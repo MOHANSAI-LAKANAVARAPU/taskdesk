@@ -126,6 +126,61 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   }
 })();
 
+// ---- Teams, document requests and file attachments (additive: new tables and columns only) ----
+(function addTeamsRequestsFiles() {
+  const hadTeams = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='teams'").get();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS teams (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      lead_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );`);
+  if (!db.prepare('PRAGMA table_info(users)').all().some(c => c.name === 'team_id')) {
+    db.exec('ALTER TABLE users ADD COLUMN team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL');
+  }
+  if (!hadTeams) { // starting teams, created once
+    const ins = db.prepare('INSERT INTO teams (name) VALUES (?)');
+    for (const n of ['R&D', 'Testing', 'STQC Documentation']) ins.run(n);
+  }
+  // requests.status is validated in server.js (no CHECK constraint) so new statuses never need a table rebuild.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      needed_by TEXT,
+      requested_by INTEGER NOT NULL REFERENCES users(id),
+      target_team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      delivered_at TEXT,
+      closed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
+    CREATE INDEX IF NOT EXISTS idx_requests_team ON requests(target_team_id);
+    CREATE INDEX IF NOT EXISTS idx_requests_by ON requests(requested_by);
+    CREATE INDEX IF NOT EXISTS idx_requests_task ON requests(task_id);
+    CREATE INDEX IF NOT EXISTS idx_users_team ON users(team_id);
+
+    CREATE TABLE IF NOT EXISTS files (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      original_name TEXT NOT NULL,
+      stored_name TEXT NOT NULL UNIQUE,
+      size INTEGER NOT NULL,
+      mime TEXT NOT NULL DEFAULT '',
+      uploaded_by INTEGER NOT NULL REFERENCES users(id),
+      task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+      update_id INTEGER REFERENCES task_updates(id) ON DELETE SET NULL,
+      request_id INTEGER REFERENCES requests(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_files_task ON files(task_id);
+    CREATE INDEX IF NOT EXISTS idx_files_request ON files(request_id);`);
+  fs.mkdirSync(path.join(dataDir, 'uploads'), { recursive: true });
+})();
+
 // Create the first admin account if there are no users yet.
 const count = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
 if (count === 0) {

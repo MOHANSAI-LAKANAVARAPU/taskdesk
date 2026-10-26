@@ -12,12 +12,25 @@
   const STATUS = { assigned: 'Not started', in_progress: 'In progress', submitted: 'Waiting for approval', completed: 'Completed' };
   const PRIORITY = { low: 'Low', medium: 'Medium', high: 'High', urgent: 'Urgent' };
   const PSTATUS = { active: 'Active', on_hold: 'On hold', closed: 'Closed' };
+  const RSTATUS = { open: 'Open', assigned: 'Assigned', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled' };
+  const FILE_ACCEPT = '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp,.txt,.csv,.zip';
+  const fileInput = (label = 'Attach files (optional)') => `<label class="f"><span>${label}</span><input type="file" name="files" multiple accept="${FILE_ACCEPT}"><small class="muted">PDF, Word, Excel, PowerPoint, images, text or ZIP · up to 25 MB each, 5 at a time</small></label>`;
+  const fmtSize = n => n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+  const fileList = files => files && files.length ? `<ul class="files">${files.map(f => `<li><a href="/api/files/${f.id}" download>${esc(f.original_name)}</a> <span class="muted">${fmtSize(f.size)}</span></li>`).join('')}</ul>` : '';
+  const reqPill = r => `<span class="pill rq-${esc(r.status)}">${RSTATUS[r.status] || esc(r.status)}</span>`;
+  // Copy plain fields into a FormData (for requests that may carry files).
+  function formData(fields, filesInput) {
+    const fd = new FormData();
+    for (const [k, v] of Object.entries(fields)) if (v !== undefined && v !== null) fd.append(k, v);
+    for (const f of (filesInput && filesInput.files) || []) fd.append('files', f);
+    return fd;
+  }
 
   async function api(path, opts = {}) {
     const res = await fetch('/api' + path, {
       method: opts.method || 'GET',
-      headers: opts.body ? { 'Content-Type': 'application/json' } : {},
-      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      headers: opts.body && !(opts.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {},
+      body: opts.body instanceof FormData ? opts.body : opts.body ? JSON.stringify(opts.body) : undefined,
       credentials: 'same-origin'
     });
     let data = {};
@@ -80,8 +93,10 @@
 
   // ---------- shell ----------
   function renderNav(route) {
-    const items = [['#/', 'Dashboard'], ['#/tasks', me.role === 'employee' ? 'My tasks' : 'Tasks'], ['#/projects', 'Projects']];
+    const items = [['#/', 'Dashboard'], ['#/tasks', me.role === 'employee' ? 'My tasks' : 'Tasks'], ['#/requests', 'Requests'], ['#/projects', 'Projects']];
     if (me.role !== 'employee') items.push(['#/people', isBoss() ? 'People' : 'My team']);
+    if (isBoss()) items.push(['#/teams', 'Teams']);
+    items.push(['#/history', 'History']);
     $('#nav').innerHTML = items.map(([h, l]) => {
       const cur = h === '#/' ? route === '' : route.startsWith(h.slice(2));
       return `<a href="${h}"${cur ? ' aria-current="page"' : ''}>${l}</a>`;
@@ -106,6 +121,10 @@
       else if (parts[0] === 'tasks') await viewTasks();
       else if (parts[0] === 'projects') await viewProjects();
       else if (parts[0] === 'people') await viewPeople();
+      else if (parts[0] === 'requests' && parts[1]) await viewRequest(Number(parts[1]));
+      else if (parts[0] === 'requests') await viewRequests();
+      else if (parts[0] === 'teams' && isBoss()) await viewTeams();
+      else if (parts[0] === 'history') await viewHistory();
       else if (parts[0] === 'account') viewAccount();
       else app.innerHTML = `<div class="empty">This page doesn’t exist. <a href="#/">Go to the dashboard</a>.</div>`;
     } catch (e) { app.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
@@ -232,8 +251,8 @@
 
   async function taskForm(task) {
     const [{ projects }, { users }] = await Promise.all([api('/projects'), api('/users')]);
-    const assignable = users.filter(u => u.active && (isBoss() || u.lead_id === me.id || u.id === me.id));
-    if (!assignable.length) { toast(isBoss() ? 'Add people first, then assign tasks.' : 'No one is on your team yet. Ask a manager to add team members.'); return; }
+    const assignable = users.filter(u => u.active); // the server only lists people this user may assign to
+    if (!assignable.length) { toast(isBoss() ? 'Add people first, then assign tasks.' : 'No one is in the teams you lead yet. Ask a manager to add team members.'); return; }
     const t = task || { priority: 'medium' };
     openModal(`
       <h2 style="font-size:1.25rem">${task ? 'Edit task' : 'Assign a task'}</h2>
@@ -267,11 +286,11 @@
 
   // ---------- task detail ----------
   async function viewTask(id) {
-    const { task: t, updates, can_edit, can_update, can_submit, can_review, can_complete_directly, locked } = await api('/tasks/' + id);
+    const { task: t, updates, can_edit, can_update, can_submit, can_review, can_complete_directly, locked, request } = await api('/tasks/' + id);
     const isAssignee = t.assignee_id === me.id;
     app.innerHTML = `
       <p style="margin:0 0 10px"><a href="#/tasks">← All tasks</a></p>
-      <div class="page-head"><div><h1>${esc(t.title)}</h1><p>${statusPill(t)} <span style="margin-left:6px">${esc(dueText(t))}</span></p></div>
+      <div class="page-head"><div><h1>${esc(t.title)}</h1><p>${statusPill(t)} <span style="margin-left:6px">${esc(dueText(t))}</span>${request ? ` <span style="margin-left:6px">· From <a href="#/requests/${request.id}">document request #${request.id}</a></span>` : ''}</p></div>
         ${can_edit ? `<div class="inline-actions"><button class="btn ghost" id="editTask">Edit</button><button class="btn danger" id="delTask">Delete</button></div>` : ''}</div>
       <div class="cols">
         <div class="stack">
@@ -296,6 +315,7 @@
           ${can_update ? `<section class="card"><h2>${locked ? 'Add a comment' : isAssignee ? 'Post an update' : 'Add a note or change status'}</h2>
             <form id="updForm">
               <label class="f"><span>${locked ? 'Comment' : 'What did you do? Any blockers?'}</span><textarea name="message" placeholder="${isAssignee ? 'For example: finished the login page, waiting for API access' : 'Add a note for the assignee'}"></textarea></label>
+              ${fileInput()}
               ${locked ? '' : `<div class="grid2">
                 <label class="f"><span>Status</span><select name="status">${options(statusChoices(t, can_complete_directly), t.status)}</select></label>
                 <label class="f"><span>Progress</span><span class="progress-input"><input type="range" name="progress" min="0" max="100" step="5" value="${t.progress}"><output>${t.progress}%</output></span></label>
@@ -309,7 +329,7 @@
         <section class="card"><h2>Activity</h2>
           <ul class="timeline">${updates.slice().reverse().map(u => `<li>
             <span class="who">${esc(u.user_name)}</span><span class="when">${fmtDateTime(u.created_at)}</span>
-            <p>${esc(u.message)}${u.progress !== null && u.progress !== undefined ? ` <span class="muted">· ${u.progress}%</span>` : ''}</p></li>`).join('')}</ul>
+            <p>${esc(u.message)}${u.progress !== null && u.progress !== undefined ? ` <span class="muted">· ${u.progress}%</span>` : ''}</p>${fileList(u.files)}</li>`).join('')}</ul>
         </section>
       </div>`;
 
@@ -325,10 +345,11 @@
       <h2 style="font-size:1.25rem">Submit for approval</h2>
       <p class="muted" style="margin-top:0">${esc(t.assigned_by_name)} will review your work and approve it or send it back.</p>
       <label class="f"><span>What was done?</span><textarea name="note" required maxlength="4000" placeholder="A short note about the finished work"></textarea></label>
+      ${fileInput('Attach the finished files (optional)')}
       ${modalActions('Submit')}`, async fd => {
         const note = String(fd.get('note') || '').trim();
         if (!note) throw new Error('Write a short note about what was done.');
-        await api(`/tasks/${t.id}/submit`, { method: 'POST', body: { note } }); toast('Submitted for approval'); router();
+        await api(`/tasks/${t.id}/submit`, { method: 'POST', body: formData({ note }, modalForm.querySelector('[name=files]')) }); toast('Submitted for approval'); router();
       });
     const ap = $('#approveBtn');
     if (ap) ap.onclick = () => openModal(`
@@ -352,9 +373,9 @@
     if (f && locked) {
       f.onsubmit = async e => {
         e.preventDefault();
-        const message = f.querySelector('[name=message]').value;
-        if (!message.trim()) { $('#updErr').textContent = 'Write a comment first.'; return; }
-        try { await api(`/tasks/${t.id}/updates`, { method: 'POST', body: { message } }); toast('Comment posted'); router(); }
+        const message = f.querySelector('[name=message]').value, fi = f.querySelector('[name=files]');
+        if (!message.trim() && !fi.files.length) { $('#updErr').textContent = 'Write a comment first.'; return; }
+        try { await api(`/tasks/${t.id}/updates`, { method: 'POST', body: formData({ message }, fi) }); toast('Comment posted'); router(); }
         catch (err) { $('#updErr').textContent = err.message; }
       };
     } else if (f) {
@@ -366,7 +387,7 @@
       };
       sel.onchange = () => { if (sel.value === 'completed' && can_complete_directly) { range.value = 100; out.textContent = '100%'; } };
       const send = async body => {
-        try { await api(`/tasks/${t.id}/updates`, { method: 'POST', body }); toast(body.status === 'completed' && t.status !== 'completed' ? 'Task completed' : 'Update posted'); router(); }
+        try { await api(`/tasks/${t.id}/updates`, { method: 'POST', body: formData(body, f.querySelector('[name=files]')) }); toast(body.status === 'completed' && t.status !== 'completed' ? 'Task completed' : 'Update posted'); router(); }
         catch (err) { $('#updErr').textContent = err.message; }
       };
       f.onsubmit = e => {
@@ -375,7 +396,7 @@
         const body = { message: fd.get('message') };
         if (fd.get('status') !== t.status) body.status = fd.get('status');
         if (+fd.get('progress') !== t.progress) body.progress = +fd.get('progress');
-        if (!body.message.trim() && body.status === undefined && body.progress === undefined) { $('#updErr').textContent = 'Write an update or change the progress.'; return; }
+        if (!body.message.trim() && body.status === undefined && body.progress === undefined && !f.querySelector('[name=files]').files.length) { $('#updErr').textContent = 'Write an update, change the progress or attach a file.'; return; }
         send(body);
       };
       const md = $('#markDone'); if (md) md.onclick = () => send({ status: 'completed', message: f.querySelector('[name=message]').value });
@@ -414,17 +435,16 @@
 
   // ---------- people ----------
   async function viewPeople() {
-    const { users } = await api('/users');
+    const [{ users }, { teams }] = await Promise.all([api('/users'), api('/teams')]);
     const byId = Object.fromEntries(users.map(u => [u.id, u]));
-    const leads = users.filter(u => u.active && u.role !== 'employee');
     app.innerHTML = `
-      <div class="page-head"><div><h1>${isBoss() ? 'People' : 'My team'}</h1><p>${isBoss() ? 'Add employees and set who they report to.' : 'People who report to you.'}</p></div>
+      <div class="page-head"><div><h1>${isBoss() ? 'People' : 'My team'}</h1><p>${isBoss() ? 'Add people and choose their team. Manage team leads on the Teams page.' : 'People in the teams you lead.'}</p></div>
         ${isBoss() ? `<button class="btn" id="newUser">Add a person</button>` : ''}</div>
       <div class="card table-wrap"><table>
-        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Reports to</th><th>Status</th>${isBoss() ? '<th></th>' : ''}</tr></thead>
+        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Team</th><th>Status</th>${isBoss() ? '<th></th>' : ''}</tr></thead>
         <tbody>${users.map(u => `<tr>
           <td><a href="#/tasks?assignee=${u.id}">${esc(u.name)}</a></td><td>${esc(u.email)}</td><td>${ROLE[u.role]}</td>
-          <td>${u.lead_id && byId[u.lead_id] ? esc(byId[u.lead_id].name) : '<span class="muted">—</span>'}</td>
+          <td>${u.team_name ? esc(u.team_name) : '<span class="muted">—</span>'}</td>
           <td>${u.active ? 'Active' : '<span class="muted">Deactivated</span>'}</td>
           ${isBoss() ? `<td>${u.role === 'admin' && me.role !== 'admin' ? '' : `<button class="btn ghost small" data-edit="${u.id}">Edit</button>`}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
     if (!isBoss()) return;
@@ -435,12 +455,12 @@
         <label class="f"><span>Full name</span><input name="name" required value="${esc(u?.name)}"></label>
         <label class="f"><span>Email</span><input name="email" type="email" required value="${esc(u?.email)}"></label>
         <label class="f"><span>Role</span><select name="role">${options(roles, u?.role || 'employee')}</select></label>
-        <label class="f"><span>Reports to</span><select name="lead_id"><option value="">No one</option>
-          ${leads.filter(l => !u || l.id !== u.id).map(l => `<option value="${l.id}"${u && l.id === u.lead_id ? ' selected' : ''}>${esc(l.name)} (${ROLE[l.role]})</option>`).join('')}</select></label>
+        <label class="f"><span>Team</span><select name="team_id"><option value="">No team</option>
+          ${teams.map(t => `<option value="${t.id}"${u && t.id === u.team_id ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select></label>
       </div>
       <label class="f"><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="8" autocomplete="new-password" ${u ? '' : 'required'}></label>
       ${u && u.id !== me.id ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
-      <p class="muted" style="font-size:.8125rem;margin-top:-4px">Team leads can assign tasks to the people who report to them.</p>
+      <p class="muted" style="font-size:.8125rem;margin-top:-4px">A team’s lead can assign tasks to the people in that team.</p>
       ${modalActions(u ? 'Save changes' : 'Add person')}`,
       async fd => {
         const body = Object.fromEntries(fd);
@@ -452,6 +472,186 @@
     $('#newUser').onclick = () => form();
     app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => form(byId[b.dataset.edit]));
   }
+
+  // ---------- teams (managers and admins) ----------
+  async function viewTeams() {
+    const [{ teams }, { users }] = await Promise.all([api('/teams'), api('/users')]);
+    const leads = users.filter(u => u.active && u.role !== 'employee');
+    app.innerHTML = `
+      <div class="page-head"><div><h1>Teams</h1><p>Each person belongs to one team. A team’s lead can assign work to its members and approves document requests the team takes on.</p></div>
+        <button class="btn" id="newTeam">Add a team</button></div>
+      <div class="stack">${teams.length ? teams.map(t => `<section class="card">
+        <div class="row-top"><h2 style="margin:0">${esc(t.name)}</h2>
+          <div class="inline-actions"><button class="btn ghost small" data-team="${t.id}">Rename / lead</button><button class="btn danger small" data-del="${t.id}">Delete</button></div></div>
+        <p class="muted" style="margin:6px 0 12px">Lead: ${t.lead_name ? esc(t.lead_name) : 'none'} · ${t.member_count} active member${t.member_count === 1 ? '' : 's'}</p>
+        ${(t.members || []).length ? `<ul class="rows">${t.members.map(m => `<li class="row-top"><span>${esc(m.name)} <span class="muted">${ROLE[m.role]}${m.active ? '' : ' · deactivated'}</span></span>
+          <button class="btn ghost small" data-remove="${t.id}:${m.id}">Remove</button></li>`).join('')}</ul>` : '<p class="muted">No members yet.</p>'}
+        <div class="inline-actions" style="margin-top:12px"><select data-addsel="${t.id}" aria-label="Add a person to ${esc(t.name)}" style="width:auto;min-width:220px"><option value="">Add a person…</option>
+          ${users.filter(u => u.active && u.team_id !== t.id).map(u => `<option value="${u.id}">${esc(u.name)}${u.team_name ? ' (now in ' + esc(u.team_name) + ')' : ''}</option>`).join('')}</select>
+          <button class="btn ghost small" data-add="${t.id}">Add</button></div>
+      </section>`).join('') : '<div class="card empty">No teams yet.</div>'}</div>`;
+    const byId = Object.fromEntries(teams.map(t => [t.id, t]));
+    const form = t => openModal(`
+      <h2 style="font-size:1.25rem">${t ? 'Edit ' + esc(t.name) : 'Add a team'}</h2>
+      <label class="f"><span>Team name</span><input name="name" required maxlength="120" value="${esc(t?.name)}"></label>
+      <label class="f"><span>Team lead</span><select name="lead_id"><option value="">No lead</option>
+        ${leads.map(l => `<option value="${l.id}"${t && l.id === t.lead_id ? ' selected' : ''}>${esc(l.name)} (${ROLE[l.role]})</option>`).join('')}</select></label>
+      <p class="muted" style="font-size:.8125rem;margin-top:-4px">Only team leads, managers and admins can lead a team. Change someone’s role on the People page.</p>
+      ${modalActions(t ? 'Save changes' : 'Add team')}`, async fd => {
+        const body = Object.fromEntries(fd);
+        if (!body.name.trim()) throw new Error('Enter a team name.');
+        await api(t ? '/teams/' + t.id : '/teams', { method: t ? 'PATCH' : 'POST', body }); toast(t ? 'Team saved' : 'Team added'); router();
+      });
+    $('#newTeam').onclick = () => form();
+    app.querySelectorAll('[data-team]').forEach(b => b.onclick = () => form(byId[b.dataset.team]));
+    app.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+      const t = byId[b.dataset.del];
+      if (!confirm(`Delete the team “${t.name}”? Its members will have no team.`)) return;
+      try { await api('/teams/' + t.id, { method: 'DELETE' }); toast('Team deleted'); router(); } catch (e) { toast(e.message); }
+    });
+    app.querySelectorAll('[data-add]').forEach(b => b.onclick = async () => {
+      const uid = app.querySelector(`[data-addsel="${b.dataset.add}"]`).value;
+      if (!uid) return;
+      try { await api(`/teams/${b.dataset.add}/members/${uid}`, { method: 'PUT' }); toast('Added to team'); router(); } catch (e) { toast(e.message); }
+    });
+    app.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
+      const [tid, uid] = b.dataset.remove.split(':');
+      try { await api(`/teams/${tid}/members/${uid}`, { method: 'DELETE' }); toast('Removed from team'); router(); } catch (e) { toast(e.message); }
+    });
+  }
+
+  // ---------- document requests ----------
+  async function viewRequests() {
+    const q = new URLSearchParams(location.hash.split('?')[1] || '');
+    const params = new URLSearchParams();
+    for (const k of ['team', 'status']) if (q.get(k)) params.set(k, q.get(k));
+    const [{ requests }, { teams }] = await Promise.all([api('/requests?' + params), api('/teams')]);
+    const setQ = (k, v) => { if (v) q.set(k, v); else q.delete(k); location.hash = '#/requests' + (q.toString() ? '?' + q : ''); };
+    app.innerHTML = `
+      <div class="page-head"><div><h1>Document requests</h1><p>Ask another team for a document. A member of that team takes it on, and you’re told when it’s ready.</p></div>
+        <button class="btn" id="newReq">New request</button></div>
+      <div class="filters">
+        <select id="fTeam" aria-label="Filter by team"><option value="">All teams</option>
+          ${teams.map(t => `<option value="${t.id}"${String(t.id) === q.get('team') ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
+        <select id="fStatus" aria-label="Filter by status"><option value="">All statuses</option>
+          <option value="active"${q.get('status') === 'active' ? ' selected' : ''}>Not finished</option>${options(RSTATUS, q.get('status'))}</select>
+      </div>
+      ${requests.length ? `<div class="card table-wrap"><table>
+        <thead><tr><th>Title</th><th>Requested by</th><th>For team</th><th>Needed by</th><th>Status</th><th>Taken by</th></tr></thead>
+        <tbody>${requests.map(r => `<tr><td><a href="#/requests/${r.id}">${esc(r.title)}</a></td><td>${esc(r.requested_by_name)}</td>
+          <td>${r.team_name ? esc(r.team_name) : '<span class="muted">—</span>'}</td><td>${fmtDate(r.needed_by)}</td><td>${reqPill(r)}</td>
+          <td>${r.assignee_name ? esc(r.assignee_name) : '<span class="muted">—</span>'}</td></tr>`).join('')}</tbody></table></div>`
+        : `<div class="card empty">${q.toString() ? 'No requests match these filters.' : 'No document requests yet.'}</div>`}`;
+    $('#fTeam').onchange = e => setQ('team', e.target.value);
+    $('#fStatus').onchange = e => setQ('status', e.target.value);
+    $('#newReq').onclick = () => openModal(`
+      <h2 style="font-size:1.25rem">New document request</h2>
+      <label class="f"><span>What do you need?</span><input name="title" required maxlength="200"></label>
+      <label class="f"><span>Details</span><textarea name="description" placeholder="What the document should contain, format, who it is for"></textarea></label>
+      <div class="grid2">
+        <label class="f"><span>Which team?</span><select name="target_team_id" required><option value="">Choose a team</option>
+          ${teams.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}</select></label>
+        <label class="f"><span>Needed by</span><input type="date" name="needed_by"></label>
+      </div>
+      ${fileInput()}
+      ${modalActions('Post request')}`, async fd => {
+        const body = Object.fromEntries([...fd].filter(([k]) => k !== 'files'));
+        if (!body.title.trim()) throw new Error('Enter what you need.');
+        if (!body.target_team_id) throw new Error('Choose the team the request is for.');
+        const r = await api('/requests', { method: 'POST', body: formData(body, modalForm.querySelector('[name=files]')) });
+        toast('Request posted'); location.hash = '#/requests/' + r.request.id;
+      });
+  }
+
+  async function viewRequest(id) {
+    const d = await api('/requests/' + id), r = d.request;
+    app.innerHTML = `
+      <p style="margin:0 0 10px"><a href="#/requests">← All requests</a></p>
+      <div class="page-head"><div><h1>${esc(r.title)}</h1><p>${reqPill(r)} <span style="margin-left:6px">Needed by ${fmtDate(r.needed_by)}</span></p></div>
+        <div class="inline-actions">
+          ${d.can_take ? `<button class="btn" id="takeBtn">Take this task</button>` : ''}
+          ${d.can_receive ? `<button class="btn" id="recvBtn">Mark as received</button>` : ''}
+          ${d.can_cancel ? `<button class="btn danger" id="cancelBtn">Cancel request</button>` : ''}</div></div>
+      <div class="cols">
+        <div class="stack">
+          <section class="card">
+            <dl class="meta-grid">
+              <div><dt>Requested by</dt><dd>${esc(r.requested_by_name)}</dd></div>
+              <div><dt>For team</dt><dd>${esc(r.team_name || '—')}</dd></div>
+              <div><dt>Posted</dt><dd>${fmtDate(r.created_at)}</dd></div>
+              <div><dt>Taken by</dt><dd>${esc(r.assignee_name || '—')}</dd></div>
+              ${r.delivered_at ? `<div><dt>Delivered</dt><dd>${fmtDate(r.delivered_at)}</dd></div>` : ''}
+              ${r.closed_at ? `<div><dt>${r.status === 'cancelled' ? 'Cancelled' : 'Received'}</dt><dd>${fmtDate(r.closed_at)}</dd></div>` : ''}
+            </dl>
+            <h2 style="margin-top:18px">Details</h2>
+            <p class="desc">${r.description ? esc(r.description) : '<span class="muted">No details.</span>'}</p>
+            ${d.files.length ? `<h2 style="margin-top:18px">Attachments</h2>${fileList(d.files)}` : ''}
+            ${d.can_open_task && r.task_id ? `<p style="margin:14px 0 0"><a href="#/tasks/${r.task_id}">Open the linked task →</a></p>` : ''}
+          </section>
+          ${d.delivered_files.length || ['delivered', 'closed'].includes(r.status) && d.can_see_files ? `<section class="card"><h2>Delivered files</h2>
+            ${d.delivered_files.length ? fileList(d.delivered_files) : '<p class="muted">No files were attached to the finished task.</p>'}</section>` : ''}
+          ${d.can_attach ? `<section class="card"><h2>Add attachments</h2><form id="attForm">${fileInput('Files')}<p class="err" id="attErr"></p><button class="btn ghost">Upload</button></form></section>` : ''}
+        </div>
+        ${d.can_assign ? `<section class="card"><h2>Assign to</h2>
+          ${d.members.length ? `<ul class="rows">${d.members.map(m => `<li class="row-top"><span>${esc(m.name)} <span class="muted">${ROLE[m.role]}</span></span>
+            <button class="btn ghost small" data-assign="${m.id}">Assign</button></li>`).join('')}</ul>` : '<p class="muted">This team has no active members yet.</p>'}
+        </section>` : ''}
+      </div>`;
+    const act = async (path, body, msg) => { try { await api(`/requests/${r.id}/${path}`, { method: 'POST', body }); toast(msg); router(); } catch (e) { toast(e.message); } };
+    if ($('#takeBtn')) $('#takeBtn').onclick = async () => {
+      try { const x = await api(`/requests/${r.id}/take`, { method: 'POST' }); toast('The task is yours'); location.hash = '#/tasks/' + x.task_id; } catch (e) { toast(e.message); }
+    };
+    if ($('#recvBtn')) $('#recvBtn').onclick = () => act('received', undefined, 'Request closed');
+    if ($('#cancelBtn')) $('#cancelBtn').onclick = () => { if (confirm('Cancel this request?')) act('cancel', undefined, 'Request cancelled'); };
+    app.querySelectorAll('[data-assign]').forEach(b => b.onclick = () => act('assign', { user_id: Number(b.dataset.assign) }, 'Task assigned'));
+    const af = $('#attForm');
+    if (af) af.onsubmit = async e => {
+      e.preventDefault();
+      const fi = af.querySelector('[name=files]');
+      if (!fi.files.length) { $('#attErr').textContent = 'Choose at least one file.'; return; }
+      try { await api(`/requests/${r.id}/files`, { method: 'POST', body: formData({}, fi) }); toast('Files added'); router(); }
+      catch (err) { $('#attErr').textContent = err.message; }
+    };
+  }
+
+  // ---------- history ----------
+  async function viewHistory() {
+    const q = new URLSearchParams(location.hash.split('?')[1] || '');
+    const params = new URLSearchParams();
+    for (const k of ['person', 'team', 'status', 'from', 'to']) if (q.get(k)) params.set(k, q.get(k));
+    const [{ rows }, { users }, { teams }] = await Promise.all([api('/history?' + params), api('/users'), api('/teams')]);
+    const setQ = (k, v) => { if (v) q.set(k, v); else q.delete(k); location.hash = '#/history' + (q.toString() ? '?' + q : ''); };
+    const ALL = Object.assign({}, STATUS, { open: 'Open (request)', delivered: 'Delivered (request)', closed: 'Closed (request)', cancelled: 'Cancelled (request)' });
+    const d = v => v ? fmtDate(v) : '<span class="muted">—</span>';
+    const pill = r => r.type === 'request' ? reqPill(r) : `<span class="pill st-${esc(r.status)}">${STATUS[r.status] || esc(r.status)}</span>`;
+    app.innerHTML = `
+      <div class="page-head"><div><h1>History</h1><p>${rows.length} item${rows.length === 1 ? '' : 's'}. ${isBoss() ? 'All tasks and requests.' : me.role === 'lead' ? 'Your teams’ tasks and requests, and anything you assigned.' : 'Your own tasks and the requests you made.'}</p></div>
+        <a class="btn" id="csvBtn" href="/api/history?${new URLSearchParams([...params, ['format', 'csv']])}" download>Export to Excel</a></div>
+      <div class="filters">
+        ${users.length > 1 ? `<select id="hPerson" aria-label="Filter by person"><option value="">Everyone</option>
+          ${users.map(u => `<option value="${u.id}"${String(u.id) === q.get('person') ? ' selected' : ''}>${esc(u.name)}</option>`).join('')}</select>` : ''}
+        <select id="hTeam" aria-label="Filter by team"><option value="">All teams</option>
+          ${teams.map(t => `<option value="${t.id}"${String(t.id) === q.get('team') ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
+        <select id="hStatus" aria-label="Filter by status"><option value="">All statuses</option>${options(ALL, q.get('status'))}</select>
+        <label class="inline-date">From <input type="date" id="hFrom" value="${esc(q.get('from') || '')}"></label>
+        <label class="inline-date">To <input type="date" id="hTo" value="${esc(q.get('to') || '')}"></label>
+      </div>
+      ${rows.length ? `<div class="card table-wrap"><table class="history">
+        <thead><tr><th>Title</th><th>Type</th><th>Status</th><th>Team</th><th>Assigned to</th><th>Assigned by</th><th>Requested by</th>
+          <th>Assigned</th><th>Submitted</th><th>Approved</th><th>Completed</th><th>Approved by</th><th>Send-back reasons</th></tr></thead>
+        <tbody>${rows.map(r => `<tr>
+          <td><a href="#/${r.type === 'request' ? 'requests' : 'tasks'}/${r.id}">${esc(r.title)}</a></td><td>${r.type === 'request' ? 'Request' : 'Task'}</td><td>${pill(r)}</td>
+          <td>${esc(r.team_name || '—')}</td><td>${esc(r.assignee_name || '—')}</td><td>${esc(r.assigned_by_name || '—')}</td><td>${esc(r.requested_by_name || '—')}</td>
+          <td>${d(r.assigned_at)}</td><td>${d(r.submitted_at)}</td><td>${d(r.approved_at)}</td><td>${d(r.completed_at)}</td>
+          <td>${esc(r.approved_by_name || '—')}</td><td class="reasons">${esc(r.send_back_reasons || '')}</td></tr>`).join('')}</tbody></table></div>`
+        : `<div class="card empty">Nothing matches these filters.</div>`}`;
+    if ($('#hPerson')) $('#hPerson').onchange = e => setQ('person', e.target.value);
+    $('#hTeam').onchange = e => setQ('team', e.target.value);
+    $('#hStatus').onchange = e => setQ('status', e.target.value);
+    $('#hFrom').onchange = e => setQ('from', e.target.value);
+    $('#hTo').onchange = e => setQ('to', e.target.value);
+  }
+
 
   // ---------- account ----------
   function viewAccount() {

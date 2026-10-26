@@ -39,7 +39,7 @@ else { app.on('second-instance', () => { createWidget(); openDashboard(); }); }
 
 // ---------- config ----------
 let cfgPath;
-let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null };
+let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null };
 function loadConfig() {
   cfgPath = path.join(app.getPath('userData'), 'config.json');
   try { cfg = Object.assign(cfg, JSON.parse(fs.readFileSync(cfgPath, 'utf8'))); } catch (e) { /* first run */ }
@@ -177,7 +177,7 @@ ipcMain.handle('test-server', async (e, url) => {
 ipcMain.handle('save-server', (e, url) => {
   const changed = cleanUrl(url) !== cfg.server;
   cfg.server = cleanUrl(url);
-  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; }
+  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; cfg.knownRequestIds = null; cfg.knownReadyIds = null; }
   saveConfig();
   if (setupWin) setupWin.destroy();
   startApp(true);
@@ -217,10 +217,12 @@ function notifyNewTasks(data) {
   const ids = data.tasks.map(t => t.id);
   const statuses = {}; for (const t of data.tasks) statuses[t.id] = t.status;
   const approvalIds = (data.approvals || []).map(t => t.id);
+  const requestIds = (data.team_requests || []).map(r => r.id), readyIds = (data.ready_requests || []).map(r => r.id);
   if (!data.user || cfg.knownUser !== data.user.id) {
     // First check for this person: remember current tasks without a burst of notifications.
     cfg.knownUser = data.user ? data.user.id : null; cfg.knownTaskIds = ids;
-    cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds; saveConfig(); return;
+    cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds;
+    cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; saveConfig(); return;
   }
   const known = new Set(cfg.knownTaskIds);
   const fresh = data.tasks.filter(t => !known.has(t.id));
@@ -237,8 +239,12 @@ function notifyNewTasks(data) {
     else if (approvedIds.has(Number(id))) reviews.push({ id: Number(id), title: approvedTitle(Number(id)), text: `'${approvedTitle(Number(id))}' was approved` });
   }
   const newApprovals = prevApprovals ? (data.approvals || []).filter(t => !prevApprovals.includes(t.id)) : [];
+  // Document requests: new ones for my team, and my own requests that became ready.
+  const newRequests = cfg.knownRequestIds ? (data.team_requests || []).filter(r => !cfg.knownRequestIds.includes(r.id)) : [];
+  const nowReady = cfg.knownReadyIds ? (data.ready_requests || []).filter(r => !cfg.knownReadyIds.includes(r.id)) : [];
 
-  cfg.knownTaskIds = ids; cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds; saveConfig();
+  cfg.knownTaskIds = ids; cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds;
+  cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; saveConfig();
 
   const shown = [];
   const notify = (title, body, path) => {
@@ -256,6 +262,8 @@ function notifyNewTasks(data) {
   if (newApprovals.length > 3) notify(`${newApprovals.length} tasks waiting for your approval`, 'Click to review them.', '/tasks?status=submitted');
   else for (const t of newApprovals) notify(`${t.assignee_name} submitted '${t.title}' for approval`, 'Click to review it.', '/tasks/' + t.id);
   for (const r of reviews) notify(r.text, 'Click to open the task.', '/tasks/' + r.id);
+  for (const r of newRequests.slice(0, 5)) notify(`New document request for ${r.team_name}: ${r.title}`, 'Click to open the request.', '/requests/' + r.id);
+  for (const r of nowReady) notify(`${r.title} is ready`, 'Click to open the request.', '/requests/' + r.id);
   if (shown.length && widgetWin && !widgetWin.isDestroyed()) widgetWin.webContents.send('new-task'); // wave and bounce the mascot
 }
 
