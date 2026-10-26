@@ -1,0 +1,19 @@
+{
+  "name": "taskdesk",
+  "version": "1.0.0",
+  "description": "Task assignment and tracking for managers, team leads and employees",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.8.1",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

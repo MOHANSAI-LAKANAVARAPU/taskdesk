@@ -1,0 +1,17 @@
+# live data, backups and downloads
+server/data/
+backups/
+old-downloads/
+
+# dependencies and build output
+node_modules/
+dist/
+
+# installers and update files (built by `npm run release`; keep the README)
+installers/
+server/updates/*
+!server/updates/README.txt
+*.exe
+*.AppImage
+*.deb
+*.blockmap

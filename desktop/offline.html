@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>TaskDesk</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<style>
+:root{--bg:#F2F4F6;--ink:#18212E;--muted:#5D6776;--accent:#1E8FE0;--line:#DCE1E7;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#11161D;--ink:#E4E9F0;--muted:#98A2B2;--accent:#5AB0F5;--line:#2B3442;color-scheme:dark}}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Segoe UI",Ubuntu,system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;text-align:center;padding:24px;box-sizing:border-box}
+h1{font-size:1.375rem;margin:0 0 8px} p{color:var(--muted);margin:0 0 6px;max-width:30rem}
+code{font-size:.875rem}
+.actions{margin-top:20px;display:flex;gap:10px;justify-content:center}
+button{font:inherit;font-weight:600;padding:10px 18px;border-radius:9px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer}
+button.ghost{background:transparent;color:var(--ink);border-color:var(--line);font-weight:500}
+@media (prefers-color-scheme:dark){button:not(.ghost){color:#0B1620}}
+.mark{width:56px;height:56px;display:block;margin:0 auto 12px}
+</style></head>
+<body><div>
+<svg class="mark" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="250 39 180 180">
+<path d="M340 40 C374 57 397 59 412 53 L412 128 C412 174 378 201 340 218 C302 201 268 174 268 128 L268 53 C283 59 306 57 340 40 Z" fill="#111111"/>
+<path d="M340 58 C368 72 387 74 397 70 L397 128 C397 166 370 188 340 201 C310 188 283 166 283 128 L283 70 C293 74 312 72 340 58 Z" fill="#1E8FE0"/>
+<ellipse cx="318" cy="106" rx="16" ry="19" fill="#FFFFFF"/>
+<ellipse cx="362" cy="106" rx="16" ry="19" fill="#FFFFFF"/>
+<circle cx="321" cy="110" r="9" fill="#111111"/>
+<circle cx="365" cy="110" r="9" fill="#111111"/>
+<path d="M322 140 Q340 160 358 140" fill="none" stroke="#111111" stroke-width="8" stroke-linecap="round"/>
+</svg>
+<h1>Can’t reach TaskDesk</h1>
+<p>Make sure your laptop is connected to the office network, then try again.</p>
+<p>Server: <code id="srv"></code></p>
+<div class="actions"><button id="retry">Try again</button><button class="ghost" id="setup">Change server address</button></div>
+</div>
+<script>
+const q=new URLSearchParams(location.search);
+document.getElementById('srv').textContent=q.get('server')||'not set';
+document.getElementById('retry').onclick=()=>window.td.retry();
+document.getElementById('setup').onclick=()=>window.td.openSetup();
+</script>
+</body></html>

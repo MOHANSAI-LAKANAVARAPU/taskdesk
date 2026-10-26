@@ -1,0 +1,141 @@
+const path = require('path');
+const fs = require('fs');
+const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
+
+const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
+fs.mkdirSync(dataDir, { recursive: true });
+
+const db = new Database(path.join(dataDir, 'taskdesk.db'));
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin','manager','lead','employee')),
+  lead_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','on_hold','closed')),
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  assignee_id INTEGER NOT NULL REFERENCES users(id),
+  assigned_by INTEGER NOT NULL REFERENCES users(id),
+  priority TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('low','medium','high','urgent')),
+  status TEXT NOT NULL DEFAULT 'assigned' CHECK (status IN ('assigned','in_progress','submitted','completed')),
+  progress INTEGER NOT NULL DEFAULT 0,
+  start_date TEXT,
+  deadline TEXT,
+  completed_at TEXT,
+  submitted_at TEXT,
+  approved_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+
+CREATE TABLE IF NOT EXISTS task_updates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  message TEXT NOT NULL,
+  progress INTEGER,
+  status TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
+`);
+
+// ---- Approval step: allow status 'submitted' and add submitted_at / approved_by ----
+// SQLite can't alter a CHECK constraint, so an old tasks table is rebuilt once, inside one transaction.
+// A snapshot of the database is saved next to it first, and the row count is verified before committing.
+(function migrateTasksForApproval() {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").get();
+  if (!row || row.sql.includes("'submitted'")) return;
+  console.log('Upgrading tasks table for the approval step...');
+  const snapshot = path.join(dataDir, 'taskdesk-before-approval-migration.db');
+  if (!fs.existsSync(snapshot)) db.exec(`VACUUM INTO '${snapshot.replace(/'/g, "''")}'`);
+  const cols = db.prepare('PRAGMA table_info(tasks)').all().map(c => c.name);
+  const keep = ['id','title','description','project_id','assignee_id','assigned_by','priority','status','progress',
+    'start_date','deadline','completed_at','created_at','updated_at'];
+  const missing = keep.filter(c => !cols.includes(c));
+  if (missing.length) throw new Error('Unexpected tasks table, missing columns: ' + missing.join(', '));
+  const list = keep.join(', ');
+  db.pragma('foreign_keys = OFF'); // must be off while the table is swapped; checked again before commit
+  try {
+    db.transaction(() => {
+      const before = db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n;
+      db.exec(`
+        CREATE TABLE tasks_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+          assignee_id INTEGER NOT NULL REFERENCES users(id),
+          assigned_by INTEGER NOT NULL REFERENCES users(id),
+          priority TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('low','medium','high','urgent')),
+          status TEXT NOT NULL DEFAULT 'assigned' CHECK (status IN ('assigned','in_progress','submitted','completed')),
+          progress INTEGER NOT NULL DEFAULT 0,
+          start_date TEXT,
+          deadline TEXT,
+          completed_at TEXT,
+          submitted_at TEXT,
+          approved_by INTEGER REFERENCES users(id),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO tasks_new (${list}) SELECT ${list} FROM tasks;`);
+      const copied = db.prepare('SELECT COUNT(*) AS n FROM tasks_new').get().n;
+      if (copied !== before) throw new Error(`Row count mismatch (${before} before, ${copied} after); nothing was changed.`);
+      db.exec(`
+        DROP TABLE tasks;
+        ALTER TABLE tasks_new RENAME TO tasks;
+        CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);`);
+      const after = db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n;
+      if (after !== before) throw new Error('Row count changed during upgrade; rolled back.');
+      if (db.pragma('foreign_key_check').length) throw new Error('Foreign key check failed; rolled back.');
+      console.log(`tasks table upgraded: ${after} rows kept.`);
+    })();
+  } finally {
+    db.pragma('foreign_keys = ON');
+  }
+})();
+
+// Create the first admin account if there are no users yet.
+const count = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+if (count === 0) {
+  const email = process.env.ADMIN_EMAIL || 'admin@example.com';
+  const password = process.env.ADMIN_PASSWORD || 'ChangeMe123!';
+  const name = process.env.ADMIN_NAME || 'Administrator';
+  db.prepare('INSERT INTO users (name,email,password_hash,role) VALUES (?,?,?,?)')
+    .run(name, email, bcrypt.hashSync(password, 10), 'admin');
+  console.log(`Created admin account: ${email}`);
+  if (!process.env.ADMIN_PASSWORD) console.log('Default password in use — sign in and change it now.');
+}
+
+module.exports = db;

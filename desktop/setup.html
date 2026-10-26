@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Connect TaskDesk</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<style>
+:root{--bg:#F2F4F6;--ink:#18212E;--muted:#5D6776;--line:#DCE1E7;--accent:#1E8FE0;--err:#C02626;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#11161D;--ink:#E4E9F0;--muted:#98A2B2;--line:#2B3442;--accent:#5AB0F5;--err:#FF8A80;color-scheme:dark}}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Segoe UI",Ubuntu,system-ui,sans-serif;padding:28px}
+h1{font-size:1.25rem;margin:0 0 6px}
+p{margin:0 0 18px;color:var(--muted)}
+label{display:block;font-weight:600;font-size:.875rem;margin-bottom:6px}
+input{width:100%;box-sizing:border-box;font:inherit;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--ink)}
+input:focus{outline:2px solid var(--accent);outline-offset:1px}
+.err{color:var(--err);font-size:.875rem;min-height:1.4em;margin:8px 0 12px}
+button{font:inherit;font-weight:600;padding:10px 18px;border-radius:9px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer}
+@media (prefers-color-scheme:dark){button{color:#0B1620}}
+button:disabled{opacity:.6;cursor:wait}
+.mark{width:48px;height:48px;display:block;margin:0 0 12px}
+</style></head>
+<body>
+<svg class="mark" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="250 39 180 180">
+<path d="M340 40 C374 57 397 59 412 53 L412 128 C412 174 378 201 340 218 C302 201 268 174 268 128 L268 53 C283 59 306 57 340 40 Z" fill="#111111"/>
+<path d="M340 58 C368 72 387 74 397 70 L397 128 C397 166 370 188 340 201 C310 188 283 166 283 128 L283 70 C293 74 312 72 340 58 Z" fill="#1E8FE0"/>
+<ellipse cx="318" cy="106" rx="16" ry="19" fill="#FFFFFF"/>
+<ellipse cx="362" cy="106" rx="16" ry="19" fill="#FFFFFF"/>
+<circle cx="321" cy="110" r="9" fill="#111111"/>
+<circle cx="365" cy="110" r="9" fill="#111111"/>
+<path d="M322 140 Q340 160 358 140" fill="none" stroke="#111111" stroke-width="8" stroke-linecap="round"/>
+</svg>
+<h1>Connect to TaskDesk</h1>
+<p>Enter the TaskDesk address your manager gave you. You only need to do this once.</p>
+<form id="f">
+  <label for="url">Server address</label>
+  <input id="url" placeholder="http://192.168.1.222:3000" spellcheck="false" autocomplete="off">
+  <div class="err" id="err"></div>
+  <button id="go">Connect</button>
+</form>
+<script>
+const url=document.getElementById('url'), err=document.getElementById('err'), go=document.getElementById('go');
+window.td.getConfig().then(c=>{ url.value=c.server||''; url.focus(); url.select(); });
+document.getElementById('f').onsubmit=async e=>{
+  e.preventDefault(); err.textContent=''; go.disabled=true; go.textContent='Connecting…';
+  let v=url.value.trim(); if(v && !/^https?:\/\//i.test(v)) v='http://'+v;
+  const r=await window.td.testServer(v);
+  if(r.ok){ await window.td.saveServer(v); }
+  else { err.textContent=r.error; go.disabled=false; go.textContent='Connect'; }
+};
+</script>
+</body></html>

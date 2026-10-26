@@ -1,0 +1,74 @@
+{
+  "name": "taskdesk-desktop",
+  "productName": "TaskDesk",
+  "version": "1.0.6",
+  "description": "TaskDesk desktop app: shows your assigned tasks and opens the TaskDesk dashboard",
+  "main": "main.js",
+  "author": {
+    "name": "Hifocus",
+    "email": "mohan.sai@hifocuscctv.com"
+  },
+  "homepage": "http://192.168.1.222:3000",
+  "taskdesk": {
+    "defaultServer": "http://192.168.1.222:3000"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dist:linux": "electron-builder --linux AppImage",
+    "dist:win": "electron-builder --win nsis",
+    "release": "node scripts/release.js"
+  },
+  "build": {
+    "appId": "com.hifocus.taskdesk",
+    "productName": "TaskDesk",
+    "files": [
+      "main.js",
+      "preload.js",
+      "widget.html",
+      "setup.html",
+      "offline.html",
+      "assets/**",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "executableName": "taskdesk",
+      "icon": "build/icon.png",
+      "category": "Office",
+      "synopsis": "Your assigned tasks"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true,
+      "shortcutName": "TaskDesk"
+    },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "http://192.168.1.222:3000/updates"
+      }
+    ]
+  },
+  "devDependencies": {
+    "electron": "33.2.1",
+    "electron-builder": "25.1.8"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  }
+}

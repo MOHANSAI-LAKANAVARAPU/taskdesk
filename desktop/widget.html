@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<style>
+html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden;user-select:none;-webkit-user-select:none}
+#btn{position:absolute;left:8px;top:12px;width:88px;height:88px;border-radius:50%;cursor:pointer;
+  box-shadow:0 3px 10px rgba(0,0,0,.28);transition:transform .12s}
+#btn:hover{transform:scale(1.06)}
+#btn svg{display:block;width:100%;height:100%;transition:filter .2s}
+#btn.dim svg{filter:grayscale(1)}
+#badge{position:absolute;right:2px;top:2px;min-width:24px;height:24px;padding:0 7px;box-sizing:border-box;border-radius:12px;background:#E8590C;color:#fff;
+  font:700 13px/24px "Segoe UI",Ubuntu,system-ui,sans-serif;text-align:center;box-shadow:0 0 0 2px #fff;display:none;pointer-events:none}
+#badge.over{background:#C02626}
+#badge.warn{background:#6B7280}
+</style></head>
+<body>
+<div id="btn" title="TaskDesk"><svg id="mascot" xmlns="http://www.w3.org/2000/svg" viewBox="208 16 264 264" aria-hidden="true">
+<circle cx="340" cy="148" r="130" fill="#D6E8FA" stroke="#B5D3F0" stroke-width="2"/>
+<circle cx="340" cy="148" r="104" fill="#EEF6FE"/>
+<g id="legs"><path d="M322 206 L320 236" fill="none" stroke="#111111" stroke-width="9" stroke-linecap="round"/>
+<path d="M358 206 L360 236" fill="none" stroke="#111111" stroke-width="9" stroke-linecap="round"/>
+<rect x="302" y="231" width="28" height="13" rx="6.5" fill="#111111"/>
+<rect x="350" y="231" width="28" height="13" rx="6.5" fill="#111111"/></g>
+<g id="arm-left"><path d="M276 128 Q250 142 268 164" fill="none" stroke="#111111" stroke-width="8" stroke-linecap="round"/>
+<circle cx="271" cy="166" r="8" fill="#1E8FE0" stroke="#111111" stroke-width="3"/></g>
+<g id="arm-wave"><path d="M404 128 Q426 120 428 100" fill="none" stroke="#111111" stroke-width="8" stroke-linecap="round"/>
+<rect x="423" y="76" width="8" height="16" rx="4" fill="#1E8FE0" stroke="#111111" stroke-width="2.5"/>
+<circle cx="428" cy="96" r="9" fill="#1E8FE0" stroke="#111111" stroke-width="3"/></g>
+<g id="body">
+<path d="M340 44 C372 60 394 62 408 56 L408 128 C408 172 376 198 340 214 C304 198 272 172 272 128 L272 56 C286 62 308 60 340 44 Z" fill="#111111"/>
+<path d="M340 57 C368 71 387 73 397 69 L397 128 C397 166 370 188 340 201 C310 188 283 166 283 128 L283 69 C293 73 312 71 340 57 Z" fill="#1E8FE0"/>
+<ellipse cx="298" cy="94" rx="5" ry="12" fill="#6CB8F2"/>
+<g id="brows"><path d="M310 82 Q320 76 330 82" fill="none" stroke="#111111" stroke-width="3.5" stroke-linecap="round"/>
+<path d="M350 82 Q360 76 370 82" fill="none" stroke="#111111" stroke-width="3.5" stroke-linecap="round"/></g>
+<g id="eyes"><ellipse cx="320" cy="101" rx="13" ry="15" fill="#FFFFFF" stroke="#111111" stroke-width="2.5"/>
+<ellipse cx="360" cy="101" rx="13" ry="15" fill="#FFFFFF" stroke="#111111" stroke-width="2.5"/>
+<circle cx="323" cy="104" r="7" fill="#111111"/>
+<circle cx="363" cy="104" r="7" fill="#111111"/>
+<circle cx="325" cy="100" r="2.5" fill="#FFFFFF"/>
+<circle cx="365" cy="100" r="2.5" fill="#FFFFFF"/></g>
+<ellipse cx="302" cy="125" rx="7" ry="4" fill="#FF8FA3"/>
+<ellipse cx="378" cy="125" rx="7" ry="4" fill="#FF8FA3"/>
+<path id="mouth" d="M328 122 Q340 138 352 122 Z" fill="#111111" stroke="#111111" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="340" cy="164" r="18" fill="#FFFFFF" stroke="#111111" stroke-width="3"/>
+<rect x="331" y="155" width="5" height="18" fill="#1E8FE0"/>
+<rect x="344" y="155" width="5" height="18" fill="#1E8FE0"/>
+<rect x="336" y="162" width="8" height="4" fill="#1E8FE0"/>
+</g>
+</svg></div>
+<div id="badge"></div>
+<script>
+const btn=document.getElementById('btn'), badge=document.getElementById('badge');
+window.td.onSummary(s=>{
+  btn.classList.toggle('dim', s.state==='offline');
+  badge.className=''; badge.style.display='none';
+  if(s.state==='ok'){
+    btn.title = s.open ? [`${s.own} open task${s.own===1?'':'s'}`, s.approvals?`${s.approvals} waiting for your approval`:'', s.overdue?`${s.overdue} overdue`:''].filter(Boolean).join(', ')+'. Click to open TaskDesk.' : 'No open tasks. Click to open TaskDesk.';
+    if(s.open){ badge.textContent = s.open>99?'99+':s.open; badge.style.display='block'; if(s.overdue) badge.className='over'; }
+  } else if(s.state==='signed-out'){
+    btn.title='Click to sign in to TaskDesk'; badge.textContent='!'; badge.className='warn'; badge.style.display='block';
+  } else if(s.state==='offline'){
+    btn.title='Can’t reach the TaskDesk server. Check you’re on the office network.';
+  }
+});
+
+// Gentle animations (skipped when the system asks for reduced motion).
+const reduce=window.matchMedia('(prefers-reduced-motion: reduce)');
+const eyes=document.getElementById('eyes'), arm=document.getElementById('arm-wave'), body=document.getElementById('body');
+function blink(){
+  if(!reduce.matches){ eyes.setAttribute('transform','translate(0 101) scale(1 0.1) translate(0 -101)'); setTimeout(()=>eyes.removeAttribute('transform'),140); }
+  setTimeout(blink, 4000+Math.random()*2000);
+}
+setTimeout(blink, 4000+Math.random()*2000);
+let celebrating=false;
+function celebrate(){
+  if(reduce.matches||celebrating) return; celebrating=true;
+  const t0=performance.now(), D=2000;
+  (function frame(now){
+    const t=now-t0;
+    if(t>=D){ arm.removeAttribute('transform'); body.removeAttribute('transform'); celebrating=false; return; }
+    const fade=1-Math.max(0,(t-1600)/400);
+    arm.setAttribute('transform',`rotate(${(-22*Math.sin(t/90)-8)*fade} 404 128)`);          // wave around the shoulder
+    body.setAttribute('transform',`translate(0 ${-Math.abs(Math.sin(t/160))*9*fade})`);      // bounce
+    requestAnimationFrame(frame);
+  })(t0);
+}
+window.td.onNewTask(celebrate);
+// Drag to move; a press without movement is a click.
+let start=null, moved=false;
+btn.addEventListener('pointerdown',e=>{ if(e.button!==0) return; start={x:e.screenX,y:e.screenY}; moved=false; btn.setPointerCapture(e.pointerId); window.td.dragStart(); });
+btn.addEventListener('pointermove',e=>{ if(!start) return; const dx=e.screenX-start.x, dy=e.screenY-start.y;
+  if(!moved && Math.hypot(dx,dy)>4) moved=true; if(moved) window.td.dragMove(dx,dy); });
+btn.addEventListener('pointerup',e=>{ if(!start) return; start=null; window.td.dragEnd(); if(!moved) window.td.click(); });
+window.addEventListener('contextmenu',e=>{ e.preventDefault(); window.td.menu(); });
+</script>
+</body></html>

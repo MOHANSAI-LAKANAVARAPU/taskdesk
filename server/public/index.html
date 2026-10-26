@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TaskDesk</title>
+<link rel="icon" type="image/svg+xml" href="/hifocus-tray.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar" id="topbar" hidden>
+  <div class="topbar-inner">
+    <a href="#/" class="brand"><span class="brand-mark" aria-hidden="true"></span>TaskDesk</a>
+    <nav class="nav" id="nav" aria-label="Main"></nav>
+    <div class="me">
+      <a href="#/account" id="meName" class="me-name"></a>
+      <button type="button" class="btn ghost small" id="logoutBtn">Sign out</button>
+    </div>
+  </div>
+</header>
+<main id="app" class="wrap" tabindex="-1"></main>
+<dialog id="modal"><form method="dialog" id="modalForm" novalidate></form></dialog>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+name: taskdesk
+services:
+  taskdesk:
+    build: .
+    container_name: taskdesk
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      TZ: Asia/Kolkata
+      ADMIN_NAME: "REDACTED-1"
+      ADMIN_EMAIL: "REDACTED-2"
+      ADMIN_PASSWORD: "REDACTED-3"
+      # Set to "true" once the site is served over HTTPS
+      COOKIE_SECURE: "false"
+    volumes:
+      - ./data:/app/data
+      - ./updates:/app/updates
