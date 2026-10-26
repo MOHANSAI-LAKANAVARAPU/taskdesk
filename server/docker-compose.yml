@@ -4,13 +4,12 @@ services:
     build: .
     container_name: taskdesk
     restart: unless-stopped
+    env_file:
+      - .env   # ADMIN_NAME, ADMIN_EMAIL, ADMIN_PASSWORD (copy .env.example)
     ports:
       - "3000:3000"
     environment:
       TZ: Asia/Kolkata
-      ADMIN_NAME: "REDACTED-1"
-      ADMIN_EMAIL: "REDACTED-2"
-      ADMIN_PASSWORD: "REDACTED-3"
       # Set to "true" once the site is served over HTTPS
       COOKIE_SECURE: "false"
     volumes:

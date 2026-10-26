@@ -15,3 +15,6 @@ server/updates/*
 *.AppImage
 *.deb
 *.blockmap
+
+# secrets
+.env

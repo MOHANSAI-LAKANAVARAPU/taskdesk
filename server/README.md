@@ -11,7 +11,7 @@ The dashboard shows tasks assigned, completed, in progress, not started and over
 ## Option 1: Run with Docker (recommended)
 
 1. Copy this folder to your server.
-2. Open `docker-compose.yml` and set `ADMIN_EMAIL` and `ADMIN_PASSWORD` for the first admin account.
+2. Copy `.env.example` to `.env` and set `ADMIN_NAME`, `ADMIN_EMAIL` and `ADMIN_PASSWORD` for the first admin account (`docker-compose.yml` reads it via `env_file`; `.env` is not committed).
 3. Start it:
    ```bash
    docker compose up -d --build

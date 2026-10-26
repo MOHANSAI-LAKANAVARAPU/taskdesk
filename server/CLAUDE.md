@@ -16,7 +16,7 @@ Task assignment and tracking web app for managers, team leads and employees. Dep
 - **Auth:** bcryptjs password hashes; server-side sessions in the `sessions` table; random 32-byte token in an httpOnly, SameSite=Lax cookie `sid` (30 days; `Secure` when `COOKIE_SECURE=true`). Login is rate limited in memory (10 attempts / 15 min per IP). Changing or resetting a password invalidates other sessions; deactivating a user deletes their sessions.
 - **Frontend:** plain HTML/CSS/JS single-page app in [public/](public) ([index.html](public/index.html), [styles.css](public/styles.css), [app.js](public/app.js)). No frameworks, no build step. Hash routing: `#/` (dashboard), `#/tasks` (filters via query: `status`, `project`, `assignee`, `mine`), `#/tasks/:id`, `#/projects`, `#/people`, `#/account`, `#/login`. `app.js` is one IIFE with a `router()` that calls a `viewXxx()` function per page; `api()` wraps `fetch('/api' + path)` and throws on errors.
 - **Static/SPA:** `express.static(public)`; unknown `/api/*` returns JSON 404; any other GET returns `index.html`.
-- **Deployment:** [Dockerfile](Dockerfile) (node:20-bookworm-slim, `npm ci --omit=dev`), [docker-compose.yml](docker-compose.yml) (port 3000, `./data` volume, env for admin/TZ/COOKIE_SECURE). [README.md](README.md) has deployment, Nginx, backup notes.
+- **Deployment:** [Dockerfile](Dockerfile) (node:20-bookworm-slim, `npm ci --omit=dev`), [docker-compose.yml](docker-compose.yml) (port 3000, `./data` and `./updates` volumes, TZ/COOKIE_SECURE; admin name/email/password come from the untracked `.env` via `env_file`, see `.env.example`). [README.md](README.md) has deployment, Nginx, backup notes.
 - **Data:** SQLite file at `data/taskdesk.db` (or `$DATA_DIR`).
 
 ### Environment variables
@@ -111,7 +111,6 @@ To reset a dev database, stop the server and delete `data/` (dev only — never 
 - Default server address: `http://192.168.1.222:3000`, set in the app's `package.json` under `"taskdesk.defaultServer"`.
 - First-time installers for employee laptops: `../installers/` (`TaskDesk Setup <version>.exe` for Windows, `TaskDesk-<version>.AppImage` for Ubuntu; the .deb is no longer built).
 - The floating tick icon is always on: users **cannot hide or quit it** (no Quit, Hide or Show-icon/Start-at-login options; `showWidget` and `autoStart` are forced to true; closing the icon window is blocked or it is recreated). It only closes on a real shutdown, restart, logout or installer/uninstaller close. The dashboard window still just hides when closed. Builds need `env -u ELECTRON_RUN_AS_NODE` if that variable is set.
-- `server.js.old` in this folder is the pre-`/api/my-summary` version, kept as a rollback copy.
 
 ### Automatic updates
 
