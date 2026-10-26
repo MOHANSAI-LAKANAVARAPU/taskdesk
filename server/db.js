@@ -176,6 +176,14 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
       request_id INTEGER REFERENCES requests(id) ON DELETE CASCADE,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS request_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      message TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_request_events_request ON request_events(request_id);
     CREATE INDEX IF NOT EXISTS idx_files_task ON files(task_id);
     CREATE INDEX IF NOT EXISTS idx_files_request ON files(request_id);`);
   fs.mkdirSync(path.join(dataDir, 'uploads'), { recursive: true });

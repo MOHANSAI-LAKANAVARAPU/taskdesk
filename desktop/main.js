@@ -39,7 +39,7 @@ else { app.on('second-instance', () => { createWidget(); openDashboard(); }); }
 
 // ---------- config ----------
 let cfgPath;
-let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null };
+let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null, knownNeedsTeamIds: null };
 function loadConfig() {
   cfgPath = path.join(app.getPath('userData'), 'config.json');
   try { cfg = Object.assign(cfg, JSON.parse(fs.readFileSync(cfgPath, 'utf8'))); } catch (e) { /* first run */ }
@@ -177,7 +177,7 @@ ipcMain.handle('test-server', async (e, url) => {
 ipcMain.handle('save-server', (e, url) => {
   const changed = cleanUrl(url) !== cfg.server;
   cfg.server = cleanUrl(url);
-  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; cfg.knownRequestIds = null; cfg.knownReadyIds = null; }
+  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; cfg.knownRequestIds = null; cfg.knownReadyIds = null; cfg.knownNeedsTeamIds = null; }
   saveConfig();
   if (setupWin) setupWin.destroy();
   startApp(true);
@@ -218,11 +218,12 @@ function notifyNewTasks(data) {
   const statuses = {}; for (const t of data.tasks) statuses[t.id] = t.status;
   const approvalIds = (data.approvals || []).map(t => t.id);
   const requestIds = (data.team_requests || []).map(r => r.id), readyIds = (data.ready_requests || []).map(r => r.id);
+  const needsTeamIds = (data.needs_team_requests || []).map(r => r.id);
   if (!data.user || cfg.knownUser !== data.user.id) {
     // First check for this person: remember current tasks without a burst of notifications.
     cfg.knownUser = data.user ? data.user.id : null; cfg.knownTaskIds = ids;
     cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds;
-    cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; saveConfig(); return;
+    cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; cfg.knownNeedsTeamIds = needsTeamIds; saveConfig(); return;
   }
   const known = new Set(cfg.knownTaskIds);
   const fresh = data.tasks.filter(t => !known.has(t.id));
@@ -242,9 +243,11 @@ function notifyNewTasks(data) {
   // Document requests: new ones for my team, and my own requests that became ready.
   const newRequests = cfg.knownRequestIds ? (data.team_requests || []).filter(r => !cfg.knownRequestIds.includes(r.id)) : [];
   const nowReady = cfg.knownReadyIds ? (data.ready_requests || []).filter(r => !cfg.knownReadyIds.includes(r.id)) : [];
+  // Managers/admins: requests posted without a team.
+  const newNeedsTeam = cfg.knownNeedsTeamIds ? (data.needs_team_requests || []).filter(r => !cfg.knownNeedsTeamIds.includes(r.id)) : [];
 
   cfg.knownTaskIds = ids; cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds;
-  cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; saveConfig();
+  cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; cfg.knownNeedsTeamIds = needsTeamIds; saveConfig();
 
   const shown = [];
   const notify = (title, body, path) => {
@@ -264,6 +267,7 @@ function notifyNewTasks(data) {
   for (const r of reviews) notify(r.text, 'Click to open the task.', '/tasks/' + r.id);
   for (const r of newRequests.slice(0, 5)) notify(`New document request for ${r.team_name}: ${r.title}`, 'Click to open the request.', '/requests/' + r.id);
   for (const r of nowReady) notify(`${r.title} is ready`, 'Click to open the request.', '/requests/' + r.id);
+  for (const r of newNeedsTeam.slice(0, 5)) notify(`New request needs a team: ${r.title}`, 'Click to choose a team.', '/requests/' + r.id);
   if (shown.length && widgetWin && !widgetWin.isDestroyed()) widgetWin.webContents.send('new-task'); // wave and bounce the mascot
 }
 

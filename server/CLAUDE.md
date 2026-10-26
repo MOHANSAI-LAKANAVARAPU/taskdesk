@@ -50,6 +50,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 **Approval step (enforced in server.js, not just the UI):**
 - Assignees can't mark a task Completed. They use `POST /api/tasks/:id/submit` with a required `note` → status `submitted`, `submitted_at` set. While `submitted`, the assignee (and everyone) can only add comments via `/updates`; status/progress changes return 409. `status: "submitted"` can't be set through `/updates`.
 - Reviewers (`canReviewTask`): any manager/admin; the person in `assigned_by` when that isn't the assignee; and for a **self-claimed document request** (`assigned_by` = assignee, task linked to a request) the lead of the request's target team. Nobody else (other team leads can't), and never the assignee themself. `POST /api/tasks/:id/approve` (optional `note`) → `completed`, progress 100, `completed_at` = now, `approved_by` = reviewer. `POST /api/tasks/:id/send-back` (required `reason`) → `in_progress`, `submitted_at` cleared. Both write to the task's activity timeline ("Approved: …", "Sent back: …").
+- `approversFor()` lists who can actually approve (same rules, active users only, never the assignee): the assigner, or for a self-claimed request the team's lead, plus "any manager" if another active manager/admin exists. The task page shows "Waiting for approval from …" from this. If nobody but the assignee could approve, "Take this task", "Assign to" (to oneself) and "Submit for approval" are refused with "Nobody can approve this yet. Ask a manager to set a lead for <team>." The Teams page warns on teams without a lead.
 - A plain task someone assigned to themself (`ownPlainTask`: `assigned_by` = assignee and no linked request) is completed directly via `/updates` (no approval; `submit` is refused). A self-claimed request task must be submitted. The assigner or a manager/admin may complete someone else's task directly via `/updates` (recorded as `approved_by`); nobody else can. An assignee can't move an approved task back out of Completed.
 - Reassigning a submitted task resets it to `in_progress`.
 - Only `completed` tasks count as completed in dashboard totals, per-project and per-employee numbers; `submitted` is counted separately (`totals.submitted`, per person). `GET /api/dashboard` also returns `awaiting_me` (submitted tasks the current user may approve).
@@ -58,7 +59,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 ### Document requests
 
 - Any user creates a request for a target team (title, details, needed-by date, optional files). The **Requests** board (`#/requests`) is visible to every signed-in user; description is visible to all, attachments and delivered files only to the requester, target-team members, the team's lead, the assignee and managers/admins.
-- Status (validated in server.js, **no CHECK constraint**, so adding a status needs no table rebuild): `open` → `assigned` (linked task created) → `delivered` (linked task approved/completed) → `closed` (requester clicks "Mark as received"). `cancelled`: requester or manager/admin, only while `open`.
+- Status (validated in server.js, **no CHECK constraint**, so adding a status needs no table rebuild): `needs_team` (posted with "Not sure, let a manager decide", no `target_team_id`; nobody can take/assign it; a manager/admin uses "Send to team" → `POST /api/requests/:id/send-to-team {team_id}`, which sets the team, makes it `open` and logs "Sent to <team> by <name>" in `request_events`) → `open` → `assigned` (linked task created) → `delivered` (linked task approved/completed) → `closed` (requester clicks "Mark as received"). `cancelled`: requester or manager/admin, only while `needs_team` or `open`. History shows team "Not decided yet" for `needs_team`.
 - "Take this task": any active member of the target team claims an open request → linked task with assignee = assigned_by = them (approved by the team's lead or a manager). "Assign to": managers/admins and the target team's lead pick an active team member → linked task with assigned_by = the person who clicked. Claims are atomic (`WHERE status = 'open'`).
 - Reopening a completed linked task moves the request back to `assigned`; deleting the linked task of an `assigned` request puts it back to `open`; deleting the task of a delivered/closed request is refused.
 
@@ -82,6 +83,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - **teams**: id, name (unique, NOCASE), lead_id → users (SET NULL), created_at. "R&D", "Testing", "STQC Documentation" are created once, when the table is first created.
 - **users.team_id** → teams (added with `ALTER TABLE`).
 - **requests**: id, title, description, needed_by, requested_by → users, target_team_id → teams (SET NULL), status (validated in server.js), task_id → tasks (SET NULL), created_at, delivered_at, closed_at.
+- **request_events**: id, request_id → requests (cascade), user_id → users, message, created_at. Request activity (currently "Sent to <team> by <name>").
 - **files**: id, original_name, stored_name (random, unique), size, mime (from the extension), uploaded_by → users, task_id → tasks (cascade), update_id → task_updates, request_id → requests (cascade), created_at.
 
 ## API endpoints ([server.js](server.js))
@@ -109,14 +111,14 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | POST `/api/tasks/:id/submit` | assignee | Submit for approval (`note` required) |
 | POST `/api/tasks/:id/approve` | assigner or boss (not the assignee) | Approve a submitted task (`note` optional) |
 | POST `/api/tasks/:id/send-back` | assigner or boss (not the assignee) | Send back (`reason` required) |
-| GET `/api/my-summary` | signed in | `user`, `open`, `overdue`, `tasks` (own open tasks with `status`, and `sent_back_reason` after a send-back; max 100), `recently_approved` (own tasks approved in the last 3 days), `approvals` (submitted tasks waiting for this user's approval), `team_requests` (open requests for the user's team or teams they lead, not made by them), `ready_requests` (the user's own delivered requests). Used by the desktop app |
+| GET `/api/my-summary` | signed in | `user`, `open`, `overdue`, `tasks` (own open tasks with `status`, and `sent_back_reason` after a send-back; max 100), `recently_approved` (own tasks approved in the last 3 days), `approvals` (submitted tasks waiting for this user's approval), `team_requests` (open requests for the user's team or teams they lead, not made by them), `ready_requests` (the user's own delivered requests), `needs_team_requests` (managers/admins only: requests without a team, not made by them). Used by the desktop app |
 | GET `/api/teams` | signed in | Teams with lead and member count; member names for managers, the team's lead and its members |
 | POST/PATCH/DELETE `/api/teams[/:id]` | boss | Add / rename + set lead / delete (refused while unfinished requests target it) |
 | PUT/DELETE `/api/teams/:id/members/:userId` | boss | Add (moves from old team) / remove a member |
 | GET `/api/requests` | signed in | Board; query `team`, `status` (`active` = open/assigned/delivered) |
 | GET `/api/requests/:id` | signed in | Request + `can_take`, `can_assign` (+ `members`), `can_cancel`, `can_receive`, `can_attach`, `files`, `delivered_files` |
 | POST `/api/requests` | signed in | New request (multipart for files) |
-| POST `/api/requests/:id/take` / `assign` / `cancel` / `received` / `files` | see "Document requests" | Claim / assign to a member / cancel / mark as received / add attachments |
+| POST `/api/requests/:id/take` / `assign` / `cancel` / `received` / `files` / `send-to-team` | see "Document requests" | Claim / assign to a member / cancel / mark as received / add attachments |
 | GET `/api/files/:id` | see "Files" | Download |
 | GET `/api/history` | signed in (scoped) | History rows; `?format=csv` for Excel |
 | GET `/api/dashboard` | signed in (scoped) | `totals`, `projects`, `people`, `due_soon`, `awaiting_me` |
@@ -139,7 +141,7 @@ To reset a dev database, stop the server and delete `data/` (dev only — never 
 ## Desktop app (Electron, Windows and Ubuntu)
 
 - Source lives in `../desktop` (sibling folder of `server/`; dependencies not installed yet — run `npm install` there only when needed).
-- Notifications (compared with the previous check; last statuses are stored in `config.json` as `knownStatuses` / `knownApprovalIds`): approver gets "<name> submitted '<task>' for approval"; the employee gets "'<task>' was approved" or "'<task>' was sent back: <reason>"; team members (and the team's lead) get "New document request for <team>: <title>"; the requester gets "<title> is ready" (request notifications open `#/requests/<id>`; tracked as `knownRequestIds` / `knownReadyIds`). Each one waves the mascot. Badge = own open tasks + tasks waiting for the user's approval.
+- Notifications (compared with the previous check; last statuses are stored in `config.json` as `knownStatuses` / `knownApprovalIds`): approver gets "<name> submitted '<task>' for approval"; the employee gets "'<task>' was approved" or "'<task>' was sent back: <reason>"; team members (and the team's lead) get "New document request for <team>: <title>"; the requester gets "<title> is ready"; managers/admins get "New request needs a team: <title>" (`knownNeedsTeamIds`) (request notifications open `#/requests/<id>`; tracked as `knownRequestIds` / `knownReadyIds`). Each one waves the mascot. Badge = own open tasks + tasks waiting for the user's approval.
 - It talks to this server through `GET /api/my-summary` (open task count + list of the signed-in user's open tasks), used for the icon badge and new-task notifications. Keep that endpoint's response shape stable (`open`, `overdue`, `tasks`) or the desktop app breaks.
 - Default server address: `http://192.168.1.222:3000`, set in the app's `package.json` under `"taskdesk.defaultServer"`.
 - First-time installers for employee laptops: `../installers/` (`TaskDesk Setup <version>.exe` for Windows, `TaskDesk-<version>.AppImage` for Ubuntu; the .deb is no longer built).

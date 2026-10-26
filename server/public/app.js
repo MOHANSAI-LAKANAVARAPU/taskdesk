@@ -12,11 +12,13 @@
   const STATUS = { assigned: 'Not started', in_progress: 'In progress', submitted: 'Waiting for approval', completed: 'Completed' };
   const PRIORITY = { low: 'Low', medium: 'Medium', high: 'High', urgent: 'Urgent' };
   const PSTATUS = { active: 'Active', on_hold: 'On hold', closed: 'Closed' };
-  const RSTATUS = { open: 'Open', assigned: 'Assigned', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled' };
+  const RSTATUS = { needs_team: 'Needs a team', open: 'Open', assigned: 'Assigned', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled' };
   const FILE_ACCEPT = '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp,.txt,.csv,.zip';
   const fileInput = (label = 'Attach files (optional)') => `<label class="f"><span>${label}</span><input type="file" name="files" multiple accept="${FILE_ACCEPT}"><small class="muted">PDF, Word, Excel, PowerPoint, images, text or ZIP · up to 25 MB each, 5 at a time</small></label>`;
   const fmtSize = n => n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
   const fileList = files => files && files.length ? `<ul class="files">${files.map(f => `<li><a href="/api/files/${f.id}" download>${esc(f.original_name)}</a> <span class="muted">${fmtSize(f.size)}</span></li>`).join('')}</ul>` : '';
+  // "X or any manager" from the server's approvers list (never includes the assignee).
+  const approverText = a => !a ? 'the person who assigned it' : [a.names.join(', '), a.any_manager ? (a.names.length ? 'or any manager' : 'any manager') : ''].filter(Boolean).join(' ');
   const reqPill = r => `<span class="pill rq-${esc(r.status)}">${RSTATUS[r.status] || esc(r.status)}</span>`;
   // Copy plain fields into a FormData (for requests that may carry files).
   function formData(fields, filesInput) {
@@ -286,7 +288,7 @@
 
   // ---------- task detail ----------
   async function viewTask(id) {
-    const { task: t, updates, can_edit, can_update, can_submit, can_review, can_complete_directly, locked, request } = await api('/tasks/' + id);
+    const { task: t, updates, can_edit, can_update, can_submit, can_review, can_complete_directly, locked, request, approvers, approval_blocked } = await api('/tasks/' + id);
     const isAssignee = t.assignee_id === me.id;
     app.innerHTML = `
       <p style="margin:0 0 10px"><a href="#/tasks">← All tasks</a></p>
@@ -311,7 +313,8 @@
           ${can_review ? `<section class="card"><h2>Waiting for your approval</h2>
             <p class="muted" style="margin-top:0">${esc(t.assignee_name)} submitted this task. Check the latest note in the activity, then approve it or send it back.</p>
             <div class="inline-actions"><button class="btn" id="approveBtn">Approve</button><button class="btn ghost" id="sendBackBtn">Send back</button></div></section>` : ''}
-          ${locked && isAssignee ? `<section class="card"><p style="margin:0">Waiting for approval from ${esc(t.assigned_by_name)}. You can add comments, but status and progress are locked until it is approved or sent back.</p></section>` : ''}
+          ${locked && isAssignee ? `<section class="card"><p style="margin:0">Waiting for approval from ${esc(approverText(approvers))}. You can add comments, but status and progress are locked until it is approved or sent back.</p></section>` : ''}
+          ${isAssignee && approval_blocked ? `<section class="card warn"><p style="margin:0">${esc(approval_blocked)}</p></section>` : ''}
           ${can_update ? `<section class="card"><h2>${locked ? 'Add a comment' : isAssignee ? 'Post an update' : 'Add a note or change status'}</h2>
             <form id="updForm">
               <label class="f"><span>${locked ? 'Comment' : 'What did you do? Any blockers?'}</span><textarea name="message" placeholder="${isAssignee ? 'For example: finished the login page, waiting for API access' : 'Add a note for the assignee'}"></textarea></label>
@@ -322,7 +325,7 @@
               </div>`}
               <p class="err" id="updErr"></p>
               <div class="inline-actions"><button class="btn">${locked ? 'Post comment' : 'Post update'}</button>
-                ${can_submit ? `<button class="btn ghost" type="button" id="submitBtn">Submit for approval</button>` : ''}
+                ${can_submit && !approval_blocked ? `<button class="btn ghost" type="button" id="submitBtn">Submit for approval</button>` : ''}
                 ${can_complete_directly ? `<button class="btn ghost" type="button" id="markDone">Mark as completed</button>` : ''}</div>
             </form></section>` : ''}
         </div>
@@ -343,7 +346,7 @@
     const sb = $('#submitBtn');
     if (sb) sb.onclick = () => openModal(`
       <h2 style="font-size:1.25rem">Submit for approval</h2>
-      <p class="muted" style="margin-top:0">${esc(t.assigned_by_name)} will review your work and approve it or send it back.</p>
+      <p class="muted" style="margin-top:0">${esc(approverText(approvers)).replace(/^./, c => c.toUpperCase())} will review your work and approve it or send it back.</p>
       <label class="f"><span>What was done?</span><textarea name="note" required maxlength="4000" placeholder="A short note about the finished work"></textarea></label>
       ${fileInput('Attach the finished files (optional)')}
       ${modalActions('Submit')}`, async fd => {
@@ -484,6 +487,7 @@
         <div class="row-top"><h2 style="margin:0">${esc(t.name)}</h2>
           <div class="inline-actions"><button class="btn ghost small" data-team="${t.id}">Rename / lead</button><button class="btn danger small" data-del="${t.id}">Delete</button></div></div>
         <p class="muted" style="margin:6px 0 12px">Lead: ${t.lead_name ? esc(t.lead_name) : 'none'} · ${t.member_count} active member${t.member_count === 1 ? '' : 's'}</p>
+        ${t.lead_id ? '' : `<p class="warn-text">⚠ This team has no lead. When a member takes a document request, only a manager can approve it. Set a lead with “Rename / lead”.</p>`}
         ${(t.members || []).length ? `<ul class="rows">${t.members.map(m => `<li class="row-top"><span>${esc(m.name)} <span class="muted">${ROLE[m.role]}${m.active ? '' : ' · deactivated'}</span></span>
           <button class="btn ghost small" data-remove="${t.id}:${m.id}">Remove</button></li>`).join('')}</ul>` : '<p class="muted">No members yet.</p>'}
         <div class="inline-actions" style="margin-top:12px"><select data-addsel="${t.id}" aria-label="Add a person to ${esc(t.name)}" style="width:auto;min-width:220px"><option value="">Add a person…</option>
@@ -539,7 +543,7 @@
       ${requests.length ? `<div class="card table-wrap"><table>
         <thead><tr><th>Title</th><th>Requested by</th><th>For team</th><th>Needed by</th><th>Status</th><th>Taken by</th></tr></thead>
         <tbody>${requests.map(r => `<tr><td><a href="#/requests/${r.id}">${esc(r.title)}</a></td><td>${esc(r.requested_by_name)}</td>
-          <td>${r.team_name ? esc(r.team_name) : '<span class="muted">—</span>'}</td><td>${fmtDate(r.needed_by)}</td><td>${reqPill(r)}</td>
+          <td>${r.team_name ? esc(r.team_name) : r.status === 'needs_team' ? '<span class="muted">Not decided yet</span>' : '<span class="muted">—</span>'}</td><td>${fmtDate(r.needed_by)}</td><td>${reqPill(r)}</td>
           <td>${r.assignee_name ? esc(r.assignee_name) : '<span class="muted">—</span>'}</td></tr>`).join('')}</tbody></table></div>`
         : `<div class="card empty">${q.toString() ? 'No requests match these filters.' : 'No document requests yet.'}</div>`}`;
     $('#fTeam').onchange = e => setQ('team', e.target.value);
@@ -550,14 +554,14 @@
       <label class="f"><span>Details</span><textarea name="description" placeholder="What the document should contain, format, who it is for"></textarea></label>
       <div class="grid2">
         <label class="f"><span>Which team?</span><select name="target_team_id" required><option value="">Choose a team</option>
-          ${teams.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}</select></label>
+          ${teams.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}<option value="none">Not sure, let a manager decide</option></select></label>
         <label class="f"><span>Needed by</span><input type="date" name="needed_by"></label>
       </div>
       ${fileInput()}
       ${modalActions('Post request')}`, async fd => {
         const body = Object.fromEntries([...fd].filter(([k]) => k !== 'files'));
         if (!body.title.trim()) throw new Error('Enter what you need.');
-        if (!body.target_team_id) throw new Error('Choose the team the request is for.');
+        if (!body.target_team_id) throw new Error('Choose a team, or “Not sure, let a manager decide”.');
         const r = await api('/requests', { method: 'POST', body: formData(body, modalForm.querySelector('[name=files]')) });
         toast('Request posted'); location.hash = '#/requests/' + r.request.id;
       });
@@ -569,15 +573,17 @@
       <p style="margin:0 0 10px"><a href="#/requests">← All requests</a></p>
       <div class="page-head"><div><h1>${esc(r.title)}</h1><p>${reqPill(r)} <span style="margin-left:6px">Needed by ${fmtDate(r.needed_by)}</span></p></div>
         <div class="inline-actions">
-          ${d.can_take ? `<button class="btn" id="takeBtn">Take this task</button>` : ''}
+          ${d.can_take && !d.take_blocked ? `<button class="btn" id="takeBtn">Take this task</button>` : ''}
           ${d.can_receive ? `<button class="btn" id="recvBtn">Mark as received</button>` : ''}
           ${d.can_cancel ? `<button class="btn danger" id="cancelBtn">Cancel request</button>` : ''}</div></div>
+      ${d.take_blocked ? `<div class="card warn" style="margin-bottom:20px"><p style="margin:0">${esc(d.take_blocked)}</p></div>` : ''}
+      ${r.status === 'needs_team' && !d.can_send_to_team ? `<div class="card" style="margin-bottom:20px"><p style="margin:0">No team was chosen for this request. A manager will send it to the right team.</p></div>` : ''}
       <div class="cols">
         <div class="stack">
           <section class="card">
             <dl class="meta-grid">
               <div><dt>Requested by</dt><dd>${esc(r.requested_by_name)}</dd></div>
-              <div><dt>For team</dt><dd>${esc(r.team_name || '—')}</dd></div>
+              <div><dt>For team</dt><dd>${esc(r.team_name || (r.status === 'needs_team' ? 'Not decided yet' : '—'))}</dd></div>
               <div><dt>Posted</dt><dd>${fmtDate(r.created_at)}</dd></div>
               <div><dt>Taken by</dt><dd>${esc(r.assignee_name || '—')}</dd></div>
               ${r.delivered_at ? `<div><dt>Delivered</dt><dd>${fmtDate(r.delivered_at)}</dd></div>` : ''}
@@ -590,8 +596,14 @@
           </section>
           ${d.delivered_files.length || ['delivered', 'closed'].includes(r.status) && d.can_see_files ? `<section class="card"><h2>Delivered files</h2>
             ${d.delivered_files.length ? fileList(d.delivered_files) : '<p class="muted">No files were attached to the finished task.</p>'}</section>` : ''}
+          ${d.events.length ? `<section class="card"><h2>Activity</h2><ul class="timeline">${d.events.map(e => `<li>
+            <span class="who">${esc(e.user_name)}</span><span class="when">${fmtDateTime(e.created_at)}</span><p>${esc(e.message)}</p></li>`).join('')}</ul></section>` : ''}
           ${d.can_attach ? `<section class="card"><h2>Add attachments</h2><form id="attForm">${fileInput('Files')}<p class="err" id="attErr"></p><button class="btn ghost">Upload</button></form></section>` : ''}
         </div>
+        ${d.can_send_to_team ? `<section class="card"><h2>Send to team</h2>
+          <p class="muted" style="margin-top:0">The requester wasn’t sure which team should do this. Choose one; its members will be notified.</p>
+          <ul class="rows">${d.teams.map(t => `<li class="row-top"><span>${esc(t.name)}${t.lead_id ? '' : ' <span class="muted">· no lead</span>'}</span>
+            <button class="btn ghost small" data-sendteam="${t.id}">Send</button></li>`).join('')}</ul></section>` : ''}
         ${d.can_assign ? `<section class="card"><h2>Assign to</h2>
           ${d.members.length ? `<ul class="rows">${d.members.map(m => `<li class="row-top"><span>${esc(m.name)} <span class="muted">${ROLE[m.role]}</span></span>
             <button class="btn ghost small" data-assign="${m.id}">Assign</button></li>`).join('')}</ul>` : '<p class="muted">This team has no active members yet.</p>'}
@@ -604,6 +616,7 @@
     if ($('#recvBtn')) $('#recvBtn').onclick = () => act('received', undefined, 'Request closed');
     if ($('#cancelBtn')) $('#cancelBtn').onclick = () => { if (confirm('Cancel this request?')) act('cancel', undefined, 'Request cancelled'); };
     app.querySelectorAll('[data-assign]').forEach(b => b.onclick = () => act('assign', { user_id: Number(b.dataset.assign) }, 'Task assigned'));
+    app.querySelectorAll('[data-sendteam]').forEach(b => b.onclick = () => act('send-to-team', { team_id: Number(b.dataset.sendteam) }, 'Sent to the team'));
     const af = $('#attForm');
     if (af) af.onsubmit = async e => {
       e.preventDefault();
@@ -621,7 +634,7 @@
     for (const k of ['person', 'team', 'status', 'from', 'to']) if (q.get(k)) params.set(k, q.get(k));
     const [{ rows }, { users }, { teams }] = await Promise.all([api('/history?' + params), api('/users'), api('/teams')]);
     const setQ = (k, v) => { if (v) q.set(k, v); else q.delete(k); location.hash = '#/history' + (q.toString() ? '?' + q : ''); };
-    const ALL = Object.assign({}, STATUS, { open: 'Open (request)', delivered: 'Delivered (request)', closed: 'Closed (request)', cancelled: 'Cancelled (request)' });
+    const ALL = Object.assign({}, STATUS, { needs_team: 'Needs a team (request)', open: 'Open (request)', delivered: 'Delivered (request)', closed: 'Closed (request)', cancelled: 'Cancelled (request)' });
     const d = v => v ? fmtDate(v) : '<span class="muted">—</span>';
     const pill = r => r.type === 'request' ? reqPill(r) : `<span class="pill st-${esc(r.status)}">${STATUS[r.status] || esc(r.status)}</span>`;
     app.innerHTML = `

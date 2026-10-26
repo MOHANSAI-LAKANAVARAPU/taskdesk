@@ -162,6 +162,7 @@ td:first-child a{white-space:nowrap}
 
 /* requests, files, history */
 a.btn{display:inline-block;text-decoration:none}
+.rq-needs_team{background:var(--s-over-bg);color:var(--s-over)}
 .rq-open{background:var(--accent-soft);color:var(--accent-text)}
 .rq-assigned{background:var(--s-prog-bg);color:var(--s-prog)}
 .rq-delivered{background:var(--s-sub-bg);color:var(--s-sub)}
@@ -176,3 +177,5 @@ a.btn{display:inline-block;text-decoration:none}
 table.history{font-size:.8125rem}
 table.history td{white-space:nowrap}
 table.history td.reasons{white-space:normal;min-width:180px}
+.card.warn{border-color:var(--s-prog);background:var(--s-prog-bg)}
+.warn-text{color:var(--s-prog);font-size:.875rem;font-weight:600;margin:-4px 0 12px}

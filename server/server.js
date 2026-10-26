@@ -83,6 +83,22 @@ function reviewScope(u) {
     : { sql: `t.status = 'submitted' AND t.assignee_id != ? AND ((t.assigned_by = ? AND t.assigned_by != t.assignee_id)
         OR (t.assigned_by = t.assignee_id AND t.id IN ${LED_REQUEST_TASKS}))`, params: [u.id, u.id, u.id] };
 }
+// Who can actually approve a task (same rules as canReviewTask): the assigner if they aren't the assignee, otherwise
+// for a self-claimed request the target team's lead; plus any active manager/admin who isn't the assignee.
+function approversFor(assigneeId, assignedBy, request) {
+  const active = id => db.prepare('SELECT name FROM users WHERE id = ? AND active = 1').get(id);
+  const names = [];
+  if (assignedBy !== assigneeId) { const a = active(assignedBy); if (a) names.push(a.name); }
+  else if (request && request.team_lead_id && request.team_lead_id !== assigneeId) { const l = active(request.team_lead_id); if (l) names.push(l.name); }
+  const any_manager = !!db.prepare(`SELECT 1 FROM users WHERE active = 1 AND role IN ('admin','manager') AND id != ?`).get(assigneeId);
+  return { names, any_manager, nobody: !names.length && !any_manager };
+}
+function nobodyCanApprove(request) {
+  return request && request.team_name ? `Nobody can approve this yet. Ask a manager to set a lead for ${request.team_name}.`
+    : 'Nobody can approve this yet. Ask a manager to add another manager or team lead.';
+}
+function linkedRequestFull(taskId) { return db.prepare(`${REQ_SELECT} WHERE r.task_id = ?`).get(taskId); }
+
 // When a task linked to a document request is completed, the request is delivered (and undone if the task is reopened).
 function syncRequestWithTask(taskId, newStatus, oldStatus) {
   if (newStatus === 'completed' && oldStatus !== 'completed') {
@@ -350,9 +366,11 @@ app.get('/api/tasks/:id', auth, (req, res) => {
     WHERE up.task_id = ? ORDER BY up.id`).all(task.id);
   const files = db.prepare('SELECT id, original_name, size, update_id, uploaded_by, created_at FROM files WHERE task_id = ? ORDER BY id').all(task.id);
   for (const up of updates) up.files = files.filter(f => f.update_id === up.id);
-  const lr = linkedRequest(task.id);
+  const lr = linkedRequestFull(task.id);
   const isAssignee = task.assignee_id === req.user.id;
-  res.json({ task, updates, can_edit: canEditTask(req.user, task),
+  const approvers = ownPlainTask(task) ? null : approversFor(task.assignee_id, task.assigned_by, lr);
+  res.json({ task, updates, can_edit: canEditTask(req.user, task), approvers,
+    approval_blocked: approvers && approvers.nobody && task.status !== 'completed' ? nobodyCanApprove(lr) : null,
     can_update: isAssignee || canEditTask(req.user, task),
     can_submit: isAssignee && !ownPlainTask(task) && ['assigned', 'in_progress'].includes(task.status),
     can_review: task.status === 'submitted' && canReviewTask(req.user, task),
@@ -472,6 +490,8 @@ app.post('/api/tasks/:id/submit', auth, canSubmit, withUploads, (req, res) => {
   const u = req.user, task = loadVisibleTask(req, res); if (!task) return;
   if (task.assignee_id !== u.id) return bad(res, 'Only the person this task is assigned to can submit it.', 403);
   if (ownPlainTask(task)) return bad(res, 'You assigned this task to yourself, so you can mark it completed directly.');
+  const lr = linkedRequestFull(task.id);
+  if (approversFor(task.assignee_id, task.assigned_by, lr).nobody) return bad(res, nobodyCanApprove(lr), 409);
   if (task.status === 'submitted') return bad(res, 'This task is already waiting for approval.', 409);
   if (task.status === 'completed') return bad(res, 'This task is already completed.', 409);
   const note = str(req.body.note, 4000);
@@ -587,7 +607,8 @@ app.delete('/api/teams/:id/members/:userId', auth, requireBoss, (req, res) => {
 
 // ---------- document requests ----------
 // Status is validated here (no CHECK constraint in the database).
-const REQ_STATUSES = ['open', 'assigned', 'delivered', 'closed', 'cancelled'];
+// needs_team: posted without a team ("Not sure, let a manager decide"); a manager sends it to a team, which makes it open.
+const REQ_STATUSES = ['needs_team', 'open', 'assigned', 'delivered', 'closed', 'cancelled'];
 const REQ_SELECT = `SELECT r.*, rb.name AS requested_by_name, tm.name AS team_name, tm.lead_id AS team_lead_id,
   t.assignee_id, a.name AS assignee_name, t.status AS task_status
   FROM requests r JOIN users rb ON rb.id = r.requested_by LEFT JOIN teams tm ON tm.id = r.target_team_id
@@ -599,12 +620,15 @@ function canSeeRequestFiles(u, r) {
     || r.team_lead_id === u.id || (r.assignee_id && r.assignee_id === u.id);
 }
 function requestFlags(u, r) {
+  const can_take = r.status === 'open' && !!u.team_id && u.team_id === r.target_team_id;
   return {
-    can_take: r.status === 'open' && !!u.team_id && u.team_id === r.target_team_id,
+    can_take,
+    take_blocked: can_take && approversFor(u.id, u.id, r).nobody ? nobodyCanApprove(r) : null,
+    can_send_to_team: r.status === 'needs_team' && isBoss(u),
     can_assign: r.status === 'open' && !!r.target_team_id && (isBoss(u) || r.team_lead_id === u.id),
-    can_cancel: r.status === 'open' && (r.requested_by === u.id || isBoss(u)),
+    can_cancel: ['open', 'needs_team'].includes(r.status) && (r.requested_by === u.id || isBoss(u)),
     can_receive: r.status === 'delivered' && r.requested_by === u.id,
-    can_attach: ['open', 'assigned'].includes(r.status) && (r.requested_by === u.id || isBoss(u)),
+    can_attach: ['needs_team', 'open', 'assigned'].includes(r.status) && (r.requested_by === u.id || isBoss(u)),
     can_see_files: canSeeRequestFiles(u, r)
   };
 }
@@ -612,10 +636,10 @@ function requestFlags(u, r) {
 app.get('/api/requests', auth, (req, res) => {
   const where = ['1=1'], params = [];
   if (req.query.team) { where.push('r.target_team_id = ?'); params.push(Number(req.query.team)); }
-  if (req.query.status === 'active') where.push(`r.status IN ('open','assigned','delivered')`);
+  if (req.query.status === 'active') where.push(`r.status IN ('needs_team','open','assigned','delivered')`);
   else if (REQ_STATUSES.includes(req.query.status)) { where.push('r.status = ?'); params.push(req.query.status); }
   const rows = db.prepare(`${REQ_SELECT} WHERE ${where.join(' AND ')}
-    ORDER BY CASE r.status WHEN 'open' THEN 0 WHEN 'assigned' THEN 1 WHEN 'delivered' THEN 2 ELSE 3 END,
+    ORDER BY CASE r.status WHEN 'needs_team' THEN 0 WHEN 'open' THEN 1 WHEN 'assigned' THEN 2 WHEN 'delivered' THEN 3 ELSE 4 END,
       r.needed_by IS NULL, r.needed_by, r.id DESC LIMIT 1000`).all(...params);
   res.json({ requests: rows.map(r => ({ id: r.id, title: r.title, requested_by: r.requested_by, requested_by_name: r.requested_by_name,
     target_team_id: r.target_team_id, team_name: r.team_name, needed_by: r.needed_by, status: r.status, assignee_name: r.assignee_name,
@@ -633,20 +657,25 @@ app.get('/api/requests/:id', auth, (req, res) => {
   const members = flags.can_assign
     ? db.prepare('SELECT id, name, role FROM users WHERE team_id = ? AND active = 1 ORDER BY name').all(r.target_team_id) : [];
   const task = r.task_id ? db.prepare('SELECT * FROM tasks WHERE id = ?').get(r.task_id) : null;
-  res.json({ request: r, ...flags, files, delivered_files: delivered, members, can_open_task: !!(task && canSeeTask(u, task)) });
+  const teams = flags.can_send_to_team ? db.prepare('SELECT id, name, lead_id FROM teams ORDER BY name').all() : [];
+  const events = db.prepare(`SELECT e.message, e.created_at, us.name AS user_name FROM request_events e JOIN users us ON us.id = e.user_id
+    WHERE e.request_id = ? ORDER BY e.id`).all(r.id);
+  res.json({ request: r, ...flags, files, delivered_files: delivered, members, teams, events, can_open_task: !!(task && canSeeTask(u, task)) });
 });
 
 app.post('/api/requests', auth, withUploads, (req, res) => {
   const u = req.user;
   const title = str(req.body.title, 200), description = str(req.body.description), needed_by = optDate(req.body.needed_by);
-  const team = db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.body.target_team_id));
+  // No team ("Not sure, let a manager decide") -> needs_team; a manager picks the team later.
+  const noTeam = !req.body.target_team_id || req.body.target_team_id === 'none';
+  const team = noTeam ? null : db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.body.target_team_id));
   if (!title) return bad(res, 'Enter a title for the request.');
-  if (!team) return bad(res, 'Choose the team the request is for.');
+  if (!noTeam && !team) return bad(res, 'Choose a valid team, or “Not sure, let a manager decide”.');
   if (needed_by === undefined) return bad(res, 'Dates must be in YYYY-MM-DD format.');
   let id;
   db.transaction(() => {
-    id = db.prepare('INSERT INTO requests (title, description, needed_by, requested_by, target_team_id) VALUES (?,?,?,?,?)')
-      .run(title, description, needed_by, u.id, team.id).lastInsertRowid;
+    id = db.prepare('INSERT INTO requests (title, description, needed_by, requested_by, target_team_id, status) VALUES (?,?,?,?,?,?)')
+      .run(title, description, needed_by, u.id, team ? team.id : null, team ? 'open' : 'needs_team').lastInsertRowid;
     saveUploads(req, { request_id: id });
   })();
   res.json({ request: getRequest(id) });
@@ -685,25 +714,43 @@ function sendRequestTask(res, r, assignee, by) {
 app.post('/api/requests/:id/take', auth, (req, res) => {
   const u = req.user, r = getRequest(Number(req.params.id));
   if (!r) return bad(res, 'Request not found.', 404);
+  if (r.status === 'needs_team') return bad(res, 'A manager hasn’t chosen a team for this request yet.', 409);
   if (r.status !== 'open') return bad(res, 'This request has already been taken.', 409);
   if (!u.team_id || u.team_id !== r.target_team_id) return bad(res, 'Only members of the team this request is for can take it.', 403);
+  if (approversFor(u.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r), 409);
   sendRequestTask(res, r, u, u);
 });
 app.post('/api/requests/:id/assign', auth, (req, res) => {
   const u = req.user, r = getRequest(Number(req.params.id));
   if (!r) return bad(res, 'Request not found.', 404);
+  if (r.status === 'needs_team') return bad(res, 'Send this request to a team first.', 409);
   if (!isBoss(u) && r.team_lead_id !== u.id) return bad(res, 'Only managers and the team’s lead can assign this request.', 403);
   if (r.status !== 'open') return bad(res, 'This request has already been taken.', 409);
   const a = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.body.user_id));
   if (!a || !a.active || a.team_id !== r.target_team_id) return bad(res, 'Choose an active member of the request’s team.');
+  if (approversFor(a.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r), 409);
   sendRequestTask(res, r, a, u);
 });
 app.post('/api/requests/:id/cancel', auth, (req, res) => {
   const u = req.user, r = getRequest(Number(req.params.id));
   if (!r) return bad(res, 'Request not found.', 404);
   if (r.requested_by !== u.id && !isBoss(u)) return bad(res, 'Only the person who made this request, or a manager, can cancel it.', 403);
-  if (r.status !== 'open') return bad(res, 'Only open requests can be cancelled.', 409);
-  db.prepare(`UPDATE requests SET status = 'cancelled', closed_at = ? WHERE id = ? AND status = 'open'`).run(new Date().toISOString(), r.id);
+  if (!['open', 'needs_team'].includes(r.status)) return bad(res, 'Only requests nobody has taken yet can be cancelled.', 409);
+  db.prepare(`UPDATE requests SET status = 'cancelled', closed_at = ? WHERE id = ? AND status IN ('open','needs_team')`).run(new Date().toISOString(), r.id);
+  res.json({ request: getRequest(r.id) });
+});
+// A manager/admin chooses the team for a request posted without one; from then on it is a normal open request.
+app.post('/api/requests/:id/send-to-team', auth, requireBoss, (req, res) => {
+  const u = req.user, r = getRequest(Number(req.params.id));
+  if (!r) return bad(res, 'Request not found.', 404);
+  if (r.status !== 'needs_team') return bad(res, 'This request already has a team.', 409);
+  const team = db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.body.team_id));
+  if (!team) return bad(res, 'Choose a team.');
+  db.transaction(() => {
+    const ok = db.prepare(`UPDATE requests SET target_team_id = ?, status = 'open' WHERE id = ? AND status = 'needs_team'`).run(team.id, r.id);
+    if (!ok.changes) return;
+    db.prepare('INSERT INTO request_events (request_id, user_id, message) VALUES (?,?,?)').run(r.id, u.id, `Sent to ${team.name} by ${u.name}`);
+  })();
   res.json({ request: getRequest(r.id) });
 });
 app.post('/api/requests/:id/received', auth, (req, res) => {
@@ -770,6 +817,7 @@ function historyRows(u, q) {
   let rows = taskRows.concat(reqRows);
   // A task approved directly (no "Approved" update) still has an approval date: when it was completed.
   for (const r of rows) if (!r.approved_at && r.type === 'task' && r.approved_by_name && r.completed_at) r.approved_at = r.completed_at;
+  for (const r of rows) if (r.type === 'request' && r.status === 'needs_team') r.team_name = 'Not decided yet';
   const person = Number(q.person), team = Number(q.team);
   if (person) rows = rows.filter(r => [r.assignee_id, r.assigned_by, r.requested_by].includes(person));
   if (team) rows = rows.filter(r => r.team_id === team);
@@ -780,7 +828,7 @@ function historyRows(u, q) {
   return rows.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
 }
 const STATUS_LABEL = { assigned: 'Not started', in_progress: 'In progress', submitted: 'Waiting for approval', completed: 'Completed',
-  open: 'Open', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled' };
+  needs_team: 'Needs a team', open: 'Open', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled' };
 function localTime(d) { // "YYYY-MM-DD HH:MM" in the server's time zone (TZ), for the CSV
   if (!d) return '';
   const dt = new Date(/[TZ]/.test(d) ? d : d.replace(' ', 'T') + 'Z');
@@ -832,7 +880,10 @@ app.get('/api/my-summary', auth, (req, res) => {
     WHERE r.status = 'open' AND r.requested_by != ? AND (r.target_team_id = ? OR tm.lead_id = ?) ORDER BY r.id DESC LIMIT 100`)
     .all(u.id, u.team_id || 0, u.id);
   const ready_requests = db.prepare(`SELECT id, title FROM requests WHERE requested_by = ? AND status = 'delivered' ORDER BY id DESC LIMIT 100`).all(u.id);
-  res.json({ user: publicUser(u), open: counts.open || 0, overdue: counts.overdue || 0, tasks, recently_approved, approvals, team_requests, ready_requests });
+  // Managers/admins: requests posted without a team, waiting for someone to choose one.
+  const needs_team_requests = isBoss(u) ? db.prepare(`SELECT id, title FROM requests WHERE status = 'needs_team' AND requested_by != ?
+    ORDER BY id DESC LIMIT 100`).all(u.id) : [];
+  res.json({ user: publicUser(u), open: counts.open || 0, overdue: counts.overdue || 0, tasks, recently_approved, approvals, team_requests, ready_requests, needs_team_requests });
 });
 
 // ---------- dashboard ----------
