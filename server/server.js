@@ -16,7 +16,23 @@ const UPLOAD_DIR = path.join(process.env.DATA_DIR || path.join(__dirname, 'data'
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
-app.use(express.static(path.join(__dirname, 'public')));
+// Pages, script and styles must be revalidated on every load so browsers and the desktop app never run stale code
+// after a server update (ETags keep it cheap: unchanged files answer 304).
+const noCache = res => res.set('Cache-Control', 'no-cache');
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders: (res, file) => { if (/\.(html|js|css)$/.test(file)) noCache(res); }
+}));
+// Build id: a hash of the server code and the pages, so it changes exactly when a new version is deployed.
+// The desktop app compares it on every check and reloads the dashboard when it changes.
+const BUILD_ID = (() => {
+  const h = crypto.createHash('sha1');
+  const add = f => { try { h.update(f + '\0' + fs.readFileSync(f)); } catch (e) { /* missing file */ } };
+  for (const f of ['server.js', 'db.js', 'package.json']) add(path.join(__dirname, f));
+  const pub = path.join(__dirname, 'public');
+  for (const f of fs.readdirSync(pub).sort()) add(path.join(pub, f));
+  return h.digest('hex').slice(0, 12);
+})();
+app.get('/api/version', (req, res) => { noCache(res); res.json({ build: BUILD_ID }); });
 // Desktop app auto-update files (latest.yml, installers). Public, no sign-in; missing files are a plain 404.
 app.use('/updates', express.static(path.join(__dirname, 'updates'), { fallthrough: false, index: false, maxAge: 0 }));
 app.use('/updates', (err, req, res, next) => res.status(err.status || 404).type('text').send('Not found'));
@@ -978,6 +994,6 @@ app.get('/api/dashboard', auth, (req, res) => {
 });
 
 app.use('/api', (req, res) => bad(res, 'Not found.', 404));
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('*', (req, res) => { noCache(res); res.sendFile(path.join(__dirname, 'public', 'index.html')); });
 
 app.listen(PORT, () => console.log(`TaskDesk running on http://localhost:${PORT}`));

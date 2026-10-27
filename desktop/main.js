@@ -116,12 +116,15 @@ function createWidget() {
   if (widgetWin && !widgetWin.isDestroyed()) { widgetWin.showInactive(); return; }
   const pos = onSomeScreen(cfg.widgetPos) ? cfg.widgetPos : defaultWidgetPos();
   widgetWin = new BrowserWindow({
-    x: pos.x, y: pos.y, width: WIDGET_SIZE, height: WIDGET_SIZE, frame: false, transparent: true, resizable: false,
+    x: pos.x, y: pos.y, width: WIDGET_SIZE, height: WIDGET_SIZE, useContentSize: true, frame: false, transparent: true, resizable: false,
     movable: true, minimizable: false, maximizable: false, fullscreenable: false, skipTaskbar: true, hasShadow: false,
     alwaysOnTop: true, show: false, title: 'TaskDesk',
-    webPreferences: { contextIsolation: true, sandbox: true, preload: path.join(__dirname, 'preload.js') }
+    webPreferences: { contextIsolation: true, sandbox: true, zoomFactor: 1, preload: path.join(__dirname, 'preload.js') }
   });
   widgetWin.setAlwaysOnTop(true, 'floating');
+  // Page zoom (Ctrl+wheel) would push the badge out of the window; keep it at 100%.
+  widgetWin.webContents.on('did-finish-load', () => { widgetWin.webContents.setZoomFactor(1); widgetWin.webContents.setVisualZoomLevelLimits(1, 1).catch(() => {}); });
+  widgetWin.webContents.on('zoom-changed', () => widgetWin.webContents.setZoomFactor(1));
   widgetWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: false });
   widgetWin.loadFile(path.join(__dirname, 'widget.html'));
   // 'ready-to-show' can fail to fire for transparent windows on some Linux setups, so also show on load and after a timeout.
@@ -147,18 +150,28 @@ function createWidget() {
 let dragStart = null;
 ipcMain.on('widget-drag-start', () => { if (widgetWin) { const [x, y] = widgetWin.getPosition(); dragStart = { x, y }; } });
 ipcMain.on('widget-drag-move', (e, { dx, dy }) => {
-  if (widgetWin && dragStart) widgetWin.setPosition(Math.round(dragStart.x + dx), Math.round(dragStart.y + dy));
+  // setBounds keeps the size fixed: with Windows display scaling, setPosition can make the window drift in size.
+  if (widgetWin && dragStart) widgetWin.setBounds({ x: Math.round(dragStart.x + dx), y: Math.round(dragStart.y + dy), width: WIDGET_SIZE, height: WIDGET_SIZE });
 });
 ipcMain.on('widget-drag-end', () => {
   if (widgetWin) { const [x, y] = widgetWin.getPosition(); cfg.widgetPos = { x, y }; saveConfig(); }
   dragStart = null;
 });
 ipcMain.on('widget-click', () => openDashboard());
+ipcMain.on('widget-ready', () => sendSummary());
+// Log where the badge actually is (only when it changes), e.g. to diagnose a badge that's missing on one laptop.
+let lastBadgeLog = '';
+ipcMain.on('widget-rendered', (e, i) => {
+  const outside = i.text && (i.x < 0 || i.y < 0 || i.x + i.w > i.iw || i.y + i.h > i.ih);
+  const line = `[widget] badge ${i.text ? `"${i.text}" at ${i.x},${i.y} ${i.w}x${i.h}` : 'hidden'} in ${i.iw}x${i.ih} page`
+    + ` (device scale ${i.dpr}, window ${widgetWin && !widgetWin.isDestroyed() ? widgetWin.getContentSize().join('x') : '?'})${outside ? ' OUTSIDE THE WINDOW' : ''}`;
+  if (line !== lastBadgeLog) { lastBadgeLog = line; (outside ? console.warn : console.log)(line); }
+});
 ipcMain.on('widget-menu', () => {
   Menu.buildFromTemplate([
     ...infoItems(),
     { label: 'Open TaskDesk', click: () => openDashboard() },
-    { label: 'Refresh', click: () => poll() }
+    { label: 'Refresh', click: () => refreshAll() }
   ]).popup({ window: widgetWin });
 });
 
@@ -208,6 +221,28 @@ function infoItems() {
   return [{ label: `TaskDesk ${app.getVersion()}`, enabled: false }, { label: checkLine(), enabled: false }, { type: 'separator' }];
 }
 
+// Reload the dashboard window, keeping the current page (#route); if it's showing the offline page, load the server again.
+function reloadDashboard(why) {
+  if (!mainWin || mainWin.isDestroyed() || !cfg.server) return;
+  const url = mainWin.webContents.getURL();
+  console.log(`[dashboard] reload (${why}) ${url.replace(/^.*?#/, '#') || ''}`);
+  if (!url || url.startsWith('file:')) mainWin.loadURL(cfg.server);
+  else mainWin.webContents.reloadIgnoringCache();
+}
+function refreshAll() { reloadDashboard('Refresh'); poll(); }
+// The server's build id changes whenever new server code or pages are deployed; reload the dashboard when it does.
+let serverBuild = null;
+async function checkServerVersion() {
+  try {
+    const r = await fetch(cfg.server + '/api/version', { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return;
+    const { build } = await r.json();
+    if (!build) return;
+    if (serverBuild && build !== serverBuild) { console.log(`[version] server updated ${serverBuild} -> ${build}`); serverBuild = build; reloadDashboard('server updated'); }
+    else if (!serverBuild) { serverBuild = build; console.log(`[version] server build ${build}`); }
+  } catch (e) { /* the summary check already logs network problems */ }
+}
+
 async function poll() {
   clearTimeout(pollTimer);
   try {
@@ -225,6 +260,7 @@ async function poll() {
     const approvals = (data.approvals || []).length;
     // Badge = my own open tasks + tasks waiting for my approval
     setSummary({ state: 'ok', open: data.open + approvals, own: data.open, approvals, overdue: data.overdue, name: data.user && data.user.name });
+    checkServerVersion();
     recordCheck(true, { user: data.user && data.user.id, own: data.open, approvals, open: data.open + approvals, overdue: data.overdue,
       teamRequests: (data.team_requests || []).length, ready: (data.ready_requests || []).length, needsTeam: (data.needs_team_requests || []).length });
   } catch (e) {
@@ -371,7 +407,7 @@ function buildTrayMenu() {
     { label: 'My open tasks', click: () => openDashboard('/tasks?status=open') },
     { type: 'separator' },
     { label: 'Change server address…', click: () => openSetup() },
-    { label: 'Refresh', click: () => poll() }
+    { label: 'Refresh', click: () => refreshAll() }
   ]));
 }
 function createTray() {

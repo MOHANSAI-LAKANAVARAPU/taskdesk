@@ -15,6 +15,8 @@ if (location.protocol === 'file:') {
     dragMove: (dx, dy) => ipcRenderer.send('widget-drag-move', { dx, dy }),
     dragEnd: () => ipcRenderer.send('widget-drag-end'),
     onNewTask: fn => ipcRenderer.on('new-task', () => fn()),
-    onSummary: fn => ipcRenderer.on('summary', (e, s) => fn(s))
+    onSummary: fn => ipcRenderer.on('summary', (e, s) => fn(s)),
+    ready: () => ipcRenderer.send('widget-ready'),
+    rendered: info => ipcRenderer.send('widget-rendered', info)
   });
 }

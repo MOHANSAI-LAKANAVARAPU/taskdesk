@@ -3,17 +3,22 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
 <style>
 html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden;user-select:none;-webkit-user-select:none}
-#btn{position:absolute;left:8px;top:12px;width:88px;height:88px;border-radius:50%;cursor:pointer;
+/* Everything is drawn on a fixed 104x104 stage that is scaled to the real window size (see fit()), so the badge
+   always stays inside the window whatever the display scaling, page zoom or window rounding. The top-right corner is
+   reserved for the badge. */
+#stage{position:absolute;left:0;top:0;width:104px;height:104px;transform-origin:0 0}
+#btn{position:absolute;left:4px;top:16px;width:84px;height:84px;border-radius:50%;cursor:pointer;
   box-shadow:0 3px 10px rgba(0,0,0,.28);transition:transform .12s}
 #btn:hover{transform:scale(1.06)}
 #btn svg{display:block;width:100%;height:100%;transition:filter .2s}
 #btn.dim svg{filter:grayscale(1)}
-#badge{position:absolute;right:2px;top:2px;min-width:24px;height:24px;padding:0 7px;box-sizing:border-box;border-radius:12px;background:#E8590C;color:#fff;
+#badge{position:absolute;right:2px;top:2px;min-width:24px;max-width:40px;height:24px;padding:0 6px;overflow:hidden;box-sizing:border-box;border-radius:12px;background:#E8590C;color:#fff;
   font:700 13px/24px "Segoe UI",Ubuntu,system-ui,sans-serif;text-align:center;box-shadow:0 0 0 2px #fff;display:none;pointer-events:none}
 #badge.over{background:#C02626}
 #badge.warn{background:#6B7280}
 </style></head>
 <body>
+<div id="stage">
 <div id="btn" title="TaskDesk"><svg id="mascot" xmlns="http://www.w3.org/2000/svg" viewBox="208 16 264 264" aria-hidden="true">
 <circle cx="340" cy="148" r="130" fill="#D6E8FA" stroke="#B5D3F0" stroke-width="2"/>
 <circle cx="340" cy="148" r="104" fill="#EEF6FE"/>
@@ -48,9 +53,15 @@ html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden
 </g>
 </svg></div>
 <div id="badge"></div>
+</div>
 <script>
 const btn=document.getElementById('btn'), badge=document.getElementById('badge');
-window.td.onSummary(s=>{
+const stage=document.getElementById('stage');
+function fit(){ const s=Math.min(innerWidth, innerHeight)/104; stage.style.transform = Math.abs(s-1)<0.01 ? '' : `scale(${s})`; }
+addEventListener('resize', fit); fit();
+// Redrawn from scratch on every summary (not only on change), then reported to main.js for the log.
+function render(s){
+  fit();
   btn.classList.toggle('dim', s.state==='offline');
   badge.className=''; badge.style.display='none';
   if(s.state==='ok'){
@@ -61,7 +72,12 @@ window.td.onSummary(s=>{
   } else if(s.state==='offline'){
     btn.title='Can’t reach the TaskDesk server. Check you’re on the office network.';
   }
-});
+  const r=badge.getBoundingClientRect();
+  window.td.rendered({ text: badge.style.display==='none' ? '' : badge.textContent, x: Math.round(r.left), y: Math.round(r.top),
+    w: Math.round(r.width), h: Math.round(r.height), iw: innerWidth, ih: innerHeight, dpr: devicePixelRatio });
+}
+window.td.onSummary(render);
+window.td.ready(); // ask for the latest summary as soon as the page can show it
 
 // Gentle animations (skipped when the system asks for reduced motion).
 const reduce=window.matchMedia('(prefers-reduced-motion: reduce)');
