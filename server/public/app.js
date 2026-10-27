@@ -572,6 +572,7 @@
         <div class="row-top"><h2>${esc(t.name)}</h2>${t.mine ? '<span class="pill accent">Your team</span>' : ''}</div>
         <p class="${t.lead_name ? '' : isBoss() ? 'warn-text' : 'muted'}">${t.lead_name ? 'Lead: ' + esc(t.lead_name) : isBoss() ? '⚠ No lead' : 'No lead yet'}</p>
         <p class="muted">${plural(t.member_count, 'active member')}</p>
+        ${t.connections.length ? `<p class="muted">Works with: ${esc(t.connections.map(c => c.name).join(', '))}</p>` : ''}
         ${t.can_see_counts ? `<p class="team-counts"><span><b>${t.open_tasks}</b> open task${t.open_tasks === 1 ? '' : 's'}</span><span><b>${t.open_requests}</b> open request${t.open_requests === 1 ? '' : 's'}</span></p>` : ''}
       </a>`).join('')}</div>` : '<div class="card empty">No teams yet.</div>'}`;
     if (isBoss()) $('#newTeam').onclick = () => teamNameForm();
@@ -602,6 +603,11 @@
         ${d.lead ? `<p style="margin:0"><b>${esc(d.lead.name)}</b> <span class="muted">${ROLE[d.lead.role]} · ${esc(d.lead.email)}${d.lead.team_id === t.id ? '' : ' · not a member of this team'}</span></p>`
           : `<p class="${d.can_manage ? 'warn-text' : 'muted'}" style="margin:0">${d.can_manage ? '⚠ This team has no lead. Its document requests can only be assigned and approved by a manager. Use “Set lead”.' : 'This team has no lead yet.'}</p>`}
       </section>
+      <section class="card" style="margin-bottom:20px"><h2>Connected teams</h2>
+        <p class="muted" style="margin-top:0">Members of connected teams can send document requests to each other.${d.can_manage ? ' Managers set this; it works both ways.' : ''}</p>
+        ${d.can_manage ? '<ul class="checks" id="connChecks"><li class="muted">Loading…</li></ul>'
+          : t.connections.length ? `<p style="margin:0">${t.connections.map(c => `<a href="#/teams/${c.id}">${esc(c.name)}</a>`).join(', ')}</p>` : '<p class="muted" style="margin:0">None yet.</p>'}
+      </section>
       <section class="card table-wrap"><h2>Members</h2>
         ${d.members.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Email</th>${counts ? '<th class="n">Open tasks</th>' : ''}${d.can_assign || d.can_manage ? '<th></th>' : ''}</tr></thead>
           <tbody>${d.members.map(m => `<tr>
@@ -615,6 +621,14 @@
       </section>`;
     app.querySelectorAll('[data-assign]').forEach(b => b.onclick = () => taskForm(null, { preset: Number(b.dataset.assign) }));
     if (!d.can_manage) return;
+    const others = teams.filter(x => x.id !== t.id), linked = new Set(t.connections.map(c => c.id));
+    $('#connChecks').innerHTML = others.length ? others.map(x => `<li><label><input type="checkbox" value="${x.id}"${linked.has(x.id) ? ' checked' : ''}> ${esc(x.name)}</label></li>`).join('')
+      : '<li class="muted">There are no other teams yet.</li>';
+    $('#connChecks').onchange = async () => {
+      const ids = [...$('#connChecks').querySelectorAll('input:checked')].map(i => Number(i.value));
+      try { await api(`/teams/${t.id}/connections`, { method: 'PUT', body: { team_ids: ids } }); toast('Connected teams saved'); }
+      catch (e) { toast(e.message); router(); }
+    };
     const leadToast = r => toast(r && r.became_lead ? `${r.became_lead.name} is now the lead of ${r.became_lead.team_name}` : 'Added to the team');
     app.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
       const m = d.members.find(x => x.id === Number(b.dataset.remove));
@@ -677,23 +691,40 @@
         : `<div class="card empty">${q.toString() ? 'No requests match these filters.' : 'No document requests yet.'}</div>`}`;
     $('#fTeam').onchange = e => setQ('team', e.target.value);
     $('#fStatus').onchange = e => setQ('status', e.target.value);
-    $('#newReq').onclick = () => openModal(`
+    $('#newReq').onclick = () => requestForm();
+  }
+  // New request: to a team (own team and connected teams; managers/admins: any) or straight to a person in those teams.
+  async function requestForm() {
+    const { teams: targets, people } = await api('/request-targets');
+    openModal(`
       <h2 style="font-size:1.25rem">New document request</h2>
       <label class="f"><span>What do you need?</span><input name="title" required maxlength="200"></label>
       <label class="f"><span>Details</span><textarea name="description" placeholder="What the document should contain, format, who it is for"></textarea></label>
-      <div class="grid2">
-        <label class="f"><span>Which team?</span><select name="target_team_id" required><option value="">Choose a team</option>
-          ${teams.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}<option value="none">Not sure, let a manager decide</option></select></label>
-        <label class="f"><span>Needed by</span><input type="date" name="needed_by"></label>
-      </div>
+      <fieldset class="choice"><legend>Send to</legend>
+        <label><input type="radio" name="send_to" value="team" checked> A team</label>
+        <label><input type="radio" name="send_to" value="person"${people.length ? '' : ' disabled'}> A person</label></fieldset>
+      <div id="toTeam"><label class="f"><span>Which team?</span><select name="target_team_id"><option value="">Choose a team</option>
+          ${targets.map(t => `<option value="${t.id}">${esc(t.name)}${t.id === me.team_id ? ' (your team)' : ''}</option>`).join('')}<option value="none">Not sure, let a manager decide</option></select>
+        <small class="muted">${isBoss() ? 'Any team.' : me.team_id ? 'Your team and the teams it works with. For another team, choose “Not sure” and a manager will send it on.' : 'You aren’t in a team yet, so a manager will choose the team.'}</small></label></div>
+      <div id="toPerson" hidden>${pickerHtml('Person', isBoss() ? 'Anyone in a team. They get it as a task straight away.' : 'People in your team and in the teams it works with. They get it as a task straight away.')}</div>
+      <label class="f"><span>Needed by</span><input type="date" name="needed_by"></label>
       ${fileInput()}
       ${modalActions('Post request')}`, async fd => {
-        const body = Object.fromEntries([...fd].filter(([k]) => k !== 'files'));
+        const body = Object.fromEntries([...fd].filter(([k]) => !['files', 'send_to'].includes(k)));
         if (!body.title.trim()) throw new Error('Enter what you need.');
-        if (!body.target_team_id) throw new Error('Choose a team, or “Not sure, let a manager decide”.');
+        if (fd.get('send_to') === 'person') {
+          const [person] = picker.people();
+          if (!person) throw new Error('Choose a person.');
+          delete body.target_team_id; body.person_id = person.id;
+        } else if (!body.target_team_id) throw new Error('Choose a team, or “Not sure, let a manager decide”.');
         const r = await api('/requests', { method: 'POST', body: formData(body, modalForm.querySelector('[name=files]')) });
-        toast('Request posted'); location.hash = '#/requests/' + r.request.id;
+        toast(body.person_id ? 'Sent to ' + picker.people()[0].name : 'Request posted'); location.hash = '#/requests/' + r.request.id;
       });
+    const picker = personPicker(modalForm.querySelector('.picker'), people, { multiple: false });
+    modalForm.querySelectorAll('[name=send_to]').forEach(rb => rb.onchange = () => {
+      const person = modalForm.querySelector('[name=send_to]:checked').value === 'person';
+      $('#toTeam').hidden = person; $('#toPerson').hidden = !person;
+    });
   }
 
   // "Assign to" for an open request (request page and the dashboard's "Requests to assign"): one person, type to search.
@@ -748,7 +779,8 @@
         <div class="inline-actions">
           ${d.can_take && !d.take_blocked ? `<button class="btn" id="takeBtn">Take this task</button>` : ''}
           ${d.can_receive ? `<button class="btn" id="recvBtn">Mark as received</button>` : ''}
-          ${d.can_cancel ? `<button class="btn danger" id="cancelBtn">Cancel request</button>` : ''}</div></div>
+          ${d.can_cancel ? `<button class="btn danger" id="cancelBtn">Cancel request</button>` : ''}
+          ${d.can_withdraw ? `<button class="btn danger" id="withdrawBtn">Withdraw request</button>` : ''}</div></div>
       ${d.take_blocked ? `<div class="card warn" style="margin-bottom:20px"><p style="margin:0">${esc(d.take_blocked)}</p></div>` : ''}
       ${r.status === 'needs_team' && !d.can_send_to_team ? `<div class="card" style="margin-bottom:20px"><p style="margin:0">No team was chosen for this request. A manager will send it to the right team.</p></div>` : ''}
       <div class="cols">
@@ -758,7 +790,8 @@
               <div><dt>Requested by</dt><dd>${esc(r.requested_by_name)}</dd></div>
               <div><dt>For team</dt><dd>${esc(r.team_name || (r.status === 'needs_team' ? 'Not decided yet' : '—'))}</dd></div>
               <div><dt>Posted</dt><dd>${fmtDate(r.created_at)}</dd></div>
-              <div><dt>Taken by</dt><dd>${esc(r.assignee_name || '—')}</dd></div>
+              ${r.asked_person_name ? `<div><dt>Sent to</dt><dd>${esc(r.asked_person_name)}</dd></div>` : `<div><dt>Taken by</dt><dd>${esc(r.assignee_name || '—')}</dd></div>`}
+              ${r.withdrawn_from_name ? `<div><dt>Withdrawn from</dt><dd>${esc(r.withdrawn_from_name)}</dd></div>` : ''}
               ${r.delivered_at ? `<div><dt>Delivered</dt><dd>${fmtDate(r.delivered_at)}</dd></div>` : ''}
               ${r.closed_at ? `<div><dt>${r.status === 'cancelled' ? 'Cancelled' : 'Received'}</dt><dd>${fmtDate(r.closed_at)}</dd></div>` : ''}
             </dl>
@@ -785,6 +818,9 @@
     };
     if ($('#recvBtn')) $('#recvBtn').onclick = () => act('received', undefined, 'Request closed');
     if ($('#cancelBtn')) $('#cancelBtn').onclick = () => { if (confirm('Cancel this request?')) act('cancel', undefined, 'Request cancelled'); };
+    if ($('#withdrawBtn')) $('#withdrawBtn').onclick = () => {
+      if (confirm(`Withdraw this request? ${r.assignee_name} will be told, and their task and any files on it will be deleted.`)) act('withdraw', undefined, 'Request withdrawn');
+    };
     const asf = $('#assignForm');
     if (asf) {
       const picker = assignPicker(asf, d);

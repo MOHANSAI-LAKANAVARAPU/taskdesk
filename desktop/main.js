@@ -39,7 +39,7 @@ else { app.on('second-instance', () => { createWidget(); openDashboard(); }); }
 
 // ---------- config ----------
 let cfgPath;
-let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null, knownNeedsTeamIds: null, knownReminderIds: null };
+let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null, knownNeedsTeamIds: null, knownReminderIds: null, knownAskIds: null, knownWithdrawnIds: null };
 function loadConfig() {
   cfgPath = path.join(app.getPath('userData'), 'config.json');
   try { cfg = Object.assign(cfg, JSON.parse(fs.readFileSync(cfgPath, 'utf8'))); } catch (e) { /* first run */ }
@@ -192,7 +192,7 @@ ipcMain.handle('test-server', async (e, url) => {
 ipcMain.handle('save-server', (e, url) => {
   const changed = cleanUrl(url) !== cfg.server;
   cfg.server = cleanUrl(url);
-  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; cfg.knownRequestIds = null; cfg.knownReadyIds = null; cfg.knownNeedsTeamIds = null; cfg.knownReminderIds = null; }
+  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; cfg.knownRequestIds = null; cfg.knownReadyIds = null; cfg.knownNeedsTeamIds = null; cfg.knownReminderIds = null; cfg.knownAskIds = null; cfg.knownWithdrawnIds = null; }
   saveConfig();
   if (setupWin) setupWin.destroy();
   startApp(true);
@@ -284,12 +284,13 @@ function notifyNewTasks(data) {
   const requestIds = (data.team_requests || []).map(r => r.id), readyIds = (data.ready_requests || []).map(r => r.id);
   const needsTeamIds = (data.needs_team_requests || []).map(r => r.id);
   const reminderIds = (data.unassigned_reminders || []).map(r => r.id);
+  const askIds = (data.team_asks || []).map(r => r.id), withdrawnIds = (data.withdrawn || []).map(r => r.id);
   if (!data.user || cfg.knownUser !== data.user.id) {
     // First check for this person: remember current tasks without a burst of notifications.
     cfg.knownUser = data.user ? data.user.id : null; cfg.knownTaskIds = ids;
     cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds;
     cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; cfg.knownNeedsTeamIds = needsTeamIds;
-    cfg.knownReminderIds = reminderIds; saveConfig(); return;
+    cfg.knownReminderIds = reminderIds; cfg.knownAskIds = askIds; cfg.knownWithdrawnIds = withdrawnIds; saveConfig(); return;
   }
   const known = new Set(cfg.knownTaskIds);
   const fresh = data.tasks.filter(t => !known.has(t.id));
@@ -315,6 +316,12 @@ function notifyNewTasks(data) {
   // request reminds once, even if it is given back later. Older config.json files: record silently first.
   const reminders = cfg.knownReminderIds ? (data.unassigned_reminders || []).filter(r => !cfg.knownReminderIds.includes(r.id)) : [];
   cfg.knownReminderIds = [...new Set((cfg.knownReminderIds || []).concat(reminderIds))].slice(-500);
+  // Requests sent straight to a member of a team I lead, and requests withdrawn from me (or my team). Remembered ids
+  // only grow, so each one notifies once. Older config.json files: record silently first.
+  const newAsks = cfg.knownAskIds ? (data.team_asks || []).filter(r => !cfg.knownAskIds.includes(r.id)) : [];
+  cfg.knownAskIds = [...new Set((cfg.knownAskIds || []).concat(askIds))].slice(-500);
+  const newWithdrawn = cfg.knownWithdrawnIds ? (data.withdrawn || []).filter(r => !cfg.knownWithdrawnIds.includes(r.id)) : [];
+  cfg.knownWithdrawnIds = [...new Set((cfg.knownWithdrawnIds || []).concat(withdrawnIds))].slice(-500);
 
   cfg.knownTaskIds = ids; cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds;
   cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; cfg.knownNeedsTeamIds = needsTeamIds; saveConfig();
@@ -330,7 +337,8 @@ function notifyNewTasks(data) {
   if (fresh.length > 3) notify(`${fresh.length} new tasks assigned to you`, 'Click to open TaskDesk.', '/tasks?status=open');
   else for (const t of fresh) {
     const due = t.deadline ? ` · Due ${t.deadline}` : '';
-    notify('New task assigned', `${t.title}\nFrom ${t.assigned_by_name}${due}`, '/tasks/' + t.id);
+    if (t.asked_by) notify(`${t.asked_by} asked you: ${t.title}`, `Click to open the task.${due}`, '/tasks/' + t.id);
+    else notify('New task assigned', `${t.title}\nFrom ${t.assigned_by_name}${due}`, '/tasks/' + t.id);
   }
   if (newApprovals.length > 3) notify(`${newApprovals.length} tasks waiting for your approval`, 'Click to review them.', '/tasks?status=submitted');
   else for (const t of newApprovals) notify(`${t.assignee_name} submitted '${t.title}' for approval`, 'Click to review it.', '/tasks/' + t.id);
@@ -341,6 +349,8 @@ function notifyNewTasks(data) {
     else notify(`New document request for ${r.team_name}: ${r.title}`, 'Click to open the request.', '/requests/' + r.id);
   }
   for (const r of reminders.slice(0, 5)) notify(`Still unassigned: ${r.title}`, `Open for more than a day in ${r.team_name}. Click to assign it.`, '/requests/' + r.id);
+  for (const r of newAsks.slice(0, 5)) notify(`${r.requested_by_name}${r.requester_team_name ? ` (${r.requester_team_name})` : ''} asked ${r.person_name}: ${r.title}`, 'Click to open the request.', '/requests/' + r.id);
+  for (const r of newWithdrawn.slice(0, 5)) notify(`${r.requested_by_name} withdrew: ${r.title}`, 'The task was removed. Click to open the request.', '/requests/' + r.id);
   for (const r of nowReady) notify(`${r.title} is ready`, 'Click to open the request.', '/requests/' + r.id);
   for (const r of newNeedsTeam.slice(0, 5)) notify(`New request needs a team: ${r.title}`, 'Click to choose a team.', '/requests/' + r.id);
   if (shown.length && widgetWin && !widgetWin.isDestroyed()) widgetWin.webContents.send('new-task'); // wave and bounce the mascot

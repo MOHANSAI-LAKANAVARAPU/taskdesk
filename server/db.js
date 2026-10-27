@@ -191,6 +191,19 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   if (!db.prepare('PRAGMA table_info(requests)').all().some(c => c.name === 'reminded_at')) {
     db.exec('ALTER TABLE requests ADD COLUMN reminded_at TEXT');
   }
+  // Ask a person: the person the request was sent to (cleared when they give it back). Withdraw: who had it then.
+  const reqCols = db.prepare('PRAGMA table_info(requests)').all().map(c => c.name);
+  if (!reqCols.includes('asked_person_id')) db.exec('ALTER TABLE requests ADD COLUMN asked_person_id INTEGER REFERENCES users(id) ON DELETE SET NULL');
+  if (!reqCols.includes('withdrawn_from_id')) db.exec('ALTER TABLE requests ADD COLUMN withdrawn_from_id INTEGER REFERENCES users(id) ON DELETE SET NULL');
+  // Teams that work together: their members may send requests to each other. Two-way, each pair once (smaller id first).
+  db.exec(`CREATE TABLE IF NOT EXISTS team_connections (
+      team_a_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      team_b_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (team_a_id, team_b_id),
+      CHECK (team_a_id < team_b_id)
+    )`);
 })();
 
 // Create the first admin account if there are no users yet.
