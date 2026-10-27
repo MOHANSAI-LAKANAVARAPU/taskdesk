@@ -274,7 +274,8 @@ app.post('/api/users', auth, requireBoss, (req, res) => {
   if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return bad(res, 'A user with this email already exists.');
   const r = db.prepare('INSERT INTO users (name,email,password_hash,role,lead_id,team_id) VALUES (?,?,?,?,?,?)')
     .run(name, email, bcrypt.hashSync(password, 10), role, lead_id, team_id);
-  res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(r.lastInsertRowid)) });
+  const became_lead = autoLead(r.lastInsertRowid);
+  res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(r.lastInsertRowid)), became_lead });
 });
 
 app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
@@ -314,7 +315,9 @@ app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
   if (keys.length) db.prepare(`UPDATE users SET ${keys.map(k => k + ' = ?').join(', ')} WHERE id = ?`).run(...keys.map(k => f[k]), target.id);
   if (f.active === 0 || f.password_hash) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);
   if (f.role === 'employee' || f.active === 0) db.prepare('UPDATE teams SET lead_id = NULL WHERE lead_id = ?').run(target.id); // can no longer lead a team
-  res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(target.id)) });
+  // Only when the team or the role changed (a manager may have cleared the team's lead on purpose).
+  const became_lead = (f.team_id !== undefined && f.team_id !== target.team_id) || (f.role !== undefined && f.role !== target.role) ? autoLead(target.id) : null;
+  res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(target.id)), became_lead });
 });
 
 // ---------- projects ----------
@@ -604,19 +607,39 @@ app.post('/api/tasks/:id/send-back', auth, (req, res) => {
 });
 
 // ---------- teams ----------
-function teamRows(u) {
-  const teams = db.prepare(`SELECT tm.*, l.name AS lead_name, (SELECT COUNT(*) FROM users m WHERE m.team_id = tm.id AND m.active = 1) AS member_count
-    FROM teams tm LEFT JOIN users l ON l.id = tm.lead_id ORDER BY tm.name`).all();
-  for (const t of teams) {
-    // Member names: managers/admins, the team's lead and its own members.
-    if (isBoss(u) || t.lead_id === u.id || u.team_id === t.id) {
-      t.members = db.prepare('SELECT id, name, role, active FROM users WHERE team_id = ? ORDER BY active DESC, name').all(t.id)
-        .map(m => ({ ...m, active: !!m.active }));
-    }
-  }
-  return teams;
+// Teams are a company directory: everyone sees every team and its members. Open task/request counts only for
+// the team's lead and managers/admins.
+const canSeeTeamCounts = (u, t) => isBoss(u) || t.lead_id === u.id;
+const OPEN_TEAM_TASKS = `(SELECT COUNT(*) FROM tasks t JOIN users m ON m.id = t.assignee_id WHERE m.team_id = tm.id AND t.status != 'completed')`;
+const OPEN_TEAM_REQUESTS = `(SELECT COUNT(*) FROM requests r WHERE r.target_team_id = tm.id AND r.status = 'open')`;
+const TEAM_SELECT = `SELECT tm.*, l.name AS lead_name, (SELECT COUNT(*) FROM users m WHERE m.team_id = tm.id AND m.active = 1) AS member_count,
+  ${OPEN_TEAM_TASKS} AS open_tasks, ${OPEN_TEAM_REQUESTS} AS open_requests FROM teams tm LEFT JOIN users l ON l.id = tm.lead_id`;
+function teamView(u, t) {
+  const v = { id: t.id, name: t.name, lead_id: t.lead_id, lead_name: t.lead_name, member_count: t.member_count, mine: u.team_id === t.id,
+    can_see_counts: canSeeTeamCounts(u, t) };
+  if (v.can_see_counts) { v.open_tasks = t.open_tasks; v.open_requests = t.open_requests; }
+  return v;
 }
-app.get('/api/teams', auth, (req, res) => res.json({ teams: teamRows(req.user) }));
+app.get('/api/teams', auth, (req, res) => res.json({ teams: db.prepare(`${TEAM_SELECT} ORDER BY tm.name`).all().map(t => teamView(req.user, t)) }));
+app.get('/api/teams/:id', auth, (req, res) => {
+  const u = req.user, t = db.prepare(`${TEAM_SELECT} WHERE tm.id = ?`).get(Number(req.params.id));
+  if (!t) return bad(res, 'Team not found.', 404);
+  const team = teamView(u, t);
+  const members = db.prepare(`SELECT m.id, m.name, m.role, m.email, m.active,
+      (SELECT COUNT(*) FROM tasks t WHERE t.assignee_id = m.id AND t.status != 'completed') AS open_tasks
+    FROM users m WHERE m.team_id = ? ${isBoss(u) ? '' : 'AND m.active = 1'} ORDER BY m.active DESC, m.id = ? DESC, m.name`).all(t.id, t.lead_id || 0)
+    .map(m => { const x = { ...m, active: !!m.active, is_lead: m.id === t.lead_id }; if (!team.can_see_counts) delete x.open_tasks; return x; });
+  const lead = t.lead_id ? db.prepare('SELECT id, name, role, email, team_id FROM users WHERE id = ?').get(t.lead_id) : null;
+  res.json({ team, lead, members, can_manage: isBoss(u), can_assign: canSeeTeamCounts(u, t) });
+});
+// A user with role "lead" who joins a team without a lead becomes its lead (setting the role and the team's lead used
+// to be two separate steps that were easy to miss). Returns { team_id, team_name } when it happened.
+function autoLead(userId) {
+  const m = db.prepare(`SELECT us.name, tm.id AS team_id, tm.name AS team_name FROM users us JOIN teams tm ON tm.id = us.team_id
+    WHERE us.id = ? AND us.active = 1 AND us.role = 'lead' AND tm.lead_id IS NULL`).get(userId);
+  if (!m || !db.prepare('UPDATE teams SET lead_id = ? WHERE id = ? AND lead_id IS NULL').run(userId, m.team_id).changes) return null;
+  return { team_id: m.team_id, team_name: m.team_name, name: m.name };
+}
 
 function teamFields(req, res, current) {
   const name = req.body.name !== undefined ? str(req.body.name, 120) : current && current.name;
@@ -663,7 +686,7 @@ function memberTarget(req, res) {
 app.put('/api/teams/:id/members/:userId', auth, requireBoss, (req, res) => {
   const t = memberTarget(req, res); if (!t) return;
   db.prepare('UPDATE users SET team_id = ? WHERE id = ?').run(t.team.id, t.user.id);
-  res.json({ ok: true });
+  res.json({ ok: true, became_lead: autoLead(t.user.id) });
 });
 app.delete('/api/teams/:id/members/:userId', auth, requireBoss, (req, res) => {
   const t = memberTarget(req, res); if (!t) return;
@@ -928,9 +951,22 @@ app.get('/api/history', auth, (req, res) => {
 });
 
 // ---------- desktop app summary ----------
+// A request still open (nobody took it) 24 hours after it became open — posted, sent to a team or given back — is
+// marked once with reminded_at; the desktop app then reminds the team's lead and managers/admins ("Still unassigned").
+// Runs on every summary check (each desktop app checks every minute), so no timer is needed.
+function remindStaleRequests() {
+  db.prepare(`UPDATE requests SET reminded_at = ? WHERE status = 'open' AND reminded_at IS NULL
+    AND MAX(created_at, COALESCE((SELECT MAX(e.created_at) FROM request_events e WHERE e.request_id = requests.id), '')) < datetime('now', '-24 hours')`)
+    .run(new Date().toISOString());
+}
+// Open requests waiting for someone to assign them: for teams the user leads (managers/admins: all teams).
+const LEAD_OPEN_REQUESTS = `SELECT r.id, r.title, r.needed_by, r.status, r.reminded_at, tm.name AS team_name, rb.name AS requested_by_name
+  FROM requests r JOIN teams tm ON tm.id = r.target_team_id JOIN users rb ON rb.id = r.requested_by WHERE r.status = 'open'`;
+
 // Open tasks assigned to the signed-in person: used for the desktop icon badge and new-task notifications.
 app.get('/api/my-summary', auth, (req, res) => {
   const u = req.user;
+  remindStaleRequests();
   const OVERDUE = `status != 'completed' AND deadline IS NOT NULL AND deadline < date('now','localtime')`;
   const counts = db.prepare(`SELECT COUNT(*) AS open, SUM(${OVERDUE}) AS overdue
     FROM tasks WHERE assignee_id = ? AND status != 'completed'`).get(u.id);
@@ -949,14 +985,22 @@ app.get('/api/my-summary', auth, (req, res) => {
   const approvals = db.prepare(`SELECT t.id, t.title, t.deadline, t.priority, t.submitted_at, a.name AS assignee_name
     FROM tasks t JOIN users a ON a.id = t.assignee_id WHERE ${rs.sql} AND t.assignee_id != ? ORDER BY t.submitted_at LIMIT 100`).all(...rs.params, u.id);
   // Open document requests for my team (or teams I lead), and my own requests that have been delivered.
-  const team_requests = db.prepare(`SELECT r.id, r.title, tm.name AS team_name FROM requests r JOIN teams tm ON tm.id = r.target_team_id
+  // `i_lead`: the user leads that team (the desktop app then says "assign it to someone").
+  const team_requests = db.prepare(`SELECT r.id, r.title, tm.name AS team_name, tm.lead_id = ? AS i_lead FROM requests r JOIN teams tm ON tm.id = r.target_team_id
     WHERE r.status = 'open' AND r.requested_by != ? AND (r.target_team_id = ? OR tm.lead_id = ?) ORDER BY r.id DESC LIMIT 100`)
-    .all(u.id, u.team_id || 0, u.id);
+    .all(u.id, u.id, u.team_id || 0, u.id).map(r => ({ ...r, i_lead: !!r.i_lead }));
+  // Open requests for teams the user leads (part of the badge), and the ones flagged "still unassigned" for the
+  // team's lead and for managers/admins.
+  const assign_requests = db.prepare(`${LEAD_OPEN_REQUESTS} AND tm.lead_id = ? ORDER BY r.id DESC LIMIT 100`).all(u.id)
+    .map(r => ({ id: r.id, title: r.title, team_name: r.team_name }));
+  const unassigned_reminders = db.prepare(`${LEAD_OPEN_REQUESTS} AND r.reminded_at IS NOT NULL ${isBoss(u) ? '' : 'AND tm.lead_id = ?'}
+    ORDER BY r.id DESC LIMIT 100`).all(...(isBoss(u) ? [] : [u.id])).map(r => ({ id: r.id, title: r.title, team_name: r.team_name }));
   const ready_requests = db.prepare(`SELECT id, title FROM requests WHERE requested_by = ? AND status = 'delivered' ORDER BY id DESC LIMIT 100`).all(u.id);
   // Managers/admins: requests posted without a team, waiting for someone to choose one.
   const needs_team_requests = isBoss(u) ? db.prepare(`SELECT id, title FROM requests WHERE status = 'needs_team' AND requested_by != ?
     ORDER BY id DESC LIMIT 100`).all(u.id) : [];
-  res.json({ user: publicUser(u), open: counts.open || 0, overdue: counts.overdue || 0, tasks, recently_approved, approvals, team_requests, ready_requests, needs_team_requests });
+  res.json({ user: publicUser(u), open: counts.open || 0, overdue: counts.overdue || 0, tasks, recently_approved, approvals, team_requests,
+    ready_requests, needs_team_requests, assign_requests, unassigned_reminders });
 });
 
 // ---------- dashboard ----------
@@ -990,7 +1034,16 @@ app.get('/api/dashboard', auth, (req, res) => {
   const rs = reviewScope(req.user);
   const awaiting_me = db.prepare(`${TASK_SELECT} WHERE ${rs.sql} ORDER BY t.submitted_at LIMIT 50`).all(...rs.params);
 
-  res.json({ totals, projects, people, due_soon, awaiting_me });
+  // "Requests to assign": open requests for teams the user leads; managers/admins: all open ones and those without a team.
+  const u = req.user;
+  const to_assign = isBoss(u)
+    ? db.prepare(`SELECT r.id, r.title, r.needed_by, r.status, tm.name AS team_name, rb.name AS requested_by_name
+        FROM requests r LEFT JOIN teams tm ON tm.id = r.target_team_id JOIN users rb ON rb.id = r.requested_by
+        WHERE r.status = 'needs_team' OR (r.status = 'open' AND r.target_team_id IS NOT NULL)
+        ORDER BY r.status = 'open', r.needed_by IS NULL, r.needed_by, r.id LIMIT 50`).all()
+    : u.role === 'lead' ? db.prepare(`${LEAD_OPEN_REQUESTS} AND tm.lead_id = ? ORDER BY r.needed_by IS NULL, r.needed_by, r.id LIMIT 50`).all(u.id) : [];
+
+  res.json({ totals, projects, people, due_soon, awaiting_me, to_assign });
 });
 
 app.use('/api', (req, res) => bad(res, 'Not found.', 404));

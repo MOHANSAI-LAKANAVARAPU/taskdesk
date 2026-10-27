@@ -14,7 +14,7 @@ Task assignment and tracking web app for managers, team leads and employees. Dep
 
 - **Backend:** Node.js (>=18) + Express 4. [server.js](server.js) holds all routes, auth and permission logic. [db.js](db.js) opens SQLite (better-sqlite3, WAL, foreign keys ON), creates tables with `CREATE TABLE IF NOT EXISTS`, and seeds the first admin when the `users` table is empty.
 - **Auth:** bcryptjs password hashes; server-side sessions in the `sessions` table; random 32-byte token in an httpOnly, SameSite=Lax cookie `sid` (30 days; `Secure` when `COOKIE_SECURE=true`). Login is rate limited in memory (10 attempts / 15 min per IP). Changing or resetting a password invalidates other sessions; deactivating a user deletes their sessions.
-- **Frontend:** plain HTML/CSS/JS single-page app in [public/](public) ([index.html](public/index.html), [styles.css](public/styles.css), [app.js](public/app.js)). No frameworks, no build step. Hash routing: `#/` (dashboard), `#/tasks` (filters via query: `status`, `project`, `assignee`, `mine`), `#/tasks/:id`, `#/projects`, `#/people`, `#/account`, `#/login`. `app.js` is one IIFE with a `router()` that calls a `viewXxx()` function per page; `api()` wraps `fetch('/api' + path)` and throws on errors.
+- **Frontend:** plain HTML/CSS/JS single-page app in [public/](public) ([index.html](public/index.html), [styles.css](public/styles.css), [app.js](public/app.js)). No frameworks, no build step. Hash routing: `#/` (dashboard), `#/tasks` (filters via query: `status`, `project`, `assignee`, `mine`), `#/tasks/:id`, `#/projects`, `#/people` (managers/admins), `#/teams`, `#/teams/:id`, `#/requests`, `#/requests/:id`, `#/history`, `#/account`, `#/login`. `#/my-team` (old) and `#/people` for non-managers redirect to `#/teams`. `app.js` is one IIFE with a `router()` that calls a `viewXxx()` function per page; `api()` wraps `fetch('/api' + path)` and throws on errors.
 - **Static/SPA:** `express.static(public)`; unknown `/api/*` returns JSON 404; any other GET returns `index.html`. `.html`, `.js` and `.css` (and the SPA fallback) are sent with `Cache-Control: no-cache`, so updates show up on the next load.
 - **Deployment:** [Dockerfile](Dockerfile) (node:20-bookworm-slim, `npm ci --omit=dev`), [docker-compose.yml](docker-compose.yml) (port 3000, `./data` and `./updates` volumes, TZ/COOKIE_SECURE; admin name/email/password come from the untracked `.env` via `env_file`, see `.env.example`). [README.md](README.md) has deployment, Nginx, backup notes.
 - **Data:** SQLite file at `data/taskdesk.db` (or `$DATA_DIR`). Uploaded files in `data/uploads/` (random names; back this folder up together with the database).
@@ -37,12 +37,18 @@ Roles: `admin`, `manager`, `lead`, `employee`. `isBoss(u)` = admin or manager.
 | Create/edit projects | yes | yes | no | no |
 | List projects | yes (counts limited to visible tasks for non-bosses) | yes | yes | yes |
 | Assign (create) tasks | to any active user | to any active user | only active members of teams they lead, or self | no |
+| See teams and their members (name, role, email) | yes | yes | yes | yes |
+| See open task/request counts of a team | yes | yes | teams they lead | no |
 | Manage teams (create/rename/delete, lead, members) | yes | yes | no | no |
 | Edit/delete a task (`canEditTask`) | any | any | only tasks they assigned | no |
 | Self-claimed request task (assigned_by = assignee) | edit/delete (any status) | edit/delete (any status) | edit/delete if lead of the request's team; the claimer can't edit/delete, only "Give back" | claimer: "Give back" only |
 | Post progress update / change status | any visible task | any visible task | tasks they are assignee of or assigned | only tasks assigned to them |
 
-**Teams replace "Reports to".** A team's lead is `teams.lead_id` (must be an active lead/manager/admin; cleared automatically if that person becomes an employee or is deactivated). Each user has one `team_id`. `users.lead_id` stays in the database but is no longer used by the UI or by permission checks.
+**Teams replace "Reports to".** A team's lead is `teams.lead_id` (must be an active lead/manager/admin; cleared automatically if that person becomes an employee or is deactivated). Each user has one `team_id`. `users.lead_id` stays in the database but is no longer used by the UI or by permission checks. A person may lead more than one team.
+
+**Teams page (everyone).** `#/teams` is a grid of team blocks (3 columns wide, 1 on phones): name, lead (managers see "⚠ No lead"), active members, and for the team's lead and managers/admins the open tasks and open requests; the user's own team comes first ("Your team"). `#/teams/:id`: lead and members (name, role, email). The team's lead also sees each member's open task count and "Assign a task" (opens the task form with that person picked); managers/admins also get Add member (type-to-search), Remove, Set lead (active leads/managers/admins, marked "already leads <team>"), Rename and Delete.
+
+**Auto-lead (`autoLead`).** When an active user with role `lead` joins a team that has no lead — `POST /api/users` with a team, `PATCH /api/users/:id` that changes their team or role, or `PUT /api/teams/:id/members/:userId` — they become its lead; the response carries `became_lead: { team_id, team_name, name }` and the UI shows "<name> is now the lead of <team>". (A PATCH that changes neither team nor role never does this, so a lead a manager cleared on purpose stays cleared.) The People page shows "Lead of <team>" under the role, and "⚠ Not leading a team yet – set it on the Teams page" for an active role-`lead` user who leads no team.
 
 Other rules: a user cannot deactivate themself; only admins can create admins or modify admin accounts. Deadlines/start dates are `YYYY-MM-DD`.
 
@@ -64,6 +70,9 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - Any user creates a request for a target team (title, details, needed-by date, optional files). The **Requests** board (`#/requests`) is visible to every signed-in user; description is visible to all, attachments and delivered files only to the requester, target-team members, the team's lead, the assignee and managers/admins.
 - Status (validated in server.js, **no CHECK constraint**, so adding a status needs no table rebuild): `needs_team` (posted with "Not sure, let a manager decide", no `target_team_id`; nobody can take/assign it; a manager/admin uses "Send to team" → `POST /api/requests/:id/send-to-team {team_id}`, which sets the team, makes it `open` and logs "Sent to <team> by <name>" in `request_events`) → `open` → `assigned` (linked task created) → `delivered` (linked task approved/completed) → `closed` (requester clicks "Mark as received"). `cancelled`: requester or manager/admin, only while `needs_team` or `open`. History shows team "Not decided yet" for `needs_team`.
 - "Take this task": any active member of the target team (or any manager/admin, for any team) claims an open request → linked task with assignee = assigned_by = them (approved by the team's lead or a manager). "Assign to": managers/admins and the target team's lead pick an active team member (managers/admins: any active person, list grouped by team) → linked task with assigned_by = the person who clicked. Claims are atomic (`WHERE status = 'open'`).
+- "Assign to" on an open request (target team's lead and managers/admins) is a single-person type-to-search picker: the lead sees the team's active members, managers/admins everyone (the request's team first). The current user isn't listed (they use "Take this task"); with nobody left it says "No other members in <team> yet – add them on the Teams page".
+- Dashboard "Requests to assign" (`to_assign` in `GET /api/dashboard`): open requests for teams the user leads; managers/admins: all open ones plus `needs_team` ("Choose team"). "Assign" opens the same picker in a dialog.
+- Reminder: `remindStaleRequests()` runs on every `GET /api/my-summary` and sets `requests.reminded_at` (once, never reset) on requests still `open` 24 hours after they became open (the later of `created_at` and the latest `request_events` entry, i.e. "Sent to team" or "gave back"). Flagged open requests are returned as `unassigned_reminders` to the team's lead and to managers/admins.
 - "Give back" (`POST /api/tasks/:id/give-back`): the claimer of a self-claimed request task, only while the task is `assigned`/`in_progress`, removes the task and its files, sets the request back to `open` and logs "<name> gave the request back" in `request_events`. The team is notified again because the request reappears among open `team_requests` (the desktop app sees it as new if it polled while the request was taken, i.e. after about a minute).
 - Reopening a completed linked task moves the request back to `assigned`; deleting the linked task of an `assigned` request puts it back to `open`; deleting the task of a delivered/closed request is refused.
 
@@ -86,7 +95,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - **task_updates**: id, task_id → tasks (cascade), user_id → users, message, progress, status, created_at. Activity log: progress posts, status changes, assignment/reassignment/deadline notes. Index on task_id.
 - **teams**: id, name (unique, NOCASE), lead_id → users (SET NULL), created_at. "R&D", "Testing", "STQC Documentation" are created once, when the table is first created.
 - **users.team_id** → teams (added with `ALTER TABLE`).
-- **requests**: id, title, description, needed_by, requested_by → users, target_team_id → teams (SET NULL), status (validated in server.js), task_id → tasks (SET NULL), created_at, delivered_at, closed_at.
+- **requests**: id, title, description, needed_by, requested_by → users, target_team_id → teams (SET NULL), status (validated in server.js), task_id → tasks (SET NULL), created_at, delivered_at, closed_at, reminded_at ("still unassigned" reminder sent; added with `ALTER TABLE` in 1.0.11, backup `../backups/taskdesk-before-team-blocks-2026-10-27.*`).
 - **request_events**: id, request_id → requests (cascade), user_id → users, message, created_at. Request activity (currently "Sent to <team> by <name>").
 - **files**: id, original_name, stored_name (random, unique), size, mime (from the extension), uploaded_by → users, task_id → tasks (cascade), update_id → task_updates, request_id → requests (cascade), created_at.
 
@@ -101,7 +110,7 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | GET `/api/me` | signed in | Current user |
 | POST `/api/me/password` | signed in | Change own password (`current`, `next` ≥ 8 chars) |
 | GET `/api/users` | signed in (scoped by role) | List users |
-| POST `/api/users` | boss | Add person |
+| POST `/api/users` | boss | Add person (returns `became_lead`) |
 | PATCH `/api/users/:id` | boss | Edit name/email/role/lead_id/active/password |
 | GET `/api/projects` | signed in | Projects with total/completed counts over visible tasks |
 | POST `/api/projects` | boss | Create project |
@@ -115,10 +124,11 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | POST `/api/tasks/:id/submit` | assignee | Submit for approval (`note` required) |
 | POST `/api/tasks/:id/approve` | assigner or boss (not the assignee) | Approve a submitted task (`note` optional) |
 | POST `/api/tasks/:id/send-back` | assigner or boss (not the assignee) | Send back (`reason` required) |
-| GET `/api/my-summary` | signed in | `user`, `open`, `overdue`, `tasks` (own open tasks with `status`, and `sent_back_reason` after a send-back; max 100), `recently_approved` (own tasks approved in the last 3 days), `approvals` (submitted tasks waiting for this user's approval), `team_requests` (open requests for the user's team or teams they lead, not made by them), `ready_requests` (the user's own delivered requests), `needs_team_requests` (managers/admins only: requests without a team, not made by them). Used by the desktop app |
-| GET `/api/teams` | signed in | Teams with lead and member count; member names for managers, the team's lead and its members |
+| GET `/api/my-summary` | signed in | `user`, `open`, `overdue`, `tasks` (own open tasks with `status`, and `sent_back_reason` after a send-back; max 100), `recently_approved` (own tasks approved in the last 3 days), `approvals` (submitted tasks waiting for this user's approval), `team_requests` (open requests for the user's team or teams they lead, not made by them), `ready_requests` (the user's own delivered requests), `needs_team_requests` (managers/admins only: requests without a team, not made by them), `assign_requests` (open requests for teams the user leads), `unassigned_reminders` (open requests flagged after 24 h, for the team's lead and managers/admins); `team_requests` rows carry `i_lead`. Used by the desktop app |
+| GET `/api/teams` | signed in | All teams: lead, active member count, `mine`, `can_see_counts`; `open_tasks`/`open_requests` only for the team's lead and managers/admins |
+| GET `/api/teams/:id` | signed in | Team, `lead`, `members` (name, role, email; managers also see deactivated ones; `open_tasks` per member only for the lead and managers/admins), `can_manage`, `can_assign` |
 | POST/PATCH/DELETE `/api/teams[/:id]` | boss | Add / rename + set lead / delete (refused while unfinished requests target it) |
-| PUT/DELETE `/api/teams/:id/members/:userId` | boss | Add (moves from old team) / remove a member |
+| PUT/DELETE `/api/teams/:id/members/:userId` | boss | Add (moves from old team; returns `became_lead`) / remove a member |
 | GET `/api/requests` | signed in | Board; query `team`, `status` (`active` = open/assigned/delivered) |
 | GET `/api/requests/:id` | signed in | Request + `can_take`, `can_assign` (+ `members`), `can_cancel`, `can_receive`, `can_attach`, `files`, `delivered_files` |
 | POST `/api/requests` | signed in | New request (multipart for files) |
@@ -126,7 +136,7 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | GET `/api/files/:id` | see "Files" | Download |
 | GET `/api/history` | signed in (scoped) | History rows; `?format=csv` for Excel |
 | GET `/api/version` | public | `{ build }`: hash of server.js, db.js, package.json and `public/*`; changes on every deploy. The desktop app reloads the dashboard window when it changes |
-| GET `/api/dashboard` | signed in (scoped) | `totals`, `projects`, `people`, `due_soon`, `awaiting_me` |
+| GET `/api/dashboard` | signed in (scoped) | `totals`, `projects`, `people`, `due_soon`, `awaiting_me`, `to_assign` |
 
 ## Run locally
 
@@ -146,7 +156,7 @@ To reset a dev database, stop the server and delete `data/` (dev only — never 
 ## Desktop app (Electron, Windows and Ubuntu)
 
 - Source lives in `../desktop` (sibling folder of `server/`; dependencies not installed yet — run `npm install` there only when needed).
-- Notifications (compared with the previous check; last statuses are stored in `config.json` as `knownStatuses` / `knownApprovalIds`): approver gets "<name> submitted '<task>' for approval"; the employee gets "'<task>' was approved" or "'<task>' was sent back: <reason>"; team members (and the team's lead) get "New document request for <team>: <title>"; the requester gets "<title> is ready"; managers/admins get "New request needs a team: <title>" (`knownNeedsTeamIds`) (request notifications open `#/requests/<id>`; tracked as `knownRequestIds` / `knownReadyIds`). Each one waves the mascot. Badge = own open tasks + tasks waiting for the user's approval.
+- Notifications (compared with the previous check; last statuses are stored in `config.json` as `knownStatuses` / `knownApprovalIds`): approver gets "<name> submitted '<task>' for approval"; the employee gets "'<task>' was approved" or "'<task>' was sent back: <reason>"; team members get "New document request for <team>: <title>", the team's lead gets "New request for <team>: <title> – assign it to someone"; the lead and managers/admins get "Still unassigned: <title>" once per request (`knownReminderIds`, only grows, max 500); the requester gets "<title> is ready"; managers/admins get "New request needs a team: <title>" (`knownNeedsTeamIds`) (request notifications open `#/requests/<id>`; tracked as `knownRequestIds` / `knownReadyIds`). Each one waves the mascot. Badge = own open tasks + tasks waiting for the user's approval + open requests for teams the user leads (`assign_requests`) + for managers/admins requests without a team (`needs_team_requests`).
 - It talks to this server through `GET /api/my-summary` (open task count + list of the signed-in user's open tasks), used for the icon badge and new-task notifications. Keep that endpoint's response shape stable (`open`, `overdue`, `tasks`) or the desktop app breaks.
 - Default server address: `http://192.168.1.222:3000`, set in the app's `package.json` under `"taskdesk.defaultServer"`.
 - First-time installers for employee laptops: `../installers/` (`TaskDesk Setup <version>.exe` for Windows, `TaskDesk-<version>.AppImage` for Ubuntu; the .deb is no longer built).

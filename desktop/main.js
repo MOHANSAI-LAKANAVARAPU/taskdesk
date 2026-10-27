@@ -39,7 +39,7 @@ else { app.on('second-instance', () => { createWidget(); openDashboard(); }); }
 
 // ---------- config ----------
 let cfgPath;
-let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null, knownNeedsTeamIds: null };
+let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null, knownNeedsTeamIds: null, knownReminderIds: null };
 function loadConfig() {
   cfgPath = path.join(app.getPath('userData'), 'config.json');
   try { cfg = Object.assign(cfg, JSON.parse(fs.readFileSync(cfgPath, 'utf8'))); } catch (e) { /* first run */ }
@@ -192,7 +192,7 @@ ipcMain.handle('test-server', async (e, url) => {
 ipcMain.handle('save-server', (e, url) => {
   const changed = cleanUrl(url) !== cfg.server;
   cfg.server = cleanUrl(url);
-  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; cfg.knownRequestIds = null; cfg.knownReadyIds = null; cfg.knownNeedsTeamIds = null; }
+  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; cfg.knownRequestIds = null; cfg.knownReadyIds = null; cfg.knownNeedsTeamIds = null; cfg.knownReminderIds = null; }
   saveConfig();
   if (setupWin) setupWin.destroy();
   startApp(true);
@@ -206,7 +206,7 @@ function schedulePoll(ms) { clearTimeout(pollTimer); pollTimer = setTimeout(poll
 
 function recordCheck(ok, info) {
   lastCheck = Object.assign({ ok, time: new Date() }, info);
-  if (ok) console.log(`[summary] ok user=${info.user} open=${info.own} approvals=${info.approvals} badge=${info.open} overdue=${info.overdue}`
+  if (ok) console.log(`[summary] ok user=${info.user} open=${info.own} approvals=${info.approvals} assign=${info.assign} badge=${info.open} overdue=${info.overdue}`
     + ` team_requests=${info.teamRequests} ready=${info.ready} needs_team=${info.needsTeam}`);
   else console.warn(`[summary] failed: ${info.reason}`);
   buildTrayMenu();
@@ -258,10 +258,13 @@ async function poll() {
     session.defaultSession.cookies.flushStore().catch(() => {}); // keep the sign-in after a restart
     notifyNewTasks(data);
     const approvals = (data.approvals || []).length;
-    // Badge = my own open tasks + tasks waiting for my approval
-    setSummary({ state: 'ok', open: data.open + approvals, own: data.open, approvals, overdue: data.overdue, name: data.user && data.user.name });
+    // Requests waiting for me to assign them: open requests for teams I lead (+ requests without a team for managers/admins).
+    const assign = (data.assign_requests || []).length + (data.needs_team_requests || []).length;
+    // Badge = my own open tasks + tasks waiting for my approval + requests waiting for me to assign them
+    const badge = data.open + approvals + assign;
+    setSummary({ state: 'ok', open: badge, own: data.open, approvals, assign, overdue: data.overdue, name: data.user && data.user.name });
     checkServerVersion();
-    recordCheck(true, { user: data.user && data.user.id, own: data.open, approvals, open: data.open + approvals, overdue: data.overdue,
+    recordCheck(true, { user: data.user && data.user.id, own: data.open, approvals, assign, open: badge, overdue: data.overdue,
       teamRequests: (data.team_requests || []).length, ready: (data.ready_requests || []).length, needsTeam: (data.needs_team_requests || []).length });
   } catch (e) {
     // fetch wraps the network error; the useful code (ECONNREFUSED, ENOTFOUND, …) is on e.cause or its inner errors.
@@ -280,11 +283,13 @@ function notifyNewTasks(data) {
   const approvalIds = (data.approvals || []).map(t => t.id);
   const requestIds = (data.team_requests || []).map(r => r.id), readyIds = (data.ready_requests || []).map(r => r.id);
   const needsTeamIds = (data.needs_team_requests || []).map(r => r.id);
+  const reminderIds = (data.unassigned_reminders || []).map(r => r.id);
   if (!data.user || cfg.knownUser !== data.user.id) {
     // First check for this person: remember current tasks without a burst of notifications.
     cfg.knownUser = data.user ? data.user.id : null; cfg.knownTaskIds = ids;
     cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds;
-    cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; cfg.knownNeedsTeamIds = needsTeamIds; saveConfig(); return;
+    cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; cfg.knownNeedsTeamIds = needsTeamIds;
+    cfg.knownReminderIds = reminderIds; saveConfig(); return;
   }
   const known = new Set(cfg.knownTaskIds);
   const fresh = data.tasks.filter(t => !known.has(t.id));
@@ -306,6 +311,10 @@ function notifyNewTasks(data) {
   const nowReady = cfg.knownReadyIds ? (data.ready_requests || []).filter(r => !cfg.knownReadyIds.includes(r.id)) : [];
   // Managers/admins: requests posted without a team.
   const newNeedsTeam = cfg.knownNeedsTeamIds ? (data.needs_team_requests || []).filter(r => !cfg.knownNeedsTeamIds.includes(r.id)) : [];
+  // "Still unassigned" (the server flags a request once, 24 hours after it opened). Remembered ids only grow, so each
+  // request reminds once, even if it is given back later. Older config.json files: record silently first.
+  const reminders = cfg.knownReminderIds ? (data.unassigned_reminders || []).filter(r => !cfg.knownReminderIds.includes(r.id)) : [];
+  cfg.knownReminderIds = [...new Set((cfg.knownReminderIds || []).concat(reminderIds))].slice(-500);
 
   cfg.knownTaskIds = ids; cfg.knownStatuses = statuses; cfg.knownApprovalIds = approvalIds;
   cfg.knownRequestIds = requestIds; cfg.knownReadyIds = readyIds; cfg.knownNeedsTeamIds = needsTeamIds; saveConfig();
@@ -326,7 +335,12 @@ function notifyNewTasks(data) {
   if (newApprovals.length > 3) notify(`${newApprovals.length} tasks waiting for your approval`, 'Click to review them.', '/tasks?status=submitted');
   else for (const t of newApprovals) notify(`${t.assignee_name} submitted '${t.title}' for approval`, 'Click to review it.', '/tasks/' + t.id);
   for (const r of reviews) notify(r.text, 'Click to open the task.', '/tasks/' + r.id);
-  for (const r of newRequests.slice(0, 5)) notify(`New document request for ${r.team_name}: ${r.title}`, 'Click to open the request.', '/requests/' + r.id);
+  // The team's lead is asked to assign it; members are told about it.
+  for (const r of newRequests.slice(0, 5)) {
+    if (r.i_lead) notify(`New request for ${r.team_name}: ${r.title} – assign it to someone`, 'Click to choose who does it.', '/requests/' + r.id);
+    else notify(`New document request for ${r.team_name}: ${r.title}`, 'Click to open the request.', '/requests/' + r.id);
+  }
+  for (const r of reminders.slice(0, 5)) notify(`Still unassigned: ${r.title}`, `Open for more than a day in ${r.team_name}. Click to assign it.`, '/requests/' + r.id);
   for (const r of nowReady) notify(`${r.title} is ready`, 'Click to open the request.', '/requests/' + r.id);
   for (const r of newNeedsTeam.slice(0, 5)) notify(`New request needs a team: ${r.title}`, 'Click to choose a team.', '/requests/' + r.id);
   if (shown.length && widgetWin && !widgetWin.isDestroyed()) widgetWin.webContents.send('new-task'); // wave and bounce the mascot
@@ -336,7 +350,7 @@ function setSummary(s) {
   lastSummary = Object.assign({ open: 0, overdue: 0 }, s);
   sendSummary();
   if (tray) {
-    const tip = s.state === 'ok' ? `TaskDesk: ${s.own} open task${s.own === 1 ? '' : 's'}${s.approvals ? `, ${s.approvals} waiting for your approval` : ''}${s.overdue ? `, ${s.overdue} overdue` : ''}`
+    const tip = s.state === 'ok' ? `TaskDesk: ${s.own} open task${s.own === 1 ? '' : 's'}${s.approvals ? `, ${s.approvals} waiting for your approval` : ''}${s.assign ? `, ${s.assign} request${s.assign === 1 ? '' : 's'} to assign` : ''}${s.overdue ? `, ${s.overdue} overdue` : ''}`
       : s.state === 'signed-out' ? 'TaskDesk: sign in to see your tasks'
       : s.state === 'offline' ? 'TaskDesk: can’t reach the server' : 'TaskDesk';
     tray.setToolTip(tip);

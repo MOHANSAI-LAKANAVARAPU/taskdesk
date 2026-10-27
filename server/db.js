@@ -187,6 +187,10 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
     CREATE INDEX IF NOT EXISTS idx_files_task ON files(task_id);
     CREATE INDEX IF NOT EXISTS idx_files_request ON files(request_id);`);
   fs.mkdirSync(path.join(dataDir, 'uploads'), { recursive: true });
+  // When the "still unassigned after 24 hours" reminder went out (once per request).
+  if (!db.prepare('PRAGMA table_info(requests)').all().some(c => c.name === 'reminded_at')) {
+    db.exec('ALTER TABLE requests ADD COLUMN reminded_at TEXT');
+  }
 })();
 
 // Create the first admin account if there are no users yet.
