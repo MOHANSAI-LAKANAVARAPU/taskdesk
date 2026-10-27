@@ -409,14 +409,14 @@
       </div>`;
 
     if (can_give_back) $('#giveBack').onclick = async () => {
-      if (!confirm('Give this request back? The task and any files attached to it will be removed, and the request goes back to the team as open.')) return;
+      if (!confirm('Give this request back? Your task is removed (kept in History) and the request goes back to the team as open.')) return;
       try { const r = await api(`/tasks/${t.id}/give-back`, { method: 'POST' }); toast('Request given back to the team'); location.hash = '#/requests/' + r.request_id; }
       catch (e) { toast(e.message); }
     };
     if (can_edit) {
       $('#editTask').onclick = () => taskForm(t);
       $('#delTask').onclick = async () => {
-        if (!confirm('Delete this task and its updates? This can’t be undone.')) return;
+        if (!confirm('Delete this task? It disappears from task lists but stays in History, where a manager can restore it.')) return;
         await api('/tasks/' + t.id, { method: 'DELETE' }); toast('Task deleted'); location.hash = '#/tasks';
       };
     }
@@ -780,7 +780,8 @@
           ${d.can_take && !d.take_blocked ? `<button class="btn" id="takeBtn">Take this task</button>` : ''}
           ${d.can_receive ? `<button class="btn" id="recvBtn">Mark as received</button>` : ''}
           ${d.can_cancel ? `<button class="btn danger" id="cancelBtn">Cancel request</button>` : ''}
-          ${d.can_withdraw ? `<button class="btn danger" id="withdrawBtn">Withdraw request</button>` : ''}</div></div>
+          ${d.can_withdraw ? `<button class="btn danger" id="withdrawBtn">Withdraw request</button>` : ''}
+          ${d.can_delete ? `<button class="btn ghost" id="deleteReqBtn">Delete</button>` : ''}</div></div>
       ${d.take_blocked ? `<div class="card warn" style="margin-bottom:20px"><p style="margin:0">${esc(d.take_blocked)}</p></div>` : ''}
       ${r.status === 'needs_team' && !d.can_send_to_team ? `<div class="card" style="margin-bottom:20px"><p style="margin:0">No team was chosen for this request. A manager will send it to the right team.</p></div>` : ''}
       <div class="cols">
@@ -818,8 +819,12 @@
     };
     if ($('#recvBtn')) $('#recvBtn').onclick = () => act('received', undefined, 'Request closed');
     if ($('#cancelBtn')) $('#cancelBtn').onclick = () => { if (confirm('Cancel this request?')) act('cancel', undefined, 'Request cancelled'); };
+    if ($('#deleteReqBtn')) $('#deleteReqBtn').onclick = async () => {
+      if (!confirm('Delete this request? It is kept in History, where a manager can restore it.')) return;
+      try { await api('/requests/' + r.id, { method: 'DELETE' }); toast('Request deleted'); location.hash = '#/requests'; } catch (e) { toast(e.message); }
+    };
     if ($('#withdrawBtn')) $('#withdrawBtn').onclick = () => {
-      if (confirm(`Withdraw this request? ${r.assignee_name} will be told, and their task and any files on it will be deleted.`)) act('withdraw', undefined, 'Request withdrawn');
+      if (confirm(`Withdraw this request? ${r.assignee_name} will be told, and their task is removed (kept in History).`)) act('withdraw', undefined, 'Request withdrawn');
     };
     const asf = $('#assignForm');
     if (asf) {
@@ -849,9 +854,14 @@
     for (const k of ['person', 'team', 'status', 'from', 'to']) if (q.get(k)) params.set(k, q.get(k));
     const [{ rows }, { users }, { teams }] = await Promise.all([api('/history?' + params), api('/users'), api('/teams')]);
     const setQ = (k, v) => { if (v) q.set(k, v); else q.delete(k); location.hash = '#/history' + (q.toString() ? '?' + q : ''); };
-    const ALL = Object.assign({}, STATUS, { needs_team: 'Needs a team (request)', open: 'Open (request)', delivered: 'Delivered (request)', closed: 'Closed (request)', cancelled: 'Cancelled (request)' });
+    const ALL = Object.assign({}, STATUS, { needs_team: 'Needs a team (request)', open: 'Open (request)', delivered: 'Delivered (request)', closed: 'Closed (request)', cancelled: 'Cancelled (request)', deleted: 'Deleted' });
     const d = v => v ? fmtDate(v) : '<span class="muted">—</span>';
-    const pill = r => r.type === 'request' ? reqPill(r) : `<span class="pill st-${esc(r.status)}">${STATUS[r.status] || esc(r.status)}</span>`;
+    // Archived (deleted) items: "Deleted by <name> on <date>"; managers/admins can restore them or delete them permanently.
+    const pill = r => r.status === 'deleted' ? `<span class="pill rq-cancelled">Deleted</span>
+        <small class="muted deleted-note">Deleted by ${esc(r.deleted_by_name || 'unknown')} on ${fmtDate(r.deleted_at)}</small>
+        ${isBoss() ? `<span class="inline-actions"><button class="btn ghost small" data-restore="${r.type}/${r.id}">Restore</button>
+          <button class="btn danger small" data-purge="${r.type}/${r.id}">Delete permanently</button></span>` : ''}`
+      : r.type === 'request' ? reqPill(r) : `<span class="pill st-${esc(r.status)}">${STATUS[r.status] || esc(r.status)}</span>`;
     app.innerHTML = `
       <div class="page-head"><div><h1>History</h1><p>${rows.length} item${rows.length === 1 ? '' : 's'}. ${isBoss() ? 'All tasks and requests.' : me.role === 'lead' ? 'Your teams’ tasks and requests, and anything you assigned.' : 'Your own tasks and the requests you made.'}</p></div>
         <a class="btn" id="csvBtn" href="/api/history?${new URLSearchParams([...params, ['format', 'csv']])}" download>Export to Excel</a></div>
@@ -868,7 +878,7 @@
         <thead><tr><th>Title</th><th>Type</th><th>Status</th><th>Team</th><th>Assigned to</th><th>Assigned by</th><th>Requested by</th>
           <th>Assigned</th><th>Submitted</th><th>Approved</th><th>Completed</th><th>Approved by</th><th>Send-back reasons</th></tr></thead>
         <tbody>${rows.map(r => `<tr>
-          <td><a href="#/${r.type === 'request' ? 'requests' : 'tasks'}/${r.id}">${esc(r.title)}</a></td><td>${r.type === 'request' ? 'Request' : 'Task'}</td><td>${pill(r)}</td>
+          <td>${r.status === 'deleted' ? esc(r.title) : `<a href="#/${r.type === 'request' ? 'requests' : 'tasks'}/${r.id}">${esc(r.title)}</a>`}</td><td>${r.type === 'request' ? 'Request' : 'Task'}</td><td>${pill(r)}</td>
           <td>${esc(r.team_name || '—')}</td><td>${esc(r.assignee_name || '—')}</td><td>${esc(r.assigned_by_name || '—')}</td><td>${esc(r.requested_by_name || '—')}</td>
           <td>${d(r.assigned_at)}</td><td>${d(r.submitted_at)}</td><td>${d(r.approved_at)}</td><td>${d(r.completed_at)}</td>
           <td>${esc(r.approved_by_name || '—')}</td><td class="reasons">${esc(r.send_back_reasons || '')}</td></tr>`).join('')}</tbody></table></div>`
@@ -878,6 +888,16 @@
     $('#hStatus').onchange = e => setQ('status', e.target.value);
     $('#hFrom').onchange = e => setQ('from', e.target.value);
     $('#hTo').onchange = e => setQ('to', e.target.value);
+    const path = v => { const [type, id] = v.split('/'); return `/${type === 'request' ? 'requests' : 'tasks'}/${id}`; };
+    const title = v => rows.find(r => `${r.type}/${r.id}` === v).title;
+    app.querySelectorAll('[data-restore]').forEach(b => b.onclick = async () => {
+      try { await api(path(b.dataset.restore) + '/restore', { method: 'POST' }); toast('Restored'); router(); } catch (e) { toast(e.message); }
+    });
+    app.querySelectorAll('[data-purge]').forEach(b => b.onclick = async () => {
+      const v = b.dataset.purge;
+      if (!confirm(`Delete “${title(v)}” permanently? Its activity and attached files are removed for good. This can’t be undone.`)) return;
+      try { await api(path(v) + '/permanent', { method: 'DELETE' }); toast('Deleted permanently'); router(); } catch (e) { toast(e.message); }
+    });
   }
 
 

@@ -63,14 +63,15 @@ function validTeamLead(id) {
   return !!db.prepare(`SELECT 1 FROM users WHERE id = ? AND active = 1 AND role IN ('lead','manager','admin')`).get(id);
 }
 
-// Which tasks a user may see, as a SQL fragment on alias t.
-function taskScope(u) {
-  if (isBoss(u)) return { sql: '1=1', params: [] };
+// Which tasks a user may see, as a SQL fragment on alias t. Archived (deleted) tasks only with `archived` (History).
+function taskScope(u, archived = false) {
+  const live = archived ? '' : ' AND t.deleted_at IS NULL';
+  if (isBoss(u)) return { sql: '1=1' + live, params: [] };
   if (u.role === 'lead') return {
-    sql: `(t.assignee_id = ? OR t.assigned_by = ? OR t.assignee_id IN ${LED_MEMBERS} OR t.id IN ${LED_REQUEST_TASKS})`,
+    sql: `(t.assignee_id = ? OR t.assigned_by = ? OR t.assignee_id IN ${LED_MEMBERS} OR t.id IN ${LED_REQUEST_TASKS})${live}`,
     params: [u.id, u.id, u.id, u.id]
   };
-  return { sql: 't.assignee_id = ?', params: [u.id] };
+  return { sql: 't.assignee_id = ?' + live, params: [u.id] };
 }
 function canSeeTask(u, task) {
   const s = taskScope(u);
@@ -115,8 +116,8 @@ function ownPlainTask(task) { return task.assigned_by === task.assignee_id && !l
 const PERSON_TASKS = '(SELECT pr.task_id FROM requests pr JOIN tasks pt ON pt.id = pr.task_id WHERE pr.asked_person_id = pt.assignee_id)';
 const MY_PERSON_ASKS = '(SELECT pr.task_id FROM requests pr JOIN tasks pt ON pt.id = pr.task_id WHERE pr.asked_person_id = pt.assignee_id AND pr.requested_by = ? AND pt.assignee_id != pr.requested_by)';
 function reviewScope(u) {
-  return isBoss(u) ? { sql: `t.status = 'submitted' AND t.id NOT IN ${MY_PERSON_ASKS}`, params: [u.id] }
-    : { sql: `t.status = 'submitted' AND t.assignee_id != ? AND ((t.assigned_by = ? AND t.assigned_by != t.assignee_id AND t.id NOT IN ${PERSON_TASKS})
+  return isBoss(u) ? { sql: `t.status = 'submitted' AND t.deleted_at IS NULL AND t.id NOT IN ${MY_PERSON_ASKS}`, params: [u.id] }
+    : { sql: `t.status = 'submitted' AND t.deleted_at IS NULL AND t.assignee_id != ? AND ((t.assigned_by = ? AND t.assigned_by != t.assignee_id AND t.id NOT IN ${PERSON_TASKS})
         OR ((t.assigned_by = t.assignee_id OR t.id IN ${PERSON_TASKS}) AND t.id IN ${LED_REQUEST_TASKS} AND t.id NOT IN ${MY_PERSON_ASKS}))`,
       params: [u.id, u.id, u.id, u.id] };
 }
@@ -478,22 +479,26 @@ app.patch('/api/tasks/:id', auth, (req, res) => {
   res.json({ task: db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(task.id) });
 });
 
+// Archive a task (Delete, Give back, Withdraw) instead of removing it: the row and its files stay, hidden everywhere
+// except History, until a manager restores it or deletes it permanently. `requestId`: the request it was linked to.
+function archiveTask(taskId, u, requestId) {
+  db.prepare(`UPDATE tasks SET deleted_at = ?, deleted_by = ?, archived_request_id = ? WHERE id = ?`)
+    .run(new Date().toISOString(), u.id, requestId || null, taskId);
+}
 app.delete('/api/tasks/:id', auth, (req, res) => {
   const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(req.params.id));
   if (!task || !canSeeTask(req.user, task)) return bad(res, 'Task not found.', 404);
   if (!canEditTask(req.user, task)) return bad(res, isClaimer(req.user, task) ? GIVE_BACK_HINT : 'Only the person who assigned this task can delete it.', 403);
   const lr = linkedRequest(task.id);
   if (lr && ['delivered', 'closed'].includes(lr.status)) return bad(res, 'This task delivered a document request, so it can’t be deleted.', 409);
-  const stored = db.prepare('SELECT stored_name FROM files WHERE task_id = ?').all(task.id);
   db.transaction(() => {
     if (lr) db.prepare(`UPDATE requests SET status = 'open', task_id = NULL, asked_person_id = NULL WHERE id = ? AND status = 'assigned'`).run(lr.id); // back on the board
-    db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id);
+    archiveTask(task.id, req.user, lr && lr.id);
   })();
-  removeStoredFiles(stored);
   res.json({ ok: true });
 });
 
-// The claimer of a self-claimed request (or the person a request was sent to) hands it back: the task (and its files) is removed and the request is open again.
+// The claimer of a self-claimed request (or the person a request was sent to) hands it back: the task is archived and the request is open again.
 // Not allowed once submitted or completed. Team members are notified again because it reappears among open requests.
 app.post('/api/tasks/:id/give-back', auth, (req, res) => {
   const u = req.user;
@@ -503,13 +508,11 @@ app.post('/api/tasks/:id/give-back', auth, (req, res) => {
   if (!['assigned', 'in_progress'].includes(task.status)) return bad(res, 'This task has been submitted or completed, so it can’t be given back.', 409);
   const lr = linkedRequest(task.id);
   if (!lr || lr.status !== 'assigned') return bad(res, 'This request can’t be given back now.', 409);
-  const stored = db.prepare('SELECT stored_name FROM files WHERE task_id = ?').all(task.id);
   db.transaction(() => {
     db.prepare(`UPDATE requests SET status = 'open', task_id = NULL, asked_person_id = NULL WHERE id = ? AND status = 'assigned'`).run(lr.id);
     db.prepare('INSERT INTO request_events (request_id, user_id, message) VALUES (?,?,?)').run(lr.id, u.id, `${u.name} gave the request back`);
-    db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id);
+    archiveTask(task.id, u, lr.id);
   })();
-  removeStoredFiles(stored);
   res.json({ ok: true, request_id: lr.id });
 });
 
@@ -642,8 +645,8 @@ app.post('/api/tasks/:id/send-back', auth, (req, res) => {
 // Teams are a company directory: everyone sees every team and its members. Open task/request counts only for
 // the team's lead and managers/admins.
 const canSeeTeamCounts = (u, t) => isBoss(u) || t.lead_id === u.id;
-const OPEN_TEAM_TASKS = `(SELECT COUNT(*) FROM tasks t JOIN users m ON m.id = t.assignee_id WHERE m.team_id = tm.id AND t.status != 'completed')`;
-const OPEN_TEAM_REQUESTS = `(SELECT COUNT(*) FROM requests r WHERE r.target_team_id = tm.id AND r.status = 'open')`;
+const OPEN_TEAM_TASKS = `(SELECT COUNT(*) FROM tasks t JOIN users m ON m.id = t.assignee_id WHERE m.team_id = tm.id AND t.status != 'completed' AND t.deleted_at IS NULL)`;
+const OPEN_TEAM_REQUESTS = `(SELECT COUNT(*) FROM requests r WHERE r.target_team_id = tm.id AND r.status = 'open' AND r.deleted_at IS NULL)`;
 const TEAM_SELECT = `SELECT tm.*, l.name AS lead_name, (SELECT COUNT(*) FROM users m WHERE m.team_id = tm.id AND m.active = 1) AS member_count,
   ${OPEN_TEAM_TASKS} AS open_tasks, ${OPEN_TEAM_REQUESTS} AS open_requests FROM teams tm LEFT JOIN users l ON l.id = tm.lead_id`;
 // Connected teams ("works with"): two-way, each pair stored once with the smaller id first.
@@ -663,7 +666,7 @@ app.get('/api/teams/:id', auth, (req, res) => {
   if (!t) return bad(res, 'Team not found.', 404);
   const team = teamView(u, t);
   const members = db.prepare(`SELECT m.id, m.name, m.role, m.email, m.active,
-      (SELECT COUNT(*) FROM tasks t WHERE t.assignee_id = m.id AND t.status != 'completed') AS open_tasks
+      (SELECT COUNT(*) FROM tasks t WHERE t.assignee_id = m.id AND t.status != 'completed' AND t.deleted_at IS NULL) AS open_tasks
     FROM users m WHERE m.team_id = ? ${isBoss(u) ? '' : 'AND m.active = 1'} ORDER BY m.active DESC, m.id = ? DESC, m.name`).all(t.id, t.lead_id || 0)
     .map(m => { const x = { ...m, active: !!m.active, is_lead: m.id === t.lead_id }; if (!team.can_see_counts) delete x.open_tasks; return x; });
   const lead = t.lead_id ? db.prepare('SELECT id, name, role, email, team_id FROM users WHERE id = ?').get(t.lead_id) : null;
@@ -755,7 +758,9 @@ const REQ_SELECT = `SELECT r.*, rb.name AS requested_by_name, rb.team_id AS requ
   FROM requests r JOIN users rb ON rb.id = r.requested_by LEFT JOIN teams rt ON rt.id = rb.team_id LEFT JOIN teams tm ON tm.id = r.target_team_id
   LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN users a ON a.id = t.assignee_id
   LEFT JOIN users ap ON ap.id = r.asked_person_id LEFT JOIN users wf ON wf.id = r.withdrawn_from_id`;
-function getRequest(id) { return db.prepare(`${REQ_SELECT} WHERE r.id = ?`).get(id); }
+// Archived (deleted) requests are only reachable from History (getAnyRequest).
+function getRequest(id) { return db.prepare(`${REQ_SELECT} WHERE r.id = ? AND r.deleted_at IS NULL`).get(id); }
+function getAnyRequest(id) { return db.prepare(`${REQ_SELECT} WHERE r.id = ?`).get(id); }
 // Who may see a request (board, page, files, History): managers/admins, the requester, members and the lead of the
 // requester's team, members and the lead of the target team, and the person doing (or who was doing) it.
 function canSeeRequest(u, r) {
@@ -764,12 +769,13 @@ function canSeeRequest(u, r) {
 }
 const canSeeRequestFiles = canSeeRequest;
 // The same rule as SQL on alias r.
-function requestScope(u) {
-  if (isBoss(u)) return { sql: '1=1', params: [] };
+function requestScope(u, archived = false) {
+  const live = archived ? '' : ' AND r.deleted_at IS NULL';
+  if (isBoss(u)) return { sql: '1=1' + live, params: [] };
   const team = u.team_id || 0;
   return { sql: `(r.requested_by = ? OR r.requested_by IN (SELECT id FROM users WHERE team_id = ?) OR r.target_team_id = ?
       OR r.requested_by IN ${LED_MEMBERS} OR r.target_team_id IN (SELECT id FROM teams WHERE lead_id = ?) OR r.withdrawn_from_id = ?
-      OR r.task_id IN (SELECT id FROM tasks WHERE assignee_id = ?))`, params: [u.id, team, team, u.id, u.id, u.id, u.id] };
+      OR r.task_id IN (SELECT id FROM tasks WHERE assignee_id = ?))${live}`, params: [u.id, team, team, u.id, u.id, u.id, u.id] };
 }
 // Teams a user may send requests to: their own team and the teams connected to it (managers/admins: any team).
 function allowedTargetTeams(u) {
@@ -801,6 +807,7 @@ function requestFlags(u, r) {
     can_assign: r.status === 'open' && !!r.target_team_id && (isBoss(u) || r.team_lead_id === u.id),
     can_cancel: ['open', 'needs_team'].includes(r.status) && (r.requested_by === u.id || isBoss(u)),
     can_withdraw: canWithdraw(u, r),
+    can_delete: isBoss(u) && ['needs_team', 'open', 'cancelled', 'closed'].includes(r.status),
     can_receive: r.status === 'delivered' && r.requested_by === u.id,
     can_attach: ['needs_team', 'open', 'assigned'].includes(r.status) && (r.requested_by === u.id || isBoss(u)),
     can_see_files: canSeeRequestFiles(u, r)
@@ -942,26 +949,24 @@ app.post('/api/requests/:id/assign', auth, (req, res) => {
   if (approversFor(a.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r, a.id), 409);
   sendRequestTask(res, r, a, u);
 });
-// Withdraw: the requester takes back a request someone is already doing (not yet submitted). The task and its files
-// are deleted and the request is cancelled; the person (and their team's lead) are told by the desktop app.
+// Withdraw: the requester takes back a request someone is already doing (not yet submitted). The task is archived
+// (kept with its files, shown in History) and the request is cancelled; the person (and their team's lead) are told by the desktop app.
 app.post('/api/requests/:id/withdraw', auth, (req, res) => {
   const u = req.user, r = getRequest(Number(req.params.id));
   if (!r || !canSeeRequest(u, r)) return bad(res, 'Request not found.', 404);
   if (r.requested_by !== u.id) return bad(res, 'Only the person who made this request can withdraw it.', 403);
   if (!canWithdraw(u, r)) return bad(res, r.status === 'assigned' ? 'The work has already been submitted for approval, so it can’t be withdrawn.'
     : 'Only a request someone is working on can be withdrawn.', 409);
-  const stored = db.prepare('SELECT stored_name FROM files WHERE task_id = ?').all(r.task_id);
   const done = db.transaction(() => { // re-checked inside the transaction: the work may have been submitted meanwhile
     const ok = db.prepare(`UPDATE requests SET status = 'cancelled', closed_at = ?, task_id = NULL, withdrawn_from_id = ?
       WHERE id = ? AND status = 'assigned' AND task_id = ? AND (SELECT status FROM tasks WHERE id = ?) IN ('assigned','in_progress')`)
       .run(new Date().toISOString(), r.assignee_id, r.id, r.task_id, r.task_id);
     if (!ok.changes) return false;
     db.prepare('INSERT INTO request_events (request_id, user_id, message) VALUES (?,?,?)').run(r.id, u.id, `${u.name} withdrew the request`);
-    db.prepare('DELETE FROM tasks WHERE id = ?').run(r.task_id);
+    archiveTask(r.task_id, u, r.id);
     return true;
   })();
   if (!done) return bad(res, 'The work has already been submitted for approval, so it can’t be withdrawn.', 409);
-  removeStoredFiles(stored);
   res.json({ request: getRequest(r.id) });
 });
 app.post('/api/requests/:id/cancel', auth, (req, res) => {
@@ -995,6 +1000,66 @@ app.post('/api/requests/:id/received', auth, (req, res) => {
   res.json({ request: getRequest(r.id) });
 });
 
+// ---------- archive: managers/admins delete requests, restore archived items, or delete them permanently ----------
+// A request can be archived while nobody is working on it (needs a team, open, cancelled or closed).
+app.delete('/api/requests/:id', auth, requireBoss, (req, res) => {
+  const u = req.user, r = getRequest(Number(req.params.id));
+  if (!r) return bad(res, 'Request not found.', 404);
+  if (!['needs_team', 'open', 'cancelled', 'closed'].includes(r.status))
+    return bad(res, 'Someone is working on this request or it has been delivered. Withdraw it or delete its task first.', 409);
+  db.transaction(() => {
+    db.prepare('UPDATE requests SET deleted_at = ?, deleted_by = ? WHERE id = ? AND deleted_at IS NULL').run(new Date().toISOString(), u.id, r.id);
+    db.prepare('INSERT INTO request_events (request_id, user_id, message) VALUES (?,?,?)').run(r.id, u.id, `${u.name} deleted the request`);
+  })();
+  res.json({ ok: true });
+});
+app.post('/api/requests/:id/restore', auth, requireBoss, (req, res) => {
+  const u = req.user, r = getAnyRequest(Number(req.params.id));
+  if (!r || !r.deleted_at) return bad(res, 'Only a deleted request can be restored.', 404);
+  db.transaction(() => {
+    db.prepare('UPDATE requests SET deleted_at = NULL, deleted_by = NULL WHERE id = ?').run(r.id);
+    db.prepare('INSERT INTO request_events (request_id, user_id, message) VALUES (?,?,?)').run(r.id, u.id, `Restored by ${u.name}`);
+  })();
+  res.json({ request: getRequest(r.id) });
+});
+app.delete('/api/requests/:id/permanent', auth, requireBoss, (req, res) => {
+  const r = getAnyRequest(Number(req.params.id));
+  if (!r || !r.deleted_at) return bad(res, 'Only a deleted request can be deleted permanently.', 404);
+  const stored = db.prepare('SELECT stored_name FROM files WHERE request_id = ?').all(r.id);
+  db.prepare('DELETE FROM requests WHERE id = ?').run(r.id); // its activity and attachments go with it; a linked task stays
+  removeStoredFiles(stored);
+  res.json({ ok: true });
+});
+// Restoring a task that came from a request puts it back on that request, if the request is still waiting for it
+// (open again after a delete/give back, or cancelled by the requester withdrawing it from this person).
+app.post('/api/tasks/:id/restore', auth, requireBoss, (req, res) => {
+  const u = req.user, task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(req.params.id));
+  if (!task || !task.deleted_at) return bad(res, 'Only a deleted task can be restored.', 404);
+  const r = task.archived_request_id ? getAnyRequest(task.archived_request_id) : null;
+  if (r && r.deleted_at) return bad(res, 'Restore the request this task came from first.', 409);
+  const relink = !!r && !r.task_id && (r.status === 'open' || (r.status === 'cancelled' && r.withdrawn_from_id === task.assignee_id));
+  if (r && !relink) return bad(res, 'The request this task came from has been taken by someone else or finished, so the task can’t be restored. Its record stays in History.', 409);
+  db.transaction(() => {
+    db.prepare('UPDATE tasks SET deleted_at = NULL, deleted_by = NULL, archived_request_id = NULL WHERE id = ?').run(task.id);
+    if (!relink) return;
+    // A request sent to a person (assigned by the requester to someone else) becomes a person request again.
+    const asked = task.assigned_by === r.requested_by && task.assigned_by !== task.assignee_id ? task.assignee_id : null;
+    db.prepare(`UPDATE requests SET status = 'assigned', task_id = ?, asked_person_id = ?, closed_at = NULL, withdrawn_from_id = NULL WHERE id = ?`)
+      .run(task.id, asked, r.id);
+    const who = db.prepare('SELECT name FROM users WHERE id = ?').get(task.assignee_id);
+    db.prepare('INSERT INTO request_events (request_id, user_id, message) VALUES (?,?,?)').run(r.id, u.id, `Restored by ${u.name}: ${who ? who.name : 'the assignee'} has it again`);
+  })();
+  res.json({ ok: true, task_id: task.id, request_id: relink ? r.id : null });
+});
+app.delete('/api/tasks/:id/permanent', auth, requireBoss, (req, res) => {
+  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(req.params.id));
+  if (!task || !task.deleted_at) return bad(res, 'Only a deleted task can be deleted permanently.', 404);
+  const stored = db.prepare('SELECT stored_name FROM files WHERE task_id = ?').all(task.id);
+  db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id); // its updates and files go with it
+  removeStoredFiles(stored);
+  res.json({ ok: true });
+});
+
 // ---------- file download (sign-in + same visibility as the task or request) ----------
 app.get('/api/files/:id', auth, (req, res) => {
   const u = req.user, f = db.prepare('SELECT * FROM files WHERE id = ?').get(Number(req.params.id));
@@ -1025,21 +1090,23 @@ const LATEST_APPROVE = `(SELECT MAX(created_at) FROM task_updates WHERE task_id 
 const SELF_APPROVED = `EXISTS (SELECT 1 FROM task_updates WHERE task_id = t.id AND message LIKE 'Self-approved by %')`;
 const SEND_BACKS = `(SELECT group_concat(substr(message, 12), ' | ') FROM task_updates WHERE task_id = t.id AND message LIKE 'Sent back: %')`;
 function historyRows(u, q) {
-  const s = taskScope(u);
+  const s = taskScope(u, true); // History also lists archived (deleted) tasks and requests, with status deleted
   const taskRows = db.prepare(`SELECT 'task' AS type, t.id, t.title, t.status, a.team_id, tm.name AS team_name,
       t.assignee_id, a.name AS assignee_name, t.assigned_by, b.name AS assigned_by_name, NULL AS requested_by, NULL AS requested_by_name,
       t.created_at AS assigned_at, ${LATEST_SUBMIT} AS submitted_at, ${LATEST_APPROVE} AS approved_at, t.completed_at,
-      ab.name AS approved_by_name, t.status = 'completed' AND ${SELF_APPROVED} AS self_approved, ${SEND_BACKS} AS send_back_reasons, t.created_at AS created_at, t.id AS task_id
+      ab.name AS approved_by_name, t.status = 'completed' AND ${SELF_APPROVED} AS self_approved, ${SEND_BACKS} AS send_back_reasons, t.created_at AS created_at, t.id AS task_id,
+      t.deleted_at, td.name AS deleted_by_name
     FROM tasks t JOIN users a ON a.id = t.assignee_id JOIN users b ON b.id = t.assigned_by
-    LEFT JOIN teams tm ON tm.id = a.team_id LEFT JOIN users ab ON ab.id = t.approved_by
+    LEFT JOIN teams tm ON tm.id = a.team_id LEFT JOIN users ab ON ab.id = t.approved_by LEFT JOIN users td ON td.id = t.deleted_by
     WHERE ${s.sql} AND t.id NOT IN (SELECT task_id FROM requests WHERE task_id IS NOT NULL)`).all(...s.params);
   // Requests: the same people who can see them on the board (requestScope).
-  const { sql: rsql, params: rparams } = requestScope(u);
+  const { sql: rsql, params: rparams } = requestScope(u, true);
   const reqRows = db.prepare(`SELECT 'request' AS type, r.id, r.title, r.status, r.target_team_id AS team_id, tm.name AS team_name,
       t.assignee_id, a.name AS assignee_name, t.assigned_by, b.name AS assigned_by_name, r.requested_by, rb.name AS requested_by_name,
       t.created_at AS assigned_at, ${LATEST_SUBMIT} AS submitted_at, ${LATEST_APPROVE} AS approved_at, r.closed_at AS completed_at,
-      ab.name AS approved_by_name, t.status = 'completed' AND ${SELF_APPROVED} AS self_approved, ${SEND_BACKS} AS send_back_reasons, r.created_at AS created_at, r.task_id
-    FROM requests r JOIN users rb ON rb.id = r.requested_by LEFT JOIN teams tm ON tm.id = r.target_team_id
+      ab.name AS approved_by_name, t.status = 'completed' AND ${SELF_APPROVED} AS self_approved, ${SEND_BACKS} AS send_back_reasons, r.created_at AS created_at, r.task_id,
+      r.deleted_at, rd.name AS deleted_by_name
+    FROM requests r JOIN users rb ON rb.id = r.requested_by LEFT JOIN teams tm ON tm.id = r.target_team_id LEFT JOIN users rd ON rd.id = r.deleted_by
     LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN users a ON a.id = t.assignee_id LEFT JOIN users b ON b.id = t.assigned_by
     LEFT JOIN users ab ON ab.id = t.approved_by WHERE ${rsql}`).all(...rparams);
   let rows = taskRows.concat(reqRows);
@@ -1047,6 +1114,7 @@ function historyRows(u, q) {
   for (const r of rows) if (!r.approved_at && r.type === 'task' && r.approved_by_name && r.completed_at) r.approved_at = r.completed_at;
   for (const r of rows) if (r.type === 'request' && r.status === 'needs_team') r.team_name = 'Not decided yet';
   for (const r of rows) if (r.self_approved && r.approved_by_name) r.approved_by_name += ' (self-approved)';
+  for (const r of rows) if (r.deleted_at) r.status = 'deleted';
   const person = Number(q.person), team = Number(q.team);
   if (person) rows = rows.filter(r => [r.assignee_id, r.assigned_by, r.requested_by].includes(person));
   if (team) rows = rows.filter(r => r.team_id === team);
@@ -1057,7 +1125,7 @@ function historyRows(u, q) {
   return rows.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
 }
 const STATUS_LABEL = { assigned: 'Not started', in_progress: 'In progress', submitted: 'Waiting for approval', completed: 'Completed',
-  needs_team: 'Needs a team', open: 'Open', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled' };
+  needs_team: 'Needs a team', open: 'Open', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled', deleted: 'Deleted' };
 function localTime(d) { // "YYYY-MM-DD HH:MM" in the server's time zone (TZ), for the CSV
   if (!d) return '';
   const dt = new Date(/[TZ]/.test(d) ? d : d.replace(' ', 'T') + 'Z');
@@ -1076,7 +1144,8 @@ app.get('/api/history', auth, (req, res) => {
   const cols = [['Title', r => r.title], ['Type', r => r.type === 'request' ? 'Request' : 'Task'], ['Status', r => STATUS_LABEL[r.status] || r.status],
     ['Team', r => r.team_name], ['Assigned to', r => r.assignee_name], ['Assigned by', r => r.assigned_by_name], ['Requested by', r => r.requested_by_name],
     ['Assigned date', r => localTime(r.assigned_at)], ['Submitted date', r => localTime(r.submitted_at)], ['Approved date', r => localTime(r.approved_at)],
-    ['Completed date', r => localTime(r.completed_at)], ['Approved by', r => r.approved_by_name], ['Send-back reasons', r => r.send_back_reasons]];
+    ['Completed date', r => localTime(r.completed_at)], ['Approved by', r => r.approved_by_name], ['Send-back reasons', r => r.send_back_reasons],
+    ['Deleted', r => r.deleted_at ? `Deleted by ${r.deleted_by_name || 'unknown'} on ${localTime(r.deleted_at)}` : '']];
   const lines = [cols.map(c => csvCell(c[0])).join(',')].concat(rows.map(r => cols.map(c => csvCell(c[1](r))).join(',')));
   res.set('Content-Type', 'text/csv; charset=utf-8');
   res.attachment(`taskdesk-history-${new Date().toISOString().slice(0, 10)}.csv`);
@@ -1088,13 +1157,13 @@ app.get('/api/history', auth, (req, res) => {
 // marked once with reminded_at; the desktop app then reminds the team's lead and managers/admins ("Still unassigned").
 // Runs on every summary check (each desktop app checks every minute), so no timer is needed.
 function remindStaleRequests() {
-  db.prepare(`UPDATE requests SET reminded_at = ? WHERE status = 'open' AND reminded_at IS NULL
+  db.prepare(`UPDATE requests SET reminded_at = ? WHERE status = 'open' AND deleted_at IS NULL AND reminded_at IS NULL
     AND MAX(created_at, COALESCE((SELECT MAX(e.created_at) FROM request_events e WHERE e.request_id = requests.id), '')) < datetime('now', '-24 hours')`)
     .run(new Date().toISOString());
 }
 // Open requests waiting for someone to assign them: for teams the user leads (managers/admins: all teams).
 const LEAD_OPEN_REQUESTS = `SELECT r.id, r.title, r.needed_by, r.status, r.reminded_at, tm.name AS team_name, rb.name AS requested_by_name
-  FROM requests r JOIN teams tm ON tm.id = r.target_team_id JOIN users rb ON rb.id = r.requested_by WHERE r.status = 'open'`;
+  FROM requests r JOIN teams tm ON tm.id = r.target_team_id JOIN users rb ON rb.id = r.requested_by WHERE r.status = 'open' AND r.deleted_at IS NULL`;
 
 // Open tasks assigned to the signed-in person: used for the desktop icon badge and new-task notifications.
 app.get('/api/my-summary', auth, (req, res) => {
@@ -1102,7 +1171,7 @@ app.get('/api/my-summary', auth, (req, res) => {
   remindStaleRequests();
   const OVERDUE = `status != 'completed' AND deadline IS NOT NULL AND deadline < date('now','localtime')`;
   const counts = db.prepare(`SELECT COUNT(*) AS open, SUM(${OVERDUE}) AS overdue
-    FROM tasks WHERE assignee_id = ? AND status != 'completed'`).get(u.id);
+    FROM tasks WHERE assignee_id = ? AND status != 'completed' AND deleted_at IS NULL`).get(u.id);
   // Own open tasks, with their status. A task that was sent back also carries the reason.
   // `asked_by`: the requester, when the task is a request sent to this person ("<requester> asked you").
   const tasks = db.prepare(`SELECT t.id, t.title, t.deadline, t.priority, t.status, b.name AS assigned_by_name,
@@ -1110,9 +1179,9 @@ app.get('/api/my-summary', auth, (req, res) => {
       CASE WHEN t.status = 'in_progress' THEN (SELECT substr(message, 12) FROM task_updates
         WHERE task_id = t.id AND message LIKE 'Sent back: %' ORDER BY id DESC LIMIT 1) END AS sent_back_reason
     FROM tasks t JOIN users b ON b.id = t.assigned_by
-    WHERE t.assignee_id = ? AND t.status != 'completed' ORDER BY t.id DESC LIMIT 100`).all(u.id);
+    WHERE t.assignee_id = ? AND t.status != 'completed' AND t.deleted_at IS NULL ORDER BY t.id DESC LIMIT 100`).all(u.id);
   // Own tasks approved in the last 3 days (so the app can say "was approved").
-  const recently_approved = db.prepare(`SELECT id, title FROM tasks WHERE assignee_id = ? AND status = 'completed'
+  const recently_approved = db.prepare(`SELECT id, title FROM tasks WHERE assignee_id = ? AND status = 'completed' AND deleted_at IS NULL
     AND approved_by IS NOT NULL AND completed_at >= ? ORDER BY completed_at DESC LIMIT 50`)
     .all(u.id, new Date(Date.now() - 3 * 864e5).toISOString());
   // Tasks waiting for this person's approval.
@@ -1122,7 +1191,7 @@ app.get('/api/my-summary', auth, (req, res) => {
   // Open document requests for my team (or teams I lead), and my own requests that have been delivered.
   // `i_lead`: the user leads that team (the desktop app then says "assign it to someone").
   const team_requests = db.prepare(`SELECT r.id, r.title, tm.name AS team_name, tm.lead_id = ? AS i_lead FROM requests r JOIN teams tm ON tm.id = r.target_team_id
-    WHERE r.status = 'open' AND r.requested_by != ? AND (r.target_team_id = ? OR tm.lead_id = ?) ORDER BY r.id DESC LIMIT 100`)
+    WHERE r.status = 'open' AND r.deleted_at IS NULL AND r.requested_by != ? AND (r.target_team_id = ? OR tm.lead_id = ?) ORDER BY r.id DESC LIMIT 100`)
     .all(u.id, u.id, u.team_id || 0, u.id).map(r => ({ ...r, i_lead: !!r.i_lead }));
   // Open requests for teams the user leads (part of the badge), and the ones flagged "still unassigned" for the
   // team's lead and for managers/admins.
@@ -1130,19 +1199,19 @@ app.get('/api/my-summary', auth, (req, res) => {
     .map(r => ({ id: r.id, title: r.title, team_name: r.team_name }));
   const unassigned_reminders = db.prepare(`${LEAD_OPEN_REQUESTS} AND r.reminded_at IS NOT NULL ${isBoss(u) ? '' : 'AND tm.lead_id = ?'}
     ORDER BY r.id DESC LIMIT 100`).all(...(isBoss(u) ? [] : [u.id])).map(r => ({ id: r.id, title: r.title, team_name: r.team_name }));
-  const ready_requests = db.prepare(`SELECT id, title FROM requests WHERE requested_by = ? AND status = 'delivered' ORDER BY id DESC LIMIT 100`).all(u.id);
+  const ready_requests = db.prepare(`SELECT id, title FROM requests WHERE requested_by = ? AND status = 'delivered' AND deleted_at IS NULL ORDER BY id DESC LIMIT 100`).all(u.id);
   // Managers/admins: requests posted without a team, waiting for someone to choose one.
-  const needs_team_requests = isBoss(u) ? db.prepare(`SELECT id, title FROM requests WHERE status = 'needs_team' AND requested_by != ?
+  const needs_team_requests = isBoss(u) ? db.prepare(`SELECT id, title FROM requests WHERE status = 'needs_team' AND deleted_at IS NULL AND requested_by != ?
     ORDER BY id DESC LIMIT 100`).all(u.id) : [];
   // Requests sent straight to a member of a team the user leads ("<requester> (<team>) asked <person>").
   const team_asks = db.prepare(`SELECT r.id, r.title, rb.name AS requested_by_name, rt.name AS requester_team_name, ap.name AS person_name
     FROM requests r JOIN teams tm ON tm.id = r.target_team_id JOIN users rb ON rb.id = r.requested_by LEFT JOIN teams rt ON rt.id = rb.team_id
     JOIN users ap ON ap.id = r.asked_person_id
-    WHERE r.status = 'assigned' AND tm.lead_id = ? AND r.requested_by != ? AND r.asked_person_id != ? ORDER BY r.id DESC LIMIT 100`).all(u.id, u.id, u.id);
+    WHERE r.status = 'assigned' AND r.deleted_at IS NULL AND tm.lead_id = ? AND r.requested_by != ? AND r.asked_person_id != ? ORDER BY r.id DESC LIMIT 100`).all(u.id, u.id, u.id);
   // Requests withdrawn in the last 3 days from this person, or from a member of a team the user leads.
   const withdrawn = db.prepare(`SELECT r.id, r.title, rb.name AS requested_by_name FROM requests r JOIN users rb ON rb.id = r.requested_by
     LEFT JOIN teams tm ON tm.id = r.target_team_id
-    WHERE r.status = 'cancelled' AND r.withdrawn_from_id IS NOT NULL AND r.closed_at >= ? AND r.requested_by != ?
+    WHERE r.status = 'cancelled' AND r.deleted_at IS NULL AND r.withdrawn_from_id IS NOT NULL AND r.closed_at >= ? AND r.requested_by != ?
       AND (r.withdrawn_from_id = ? OR tm.lead_id = ?) ORDER BY r.id DESC LIMIT 100`)
     .all(new Date(Date.now() - 3 * 864e5).toISOString(), u.id, u.id, u.id);
   res.json({ user: publicUser(u), open: counts.open || 0, overdue: counts.overdue || 0, tasks, recently_approved, approvals, team_requests,
@@ -1185,7 +1254,7 @@ app.get('/api/dashboard', auth, (req, res) => {
   const to_assign = isBoss(u)
     ? db.prepare(`SELECT r.id, r.title, r.needed_by, r.status, tm.name AS team_name, rb.name AS requested_by_name
         FROM requests r LEFT JOIN teams tm ON tm.id = r.target_team_id JOIN users rb ON rb.id = r.requested_by
-        WHERE r.status = 'needs_team' OR (r.status = 'open' AND r.target_team_id IS NOT NULL)
+        WHERE r.deleted_at IS NULL AND (r.status = 'needs_team' OR (r.status = 'open' AND r.target_team_id IS NOT NULL))
         ORDER BY r.status = 'open', r.needed_by IS NULL, r.needed_by, r.id LIMIT 50`).all()
     : u.role === 'lead' ? db.prepare(`${LEAD_OPEN_REQUESTS} AND tm.lead_id = ? ORDER BY r.needed_by IS NULL, r.needed_by, r.id LIMIT 50`).all(u.id) : [];
 

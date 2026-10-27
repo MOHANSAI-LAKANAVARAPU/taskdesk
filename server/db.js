@@ -195,6 +195,15 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   const reqCols = db.prepare('PRAGMA table_info(requests)').all().map(c => c.name);
   if (!reqCols.includes('asked_person_id')) db.exec('ALTER TABLE requests ADD COLUMN asked_person_id INTEGER REFERENCES users(id) ON DELETE SET NULL');
   if (!reqCols.includes('withdrawn_from_id')) db.exec('ALTER TABLE requests ADD COLUMN withdrawn_from_id INTEGER REFERENCES users(id) ON DELETE SET NULL');
+  // Archive instead of delete: Delete / Give back / Withdraw set deleted_at + deleted_by; rows and files stay until a
+  // manager deletes them permanently from History. archived_request_id: the request an archived task came from (for Restore).
+  for (const table of ['tasks', 'requests']) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+    if (!cols.includes('deleted_at')) db.exec(`ALTER TABLE ${table} ADD COLUMN deleted_at TEXT`);
+    if (!cols.includes('deleted_by')) db.exec(`ALTER TABLE ${table} ADD COLUMN deleted_by INTEGER REFERENCES users(id) ON DELETE SET NULL`);
+  }
+  if (!db.prepare('PRAGMA table_info(tasks)').all().some(c => c.name === 'archived_request_id'))
+    db.exec('ALTER TABLE tasks ADD COLUMN archived_request_id INTEGER REFERENCES requests(id) ON DELETE SET NULL');
   // Teams that work together: their members may send requests to each other. Two-way, each pair once (smaller id first).
   db.exec(`CREATE TABLE IF NOT EXISTS team_connections (
       team_a_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
