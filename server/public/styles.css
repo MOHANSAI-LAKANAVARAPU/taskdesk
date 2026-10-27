@@ -179,3 +179,5 @@ table.history td{white-space:nowrap}
 table.history td.reasons{white-space:normal;min-width:180px}
 .card.warn{border-color:var(--s-prog);background:var(--s-prog-bg)}
 .warn-text{color:var(--s-prog);font-size:.875rem;font-weight:600;margin:-4px 0 12px}
+.group-head{font-size:.8125rem;color:var(--muted);font-weight:600;margin:14px 0 6px}
+.group-head:first-of-type{margin-top:0}

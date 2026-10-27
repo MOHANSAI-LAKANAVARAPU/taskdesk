@@ -18,7 +18,12 @@
   const fmtSize = n => n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
   const fileList = files => files && files.length ? `<ul class="files">${files.map(f => `<li><a href="/api/files/${f.id}" download>${esc(f.original_name)}</a> <span class="muted">${fmtSize(f.size)}</span></li>`).join('')}</ul>` : '';
   // "X or any manager" from the server's approvers list (never includes the assignee).
-  const approverText = a => !a ? 'the person who assigned it' : [a.names.join(', '), a.any_manager ? (a.names.length ? 'or any manager' : 'any manager') : ''].filter(Boolean).join(' ');
+  const approverText = a => {
+    if (!a) return 'the person who assigned it';
+    const others = [a.names.join(', '), a.any_manager ? (a.names.length ? 'or any manager' : 'any manager') : ''].filter(Boolean).join(' ');
+    if (!a.self) return others;
+    return others ? others + ' (as a manager you can also approve it yourself)' : 'you (as a manager you can approve it yourself)';
+  };
   const reqPill = r => `<span class="pill rq-${esc(r.status)}">${RSTATUS[r.status] || esc(r.status)}</span>`;
   // Copy plain fields into a FormData (for requests that may carry files).
   function formData(fields, filesInput) {
@@ -312,9 +317,10 @@
             <p class="desc">${t.description ? esc(t.description) : '<span class="muted">No description.</span>'}</p>
           </section>
           ${can_review ? `<section class="card"><h2>Waiting for your approval</h2>
-            <p class="muted" style="margin-top:0">${esc(t.assignee_name)} submitted this task. Check the latest note in the activity, then approve it or send it back.</p>
+            <p class="muted" style="margin-top:0">${t.assignee_id === me.id ? 'This is your own task. As a manager you can approve it yourself; it will be recorded as self-approved.'
+              : `${esc(t.assignee_name)} submitted this task. Check the latest note in the activity, then approve it or send it back.`}</p>
             <div class="inline-actions"><button class="btn" id="approveBtn">Approve</button><button class="btn ghost" id="sendBackBtn">Send back</button></div></section>` : ''}
-          ${locked && isAssignee ? `<section class="card"><p style="margin:0">Waiting for approval from ${esc(approverText(approvers))}. You can add comments, but status and progress are locked until it is approved or sent back.</p></section>` : ''}
+          ${locked && isAssignee && !can_review ? `<section class="card"><p style="margin:0">Waiting for approval from ${esc(approverText(approvers))}. You can add comments, but status and progress are locked until it is approved or sent back.</p></section>` : ''}
           ${isAssignee && approval_blocked ? `<section class="card warn"><p style="margin:0">${esc(approval_blocked)}</p></section>` : ''}
           ${can_update ? `<section class="card"><h2>${locked ? 'Add a comment' : isAssignee ? 'Post an update' : 'Add a note or change status'}</h2>
             <form id="updForm">
@@ -573,6 +579,18 @@
       });
   }
 
+  // Assign list grouped by team (the request's own team first); managers see everyone.
+  function memberGroups(members, r) {
+    const groups = [];
+    for (const m of members) {
+      const label = m.team_id === r.target_team_id ? `${m.team_name} (this request’s team)` : m.team_name || 'No team';
+      let g = groups.find(x => x.label === label);
+      if (!g) groups.push(g = { label, people: [] });
+      g.people.push(m);
+    }
+    return groups;
+  }
+
   async function viewRequest(id) {
     const d = await api('/requests/' + id), r = d.request;
     app.innerHTML = `
@@ -611,8 +629,8 @@
           <ul class="rows">${d.teams.map(t => `<li class="row-top"><span>${esc(t.name)}${t.lead_id ? '' : ' <span class="muted">· no lead</span>'}</span>
             <button class="btn ghost small" data-sendteam="${t.id}">Send</button></li>`).join('')}</ul></section>` : ''}
         ${d.can_assign ? `<section class="card"><h2>Assign to</h2>
-          ${d.members.length ? `<ul class="rows">${d.members.map(m => `<li class="row-top"><span>${esc(m.name)} <span class="muted">${ROLE[m.role]}</span></span>
-            <button class="btn ghost small" data-assign="${m.id}">Assign</button></li>`).join('')}</ul>` : '<p class="muted">This team has no active members yet.</p>'}
+          ${d.members.length ? memberGroups(d.members, r).map(g => `${isBoss() ? `<h3 class="group-head">${esc(g.label)}</h3>` : ''}<ul class="rows">${g.people.map(m => `<li class="row-top"><span>${esc(m.name)} <span class="muted">${ROLE[m.role]}</span></span>
+            <button class="btn ghost small" data-assign="${m.id}">Assign</button></li>`).join('')}</ul>`).join('') : '<p class="muted">This team has no active members yet.</p>'}
         </section>` : ''}
       </div>`;
     const act = async (path, body, msg) => { try { await api(`/requests/${r.id}/${path}`, { method: 'POST', body }); toast(msg); router(); } catch (e) { toast(e.message); } };

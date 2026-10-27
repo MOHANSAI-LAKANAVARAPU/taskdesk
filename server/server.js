@@ -77,8 +77,8 @@ function linkedRequest(taskId) {
     WHERE r.task_id = ?`).get(taskId);
 }
 function canReviewTask(u, task) {
+  if (isBoss(u)) return true; // managers/admins: any submitted task, including their own (recorded as self-approved)
   if (u.id === task.assignee_id) return false;
-  if (isBoss(u)) return true;
   if (task.assigned_by !== task.assignee_id) return task.assigned_by === u.id;
   const r = linkedRequest(task.id);
   return !!(r && r.team_lead_id === u.id);
@@ -87,19 +87,22 @@ function canReviewTask(u, task) {
 function ownPlainTask(task) { return task.assigned_by === task.assignee_id && !linkedRequest(task.id); }
 // SQL fragment (alias t): submitted tasks the user may approve.
 function reviewScope(u) {
-  return isBoss(u) ? { sql: `t.status = 'submitted' AND t.assignee_id != ?`, params: [u.id] }
+  return isBoss(u) ? { sql: `t.status = 'submitted'`, params: [] }
     : { sql: `t.status = 'submitted' AND t.assignee_id != ? AND ((t.assigned_by = ? AND t.assigned_by != t.assignee_id)
         OR (t.assigned_by = t.assignee_id AND t.id IN ${LED_REQUEST_TASKS}))`, params: [u.id, u.id, u.id] };
 }
 // Who can actually approve a task (same rules as canReviewTask): the assigner if they aren't the assignee, otherwise
-// for a self-claimed request the target team's lead; plus any active manager/admin who isn't the assignee.
+// for a self-claimed request the target team's lead; plus any active manager/admin who isn't the assignee (`any_manager`),
+// and the assignee themself if they are a manager/admin (`self`).
 function approversFor(assigneeId, assignedBy, request) {
   const active = id => db.prepare('SELECT name FROM users WHERE id = ? AND active = 1').get(id);
   const names = [];
   if (assignedBy !== assigneeId) { const a = active(assignedBy); if (a) names.push(a.name); }
   else if (request && request.team_lead_id && request.team_lead_id !== assigneeId) { const l = active(request.team_lead_id); if (l) names.push(l.name); }
   const any_manager = !!db.prepare(`SELECT 1 FROM users WHERE active = 1 AND role IN ('admin','manager') AND id != ?`).get(assigneeId);
-  return { names, any_manager, nobody: !names.length && !any_manager };
+  // A manager/admin assignee can always approve their own work, so the "nobody can approve" block never applies to them.
+  const self = !!db.prepare(`SELECT 1 FROM users WHERE id = ? AND active = 1 AND role IN ('admin','manager')`).get(assigneeId);
+  return { names, any_manager, self, nobody: !names.length && !any_manager && !self };
 }
 function nobodyCanApprove(request) {
   return request && request.team_name ? `Nobody can approve this yet. Ask a manager to set a lead for ${request.team_name}.`
@@ -383,7 +386,7 @@ app.get('/api/tasks/:id', auth, (req, res) => {
     can_update: isAssignee || canEditTask(req.user, task),
     can_submit: isAssignee && !ownPlainTask(task) && ['assigned', 'in_progress'].includes(task.status),
     can_review: task.status === 'submitted' && canReviewTask(req.user, task),
-    can_complete_directly: task.status !== 'completed' && task.status !== 'submitted' && (isAssignee ? ownPlainTask(task) : canEditTask(req.user, task)),
+    can_complete_directly: task.status !== 'completed' && task.status !== 'submitted' && (isAssignee ? ownPlainTask(task) || isBoss(req.user) : canEditTask(req.user, task)),
     locked: task.status === 'submitted',
     files, request: lr ? { id: lr.id, title: lr.title, status: lr.status } : null });
 });
@@ -410,7 +413,11 @@ app.patch('/api/tasks/:id', auth, (req, res) => {
     const a = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.body.assignee_id));
     if (!canAssignTo(u, a)) return bad(res, 'You can’t assign tasks to this person.', 403);
     f.assignee_id = a.id; notes.push(`Reassigned to ${a.name}`);
-    if (task.status === 'submitted') { f.status = 'in_progress'; f.submitted_at = null; } // new person, so the old submission no longer applies
+    // A self-claimed request task now belongs to someone else: the person reassigning becomes its assigner.
+    if (task.assigned_by === task.assignee_id && linkedRequest(task.id)) f.assigned_by = u.id;
+    if (task.status === 'submitted') { // new person, so the old submission no longer applies
+      f.status = 'in_progress'; f.submitted_at = null; notes.push(`Moved back to in progress for ${a.name}`);
+    }
   }
   const keys = Object.keys(f);
   if (keys.length) db.prepare(`UPDATE tasks SET ${keys.map(k => k + ' = ?').join(', ')}, updated_at = datetime('now') WHERE id = ?`).run(...keys.map(k => f[k]), task.id);
@@ -474,11 +481,11 @@ app.post('/api/tasks/:id/updates', auth, canPostUpdate, withUploads, (req, res) 
   if (task.status === 'submitted' && (status !== undefined || progress !== null)) {
     return bad(res, 'This task is waiting for approval. Status and progress can’t change until it is approved or sent back. You can still add a comment.', 409);
   }
-  if (task.status === 'completed' && u.id === task.assignee_id && !ownPlainTask(task) && (status !== undefined || progress !== null)) {
+  if (task.status === 'completed' && u.id === task.assignee_id && !ownPlainTask(task) && !isBoss(u) && (status !== undefined || progress !== null)) {
     return bad(res, 'This task has been approved and completed. You can still add a comment.', 409);
   }
   if (status === 'completed' && task.status !== 'completed') {
-    const direct = u.id === task.assignee_id ? ownPlainTask(task) : canEditTask(u, task);
+    const direct = u.id === task.assignee_id ? ownPlainTask(task) || isBoss(u) : canEditTask(u, task);
     if (!direct) return bad(res, 'Tasks must be submitted for approval before they can be completed.', 403);
   }
   if (status === 'completed') progress = 100;
@@ -493,8 +500,10 @@ app.post('/api/tasks/:id/updates', auth, canPostUpdate, withUploads, (req, res) 
     db.prepare(`UPDATE tasks SET status = ?, progress = ?, completed_at = ?, approved_by = ?, updated_at = datetime('now') WHERE id = ?`)
       .run(newStatus, newProgress, completedAt, approvedBy, task.id);
     const autoMsg = newStatus !== task.status ? ({ assigned: 'Moved back to not started', in_progress: 'Started work', completed: 'Marked as completed' })[newStatus] : '';
+    // A manager/admin completing their own (non-plain) task approves it themselves.
+    const selfApproved = newStatus === 'completed' && task.status !== 'completed' && u.id === task.assignee_id && !ownPlainTask(task) && isBoss(u);
     const up = db.prepare('INSERT INTO task_updates (task_id,user_id,message,progress,status) VALUES (?,?,?,?,?)')
-      .run(task.id, u.id, message || autoMsg || (hasFiles && status === undefined && progress === null ? 'Attached files' : 'Progress updated'), progress, newStatus !== task.status ? newStatus : null);
+      .run(task.id, u.id, selfApproved ? `Self-approved by ${u.name}` + (message ? ': ' + message : '') : message || autoMsg || (hasFiles && status === undefined && progress === null ? 'Attached files' : 'Progress updated'), progress, newStatus !== task.status ? newStatus : null);
     saveUploads(req, { task_id: task.id, update_id: up.lastInsertRowid });
     syncRequestWithTask(task.id, newStatus, task.status);
   })();
@@ -536,6 +545,7 @@ app.post('/api/tasks/:id/submit', auth, canSubmit, withUploads, (req, res) => {
 });
 
 // A reviewer (see canReviewTask) approves: task becomes completed (and a linked request is delivered).
+// A manager/admin approving their own task is logged as "Self-approved by <name>".
 app.post('/api/tasks/:id/approve', auth, (req, res) => {
   const u = req.user, task = loadVisibleTask(req, res); if (!task) return;
   if (!canReviewTask(u, task)) return bad(res, 'Only the person who assigned this task, the request team’s lead or a manager can approve it.', 403);
@@ -545,7 +555,7 @@ app.post('/api/tasks/:id/approve', auth, (req, res) => {
     db.prepare(`UPDATE tasks SET status = 'completed', progress = 100, completed_at = ?, approved_by = ?, updated_at = datetime('now') WHERE id = ?`)
       .run(new Date().toISOString(), u.id, task.id);
     db.prepare('INSERT INTO task_updates (task_id,user_id,message,progress,status) VALUES (?,?,?,?,?)')
-      .run(task.id, u.id, 'Approved' + (note ? ': ' + note : ''), 100, 'completed');
+      .run(task.id, u.id, (u.id === task.assignee_id ? `Self-approved by ${u.name}` : 'Approved') + (note ? ': ' + note : ''), 100, 'completed');
     syncRequestWithTask(task.id, 'completed', task.status);
   })();
   taskResponse(res, task.id);
@@ -649,7 +659,7 @@ function canSeeRequestFiles(u, r) {
     || r.team_lead_id === u.id || (r.assignee_id && r.assignee_id === u.id);
 }
 function requestFlags(u, r) {
-  const can_take = r.status === 'open' && !!u.team_id && u.team_id === r.target_team_id;
+  const can_take = r.status === 'open' && (isBoss(u) || (!!u.team_id && u.team_id === r.target_team_id)); // managers: any team
   return {
     can_take,
     take_blocked: can_take && approversFor(u.id, u.id, r).nobody ? nobodyCanApprove(r) : null,
@@ -683,8 +693,12 @@ app.get('/api/requests/:id', auth, (req, res) => {
   const files = flags.can_see_files ? db.prepare(`SELECT ${fileCols} FROM files WHERE request_id = ? ORDER BY id`).all(r.id) : [];
   const delivered = flags.can_see_files && r.task_id && ['delivered', 'closed'].includes(r.status)
     ? db.prepare(`SELECT ${fileCols} FROM files WHERE task_id = ? ORDER BY id`).all(r.task_id) : [];
-  const members = flags.can_assign
-    ? db.prepare('SELECT id, name, role FROM users WHERE team_id = ? AND active = 1 ORDER BY name').all(r.target_team_id) : [];
+  // Assign list: the team's members for its lead; every active person (with their team) for managers/admins.
+  const members = !flags.can_assign ? [] : isBoss(u)
+    ? db.prepare(`SELECT us.id, us.name, us.role, us.team_id, tm.name AS team_name FROM users us LEFT JOIN teams tm ON tm.id = us.team_id
+        WHERE us.active = 1 ORDER BY us.team_id IS NOT ?, tm.name IS NULL, tm.name, us.name`).all(r.target_team_id)
+    : db.prepare(`SELECT us.id, us.name, us.role, us.team_id, tm.name AS team_name FROM users us LEFT JOIN teams tm ON tm.id = us.team_id
+        WHERE us.team_id = ? AND us.active = 1 ORDER BY us.name`).all(r.target_team_id);
   const task = r.task_id ? db.prepare('SELECT * FROM tasks WHERE id = ?').get(r.task_id) : null;
   const teams = flags.can_send_to_team ? db.prepare('SELECT id, name, lead_id FROM teams ORDER BY name').all() : [];
   const events = db.prepare(`SELECT e.message, e.created_at, us.name AS user_name FROM request_events e JOIN users us ON us.id = e.user_id
@@ -745,7 +759,7 @@ app.post('/api/requests/:id/take', auth, (req, res) => {
   if (!r) return bad(res, 'Request not found.', 404);
   if (r.status === 'needs_team') return bad(res, 'A manager hasn’t chosen a team for this request yet.', 409);
   if (r.status !== 'open') return bad(res, 'This request has already been taken.', 409);
-  if (!u.team_id || u.team_id !== r.target_team_id) return bad(res, 'Only members of the team this request is for can take it.', 403);
+  if (!isBoss(u) && (!u.team_id || u.team_id !== r.target_team_id)) return bad(res, 'Only members of the team this request is for can take it.', 403);
   if (approversFor(u.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r), 409);
   sendRequestTask(res, r, u, u);
 });
@@ -756,7 +770,8 @@ app.post('/api/requests/:id/assign', auth, (req, res) => {
   if (!isBoss(u) && r.team_lead_id !== u.id) return bad(res, 'Only managers and the team’s lead can assign this request.', 403);
   if (r.status !== 'open') return bad(res, 'This request has already been taken.', 409);
   const a = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.body.user_id));
-  if (!a || !a.active || a.team_id !== r.target_team_id) return bad(res, 'Choose an active member of the request’s team.');
+  if (!a || !a.active) return bad(res, 'Choose an active person.');
+  if (!isBoss(u) && a.team_id !== r.target_team_id) return bad(res, 'Choose an active member of the request’s team.'); // managers: anyone
   if (approversFor(a.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r), 409);
   sendRequestTask(res, r, a, u);
 });
@@ -817,14 +832,15 @@ app.get('/api/files/:id', auth, (req, res) => {
 // ---------- history ----------
 // One row per document request (with its linked task) and one per task that isn't a request's task.
 const LATEST_SUBMIT = `(SELECT MAX(created_at) FROM task_updates WHERE task_id = t.id AND message LIKE 'Submitted for approval%')`;
-const LATEST_APPROVE = `(SELECT MAX(created_at) FROM task_updates WHERE task_id = t.id AND status = 'completed' AND message LIKE 'Approved%')`;
+const LATEST_APPROVE = `(SELECT MAX(created_at) FROM task_updates WHERE task_id = t.id AND status = 'completed' AND (message LIKE 'Approved%' OR message LIKE 'Self-approved by %'))`;
+const SELF_APPROVED = `EXISTS (SELECT 1 FROM task_updates WHERE task_id = t.id AND message LIKE 'Self-approved by %')`;
 const SEND_BACKS = `(SELECT group_concat(substr(message, 12), ' | ') FROM task_updates WHERE task_id = t.id AND message LIKE 'Sent back: %')`;
 function historyRows(u, q) {
   const s = taskScope(u);
   const taskRows = db.prepare(`SELECT 'task' AS type, t.id, t.title, t.status, a.team_id, tm.name AS team_name,
       t.assignee_id, a.name AS assignee_name, t.assigned_by, b.name AS assigned_by_name, NULL AS requested_by, NULL AS requested_by_name,
       t.created_at AS assigned_at, ${LATEST_SUBMIT} AS submitted_at, ${LATEST_APPROVE} AS approved_at, t.completed_at,
-      ab.name AS approved_by_name, ${SEND_BACKS} AS send_back_reasons, t.created_at AS created_at, t.id AS task_id
+      ab.name AS approved_by_name, t.status = 'completed' AND ${SELF_APPROVED} AS self_approved, ${SEND_BACKS} AS send_back_reasons, t.created_at AS created_at, t.id AS task_id
     FROM tasks t JOIN users a ON a.id = t.assignee_id JOIN users b ON b.id = t.assigned_by
     LEFT JOIN teams tm ON tm.id = a.team_id LEFT JOIN users ab ON ab.id = t.approved_by
     WHERE ${s.sql} AND t.id NOT IN (SELECT task_id FROM requests WHERE task_id IS NOT NULL)`).all(...s.params);
@@ -839,7 +855,7 @@ function historyRows(u, q) {
   const reqRows = db.prepare(`SELECT 'request' AS type, r.id, r.title, r.status, r.target_team_id AS team_id, tm.name AS team_name,
       t.assignee_id, a.name AS assignee_name, t.assigned_by, b.name AS assigned_by_name, r.requested_by, rb.name AS requested_by_name,
       t.created_at AS assigned_at, ${LATEST_SUBMIT} AS submitted_at, ${LATEST_APPROVE} AS approved_at, r.closed_at AS completed_at,
-      ab.name AS approved_by_name, ${SEND_BACKS} AS send_back_reasons, r.created_at AS created_at, r.task_id
+      ab.name AS approved_by_name, t.status = 'completed' AND ${SELF_APPROVED} AS self_approved, ${SEND_BACKS} AS send_back_reasons, r.created_at AS created_at, r.task_id
     FROM requests r JOIN users rb ON rb.id = r.requested_by LEFT JOIN teams tm ON tm.id = r.target_team_id
     LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN users a ON a.id = t.assignee_id LEFT JOIN users b ON b.id = t.assigned_by
     LEFT JOIN users ab ON ab.id = t.approved_by WHERE ${rsql}`).all(...rparams);
@@ -847,6 +863,7 @@ function historyRows(u, q) {
   // A task approved directly (no "Approved" update) still has an approval date: when it was completed.
   for (const r of rows) if (!r.approved_at && r.type === 'task' && r.approved_by_name && r.completed_at) r.approved_at = r.completed_at;
   for (const r of rows) if (r.type === 'request' && r.status === 'needs_team') r.team_name = 'Not decided yet';
+  for (const r of rows) if (r.self_approved && r.approved_by_name) r.approved_by_name += ' (self-approved)';
   const person = Number(q.person), team = Number(q.team);
   if (person) rows = rows.filter(r => [r.assignee_id, r.assigned_by, r.requested_by].includes(person));
   if (team) rows = rows.filter(r => r.team_id === team);
@@ -903,7 +920,7 @@ app.get('/api/my-summary', auth, (req, res) => {
   // Tasks waiting for this person's approval.
   const rs = reviewScope(u);
   const approvals = db.prepare(`SELECT t.id, t.title, t.deadline, t.priority, t.submitted_at, a.name AS assignee_name
-    FROM tasks t JOIN users a ON a.id = t.assignee_id WHERE ${rs.sql} ORDER BY t.submitted_at LIMIT 100`).all(...rs.params);
+    FROM tasks t JOIN users a ON a.id = t.assignee_id WHERE ${rs.sql} AND t.assignee_id != ? ORDER BY t.submitted_at LIMIT 100`).all(...rs.params, u.id);
   // Open document requests for my team (or teams I lead), and my own requests that have been delivered.
   const team_requests = db.prepare(`SELECT r.id, r.title, tm.name AS team_name FROM requests r JOIN teams tm ON tm.id = r.target_team_id
     WHERE r.status = 'open' AND r.requested_by != ? AND (r.target_team_id = ? OR tm.lead_id = ?) ORDER BY r.id DESC LIMIT 100`)
