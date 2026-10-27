@@ -30,11 +30,17 @@ h2{font-size:1.0625rem;margin:0 0 12px}
 .topbar-inner{max-width:1160px;margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:20px}
 .brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:1.0625rem;color:var(--ink);text-decoration:none}
 .brand-mark{width:24px;height:24px;background:url(/hifocus-tray.svg) center/contain no-repeat}
+/* Hi-Focus logo (light/dark versions via <picture>), a thin divider, then "TaskDesk". On narrow phones only the
+   shield shows (below 1100px, where the full logo would squeeze the menu): the box clips the logo to its left 21px. */
+.brand-logo{display:block;width:112px;height:28px;overflow:hidden;flex-shrink:0}
+.brand-logo img{display:block;width:112px;height:28px;max-width:none}
+.brand-sep{width:1px;height:24px;background:var(--line);flex-shrink:0}
+@media (max-width:1100px){.brand-logo{width:21px}.brand{gap:8px}}
 .nav{display:flex;gap:4px;flex:1;overflow-x:auto}
 .nav a{padding:7px 12px;border-radius:8px;color:var(--muted);text-decoration:none;white-space:nowrap;font-weight:500}
 .nav a[aria-current="page"]{background:var(--accent-soft);color:var(--accent-text)}
 .me{display:flex;align-items:center;gap:10px}
-.me-name{color:var(--ink);text-decoration:none;font-weight:500;white-space:nowrap}
+.me-name{color:var(--ink);text-decoration:none;font-weight:500;white-space:nowrap;max-width:160px;overflow:hidden;text-overflow:ellipsis}
 @media (max-width:760px){
   .topbar-inner{flex-wrap:wrap;gap:8px 12px}
   .nav{order:3;flex-basis:100%}
@@ -143,7 +149,10 @@ td a:hover{text-decoration:underline}
 
 /* login */
 .login{max-width:380px;margin:9vh auto 0}
-.login .brand{font-size:1.375rem;margin-bottom:22px}
+.login .brand{font-size:1.375rem;margin-bottom:14px}
+/* Banner across the top of the sign-in card: full card width (cancels the card padding), rounded top corners. */
+.login-card{overflow:hidden}
+.login-banner{display:block;width:calc(100% + 36px);max-width:none;height:auto;max-height:180px;object-fit:cover;margin:-18px -18px 18px;border-radius:12px 12px 0 0}
 .login .brand-mark{width:32px;height:32px}
 
 /* modal */

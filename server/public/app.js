@@ -107,7 +107,7 @@
       const cur = h === '#/' ? route === '' : route.startsWith(h.slice(2));
       return `<a href="${h}"${cur ? ' aria-current="page"' : ''}>${l}</a>`;
     }).join('');
-    $('#meName').textContent = me.name;
+    $('#meName').textContent = me.name; $('#meName').title = me.name; // long names are cut short with "…"
     $('#topbar').hidden = false;
   }
   $('#logoutBtn').onclick = async () => { await api('/logout', { method: 'POST' }).catch(() => {}); me = null; location.hash = '#/login'; };
@@ -144,8 +144,9 @@
   // ---------- login ----------
   function viewLogin() {
     app.innerHTML = `<div class="login">
-      <div class="brand"><span class="brand-mark" aria-hidden="true"></span>TaskDesk</div>
-      <form class="card" id="loginForm">
+      <form class="card login-card" id="loginForm">
+        <img class="login-banner" src="/branding/hifocus-banner.png" alt="Hi-Focus – Enhancing your sixth sense" width="1600" height="820">
+        <div class="brand"><span class="brand-mark" aria-hidden="true"></span>TaskDesk</div>
         <h1 style="font-size:1.25rem;margin-bottom:16px">Sign in</h1>
         <label class="f"><span>Email</span><input name="email" type="email" autocomplete="username" required></label>
         <label class="f"><span>Password</span><input name="password" type="password" autocomplete="current-password" required></label>

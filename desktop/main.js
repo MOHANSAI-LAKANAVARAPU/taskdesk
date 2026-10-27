@@ -93,7 +93,7 @@ function openDashboard(hashPath) {
 function openSetup() {
   if (setupWin && !setupWin.isDestroyed()) { setupWin.show(); setupWin.focus(); return; }
   setupWin = new BrowserWindow({
-    width: 480, height: 360, resizable: false, icon: ICON, title: 'Connect TaskDesk', autoHideMenuBar: true,
+    width: 480, height: 500, resizable: false, icon: ICON, title: 'Connect TaskDesk', autoHideMenuBar: true,
     webPreferences: { contextIsolation: true, sandbox: true, preload: path.join(__dirname, 'preload.js') }
   });
   setupWin.setMenuBarVisibility(false);

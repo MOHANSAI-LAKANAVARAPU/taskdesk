@@ -19,6 +19,10 @@ Task assignment and tracking web app for managers, team leads and employees. Dep
 - **Deployment:** [Dockerfile](Dockerfile) (node:20-bookworm-slim, `npm ci --omit=dev`), [docker-compose.yml](docker-compose.yml) (port 3000, `./data` and `./updates` volumes, TZ/COOKIE_SECURE; admin name/email/password come from the untracked `.env` via `env_file`, see `.env.example`). [README.md](README.md) has deployment, Nginx, backup notes.
 - **Data:** SQLite file at `data/taskdesk.db` (or `$DATA_DIR`). Uploaded files in `data/uploads/` (random names; back this folder up together with the database).
 
+### Branding
+- Hi-Focus logo files are in `public/branding/` (served at `/branding/…`): `hifocus-banner.png` (logo on dark background) across the top of the sign-in card (max 180px high, `object-fit: cover`); in the top bar `hifocus-logo.svg` (light mode) / `hifocus-logo-white.svg` (dark mode) via `<picture>`, 28px high, then a thin divider and "TaskDesk". Below 1100px wide (and on phones) the logo box is clipped to the shield only, so the menu keeps its room; long user names in the top bar are cut short with "…" (full name on hover). The favicon stays the mascot (`/hifocus-tray.svg`).
+- Desktop app: `desktop/branding/hifocus-banner.png` is inlined as a data URI at the top of `setup.html` and `offline.html` (their CSP allows `img-src data:`), so it shows without the server. The setup window is 480×500. If the banner changes, re-inline it in both files.
+
 ### Environment variables
 
 `PORT` (3000), `DATA_DIR` (./data), `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_NAME` (first start only; defaults `admin@example.com` / `ChangeMe123!`), `COOKIE_SECURE` (`true` behind HTTPS), `TZ` (decides "overdue").
