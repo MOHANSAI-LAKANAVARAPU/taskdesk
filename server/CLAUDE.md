@@ -37,6 +37,7 @@ Roles: `admin`, `manager`, `lead`, `employee`. `isBoss(u)` = admin or manager.
 | Assign (create) tasks | to any active user | to any active user | only active members of teams they lead, or self | no |
 | Manage teams (create/rename/delete, lead, members) | yes | yes | no | no |
 | Edit/delete a task (`canEditTask`) | any | any | only tasks they assigned | no |
+| Self-claimed request task (assigned_by = assignee) | edit/delete | edit/delete | edit/delete if lead of the request's team; the claimer can't edit/delete, only "Give back" | claimer: "Give back" only |
 | Post progress update / change status | any visible task | any visible task | tasks they are assignee of or assigned | only tasks assigned to them |
 
 **Teams replace "Reports to".** A team's lead is `teams.lead_id` (must be an active lead/manager/admin; cleared automatically if that person becomes an employee or is deactivated). Each user has one `team_id`. `users.lead_id` stays in the database but is no longer used by the UI or by permission checks.
@@ -61,6 +62,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - Any user creates a request for a target team (title, details, needed-by date, optional files). The **Requests** board (`#/requests`) is visible to every signed-in user; description is visible to all, attachments and delivered files only to the requester, target-team members, the team's lead, the assignee and managers/admins.
 - Status (validated in server.js, **no CHECK constraint**, so adding a status needs no table rebuild): `needs_team` (posted with "Not sure, let a manager decide", no `target_team_id`; nobody can take/assign it; a manager/admin uses "Send to team" → `POST /api/requests/:id/send-to-team {team_id}`, which sets the team, makes it `open` and logs "Sent to <team> by <name>" in `request_events`) → `open` → `assigned` (linked task created) → `delivered` (linked task approved/completed) → `closed` (requester clicks "Mark as received"). `cancelled`: requester or manager/admin, only while `needs_team` or `open`. History shows team "Not decided yet" for `needs_team`.
 - "Take this task": any active member of the target team claims an open request → linked task with assignee = assigned_by = them (approved by the team's lead or a manager). "Assign to": managers/admins and the target team's lead pick an active team member → linked task with assigned_by = the person who clicked. Claims are atomic (`WHERE status = 'open'`).
+- "Give back" (`POST /api/tasks/:id/give-back`): the claimer of a self-claimed request task, only while the task is `assigned`/`in_progress`, removes the task and its files, sets the request back to `open` and logs "<name> gave the request back" in `request_events`. The team is notified again because the request reappears among open `team_requests` (the desktop app sees it as new if it polled while the request was taken, i.e. after about a minute).
 - Reopening a completed linked task moves the request back to `assigned`; deleting the linked task of an `assigned` request puts it back to `open`; deleting the task of a delivered/closed request is refused.
 
 ### Files

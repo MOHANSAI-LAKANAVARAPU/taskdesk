@@ -288,12 +288,13 @@
 
   // ---------- task detail ----------
   async function viewTask(id) {
-    const { task: t, updates, can_edit, can_update, can_submit, can_review, can_complete_directly, locked, request, approvers, approval_blocked } = await api('/tasks/' + id);
+    const { task: t, updates, can_edit, can_update, can_submit, can_review, can_complete_directly, locked, request, approvers, approval_blocked, can_give_back } = await api('/tasks/' + id);
     const isAssignee = t.assignee_id === me.id;
     app.innerHTML = `
       <p style="margin:0 0 10px"><a href="#/tasks">← All tasks</a></p>
       <div class="page-head"><div><h1>${esc(t.title)}</h1><p>${statusPill(t)} <span style="margin-left:6px">${esc(dueText(t))}</span>${request ? ` <span style="margin-left:6px">· From <a href="#/requests/${request.id}">document request #${request.id}</a></span>` : ''}</p></div>
-        ${can_edit ? `<div class="inline-actions"><button class="btn ghost" id="editTask">Edit</button><button class="btn danger" id="delTask">Delete</button></div>` : ''}</div>
+        ${can_edit ? `<div class="inline-actions"><button class="btn ghost" id="editTask">Edit</button><button class="btn danger" id="delTask">Delete</button></div>`
+          : can_give_back ? `<div class="inline-actions"><button class="btn ghost" id="giveBack">Give back</button></div>` : ''}</div>
       <div class="cols">
         <div class="stack">
           <section class="card">
@@ -336,6 +337,11 @@
         </section>
       </div>`;
 
+    if (can_give_back) $('#giveBack').onclick = async () => {
+      if (!confirm('Give this request back? The task and any files attached to it will be removed, and the request goes back to the team as open.')) return;
+      try { const r = await api(`/tasks/${t.id}/give-back`, { method: 'POST' }); toast('Request given back to the team'); location.hash = '#/requests/' + r.request_id; }
+      catch (e) { toast(e.message); }
+    };
     if (can_edit) {
       $('#editTask').onclick = () => taskForm(t);
       $('#delTask').onclick = async () => {

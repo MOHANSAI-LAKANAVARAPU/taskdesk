@@ -60,7 +60,15 @@ function canSeeTask(u, task) {
   const s = taskScope(u);
   return !!db.prepare(`SELECT 1 FROM tasks t WHERE t.id = ? AND ${s.sql}`).get(task.id, ...s.params);
 }
-function canEditTask(u, task) { return isBoss(u) || task.assigned_by === u.id; }
+// Edit/delete: managers/admins and the assigner. A self-claimed request task (assigned_by = assignee) can't be edited
+// or deleted by the claimer (they use "Give back"); the request team's lead can instead.
+function canEditTask(u, task) {
+  if (isBoss(u)) return true;
+  if (task.assigned_by === task.assignee_id) { const r = linkedRequest(task.id); if (r) return r.team_lead_id === u.id; }
+  return task.assigned_by === u.id;
+}
+function isClaimer(u, task) { return task.assignee_id === u.id && task.assigned_by === u.id && !!linkedRequest(task.id); }
+const GIVE_BACK_HINT = 'You took this from a document request. Use “Give back” to return it to the team.';
 // Approval step: the assignee submits; reviewers approve or send back. Nobody reviews their own work.
 // Reviewers: managers/admins; the person in assigned_by (when that isn't the assignee); and for a self-claimed
 // document request (assigned_by = assignee) the lead of the request's target team. Nobody else.
@@ -370,6 +378,7 @@ app.get('/api/tasks/:id', auth, (req, res) => {
   const isAssignee = task.assignee_id === req.user.id;
   const approvers = ownPlainTask(task) ? null : approversFor(task.assignee_id, task.assigned_by, lr);
   res.json({ task, updates, can_edit: canEditTask(req.user, task), approvers,
+    can_give_back: isClaimer(req.user, task) && ['assigned', 'in_progress'].includes(task.status) && lr && lr.status === 'assigned',
     approval_blocked: approvers && approvers.nobody && task.status !== 'completed' ? nobodyCanApprove(lr) : null,
     can_update: isAssignee || canEditTask(req.user, task),
     can_submit: isAssignee && !ownPlainTask(task) && ['assigned', 'in_progress'].includes(task.status),
@@ -383,7 +392,7 @@ app.patch('/api/tasks/:id', auth, (req, res) => {
   const u = req.user;
   const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(req.params.id));
   if (!task || !canSeeTask(u, task)) return bad(res, 'Task not found.', 404);
-  if (!canEditTask(u, task)) return bad(res, 'Only the person who assigned this task can edit it.', 403);
+  if (!canEditTask(u, task)) return bad(res, isClaimer(u, task) ? GIVE_BACK_HINT : 'Only the person who assigned this task can edit it.', 403);
   const f = {}; const notes = [];
   if (req.body.title !== undefined) { f.title = str(req.body.title, 200); if (!f.title) return bad(res, 'Title cannot be empty.'); }
   if (req.body.description !== undefined) f.description = str(req.body.description);
@@ -412,7 +421,7 @@ app.patch('/api/tasks/:id', auth, (req, res) => {
 app.delete('/api/tasks/:id', auth, (req, res) => {
   const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(req.params.id));
   if (!task || !canSeeTask(req.user, task)) return bad(res, 'Task not found.', 404);
-  if (!canEditTask(req.user, task)) return bad(res, 'Only the person who assigned this task can delete it.', 403);
+  if (!canEditTask(req.user, task)) return bad(res, isClaimer(req.user, task) ? GIVE_BACK_HINT : 'Only the person who assigned this task can delete it.', 403);
   const lr = linkedRequest(task.id);
   if (lr && ['delivered', 'closed'].includes(lr.status)) return bad(res, 'This task delivered a document request, so it can’t be deleted.', 409);
   const stored = db.prepare('SELECT stored_name FROM files WHERE task_id = ?').all(task.id);
@@ -422,6 +431,26 @@ app.delete('/api/tasks/:id', auth, (req, res) => {
   })();
   removeStoredFiles(stored);
   res.json({ ok: true });
+});
+
+// The claimer of a self-claimed request hands it back: the task (and its files) is removed and the request is open again.
+// Not allowed once submitted or completed. Team members are notified again because it reappears among open requests.
+app.post('/api/tasks/:id/give-back', auth, (req, res) => {
+  const u = req.user;
+  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(req.params.id));
+  if (!task || !canSeeTask(u, task)) return bad(res, 'Task not found.', 404);
+  if (!isClaimer(u, task)) return bad(res, 'Only the person who took this request can give it back.', 403);
+  if (!['assigned', 'in_progress'].includes(task.status)) return bad(res, 'This task has been submitted or completed, so it can’t be given back.', 409);
+  const lr = linkedRequest(task.id);
+  if (!lr || lr.status !== 'assigned') return bad(res, 'This request can’t be given back now.', 409);
+  const stored = db.prepare('SELECT stored_name FROM files WHERE task_id = ?').all(task.id);
+  db.transaction(() => {
+    db.prepare(`UPDATE requests SET status = 'open', task_id = NULL WHERE id = ? AND status = 'assigned'`).run(lr.id);
+    db.prepare('INSERT INTO request_events (request_id, user_id, message) VALUES (?,?,?)').run(lr.id, u.id, `${u.name} gave the request back`);
+    db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id);
+  })();
+  removeStoredFiles(stored);
+  res.json({ ok: true, request_id: lr.id });
 });
 
 // Progress update / status change by the assignee (or the assigner); may carry attached files.
