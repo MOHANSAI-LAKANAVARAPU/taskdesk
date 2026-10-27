@@ -698,13 +698,28 @@
 
   // "Assign to" for an open request (request page and the dashboard's "Requests to assign"): one person, type to search.
   // The team's lead sees its active members; managers/admins see everyone, the request's team first (server order).
-  // The current user isn't listed: they use "Take this task".
-  const assignable = d => d.members.filter(m => m.id !== me.id)
-    .map(m => ({ ...m, team_name: m.team_id === d.request.target_team_id ? `${m.team_name} (this request’s team)` : m.team_name || 'No team' }));
+  // The current user comes first as "<name> (me)" when they may take it; choosing it is the same as "Take this task".
+  const assignable = d => {
+    const team = m => m.team_id === d.request.target_team_id ? `${m.team_name} (this request’s team)` : m.team_name || 'No team';
+    const others = d.members.filter(m => m.id !== me.id).map(m => ({ ...m, team_name: team(m) }));
+    const mine = me.team_id !== d.request.target_team_id && d.request.team_lead_id === me.id ? `Lead of ${d.request.team_name}` : team(me);
+    return d.can_take && !d.take_blocked ? [{ ...me, name: me.name + ' (me)', team_name: mine }, ...others] : others;
+  };
+  const noOthers = d => `No other members in ${esc(d.request.team_name)} yet – add them on the <a href="#/teams/${d.request.target_team_id}">Teams page</a>.`;
+  const assignHint = d => assignable(d).some(m => m.id !== me.id) ? (isBoss() ? 'Anyone can be chosen; people in the request’s team are listed first.'
+    : `Active members of ${esc(d.request.team_name)}.`) : noOthers(d);
   function assignPickerHtml(d) {
-    if (!assignable(d).length) return `<p class="muted" style="margin:0">No other members in ${esc(d.request.team_name)} yet – add them on the <a href="#/teams/${d.request.target_team_id}">Teams page</a>.</p>`;
-    return `${pickerHtml('Person', isBoss() ? 'Anyone can be chosen; people in the request’s team are listed first.' : `Active members of ${esc(d.request.team_name)}.`)}
-      <p class="err" id="assignErr"></p><button class="btn">Assign</button>`;
+    if (!assignable(d).length) return `<p class="muted" style="margin:0">${noOthers(d)}</p>`;
+    return `${pickerHtml('Person', assignHint(d))}<p class="err" id="assignErr"></p><button class="btn">Assign</button>`;
+  }
+  // Assign the request, or take it when the current user chose themself (then open their new task).
+  async function assignTo(d, person) {
+    if (person.id === me.id) {
+      const x = await api(`/requests/${d.request.id}/take`, { method: 'POST' });
+      toast('The task is yours'); location.hash = '#/tasks/' + x.task_id; return;
+    }
+    await api(`/requests/${d.request.id}/assign`, { method: 'POST', body: { user_id: person.id } });
+    toast('Assigned to ' + person.name); router();
   }
   function assignPicker(form, d) {
     const people = assignable(d);
@@ -716,12 +731,11 @@
     if (!d.can_assign) { toast('This request can’t be assigned any more.'); return router(); }
     openModal(`<h2 style="font-size:1.25rem">Assign “${esc(d.request.title)}”</h2>
       <p class="muted" style="margin-top:0">For ${esc(d.request.team_name)} · requested by ${esc(d.request.requested_by_name)} · needed by ${fmtDate(d.request.needed_by)}</p>
-      ${assignable(d).length ? pickerHtml('Assign to', isBoss() ? 'People in the request’s team are listed first.' : `Active members of ${esc(d.request.team_name)}.`) + modalActions('Assign')
+      ${assignable(d).length ? pickerHtml('Assign to', assignHint(d)) + modalActions('Assign')
         : assignPickerHtml(d) + '<div class="modal-actions"><button class="btn ghost" value="cancel" formnovalidate>Close</button></div>'}`, async () => {
-      const [uid] = picker ? picker.values() : [];
-      if (!uid) throw new Error('Choose a person.');
-      await api(`/requests/${id}/assign`, { method: 'POST', body: { user_id: uid } });
-      toast('Assigned to ' + picker.people()[0].name); router();
+      const [person] = picker ? picker.people() : [];
+      if (!person) throw new Error('Choose a person.');
+      await assignTo(d, person);
     });
     const picker = assignPicker(modalForm, d);
   }
@@ -776,9 +790,9 @@
       const picker = assignPicker(asf, d);
       if (picker) asf.onsubmit = e => {
         e.preventDefault();
-        const [uid] = picker.values();
-        if (!uid) { $('#assignErr').textContent = 'Choose a person.'; return; }
-        act('assign', { user_id: uid }, 'Assigned to ' + picker.people()[0].name);
+        const [person] = picker.people();
+        if (!person) { $('#assignErr').textContent = 'Choose a person.'; return; }
+        assignTo(d, person).catch(err => { $('#assignErr').textContent = err.message; });
       };
     }
     app.querySelectorAll('[data-sendteam]').forEach(b => b.onclick = () => act('send-to-team', { team_id: Number(b.dataset.sendteam) }, 'Sent to the team'));

@@ -120,7 +120,10 @@ function approversFor(assigneeId, assignedBy, request) {
   const self = !!db.prepare(`SELECT 1 FROM users WHERE id = ? AND active = 1 AND role IN ('admin','manager')`).get(assigneeId);
   return { names, any_manager, self, nobody: !names.length && !any_manager && !self };
 }
-function nobodyCanApprove(request) {
+// `assigneeId`: who would do the work. A team lead's own request task can only be approved by a manager/admin.
+function nobodyCanApprove(request, assigneeId) {
+  if (request && request.team_lead_id && request.team_lead_id === assigneeId)
+    return `Nobody can approve this yet: work the lead of ${request.team_name} takes is approved by a manager. Ask an admin to add a manager.`;
   return request && request.team_name ? `Nobody can approve this yet. Ask a manager to set a lead for ${request.team_name}.`
     : 'Nobody can approve this yet. Ask a manager to add another manager or team lead.';
 }
@@ -412,7 +415,7 @@ app.get('/api/tasks/:id', auth, (req, res) => {
   const approvers = ownPlainTask(task) ? null : approversFor(task.assignee_id, task.assigned_by, lr);
   res.json({ task, updates, can_edit: canEditTask(req.user, task), approvers,
     can_give_back: isClaimer(req.user, task) && ['assigned', 'in_progress'].includes(task.status) && lr && lr.status === 'assigned',
-    approval_blocked: approvers && approvers.nobody && task.status !== 'completed' ? nobodyCanApprove(lr) : null,
+    approval_blocked: approvers && approvers.nobody && task.status !== 'completed' ? nobodyCanApprove(lr, task.assignee_id) : null,
     can_update: isAssignee || canEditTask(req.user, task),
     can_submit: isAssignee && !ownPlainTask(task) && ['assigned', 'in_progress'].includes(task.status),
     can_review: task.status === 'submitted' && canReviewTask(req.user, task),
@@ -559,7 +562,7 @@ app.post('/api/tasks/:id/submit', auth, canSubmit, withUploads, (req, res) => {
   if (task.assignee_id !== u.id) return bad(res, 'Only the person this task is assigned to can submit it.', 403);
   if (ownPlainTask(task)) return bad(res, 'You assigned this task to yourself, so you can mark it completed directly.');
   const lr = linkedRequestFull(task.id);
-  if (approversFor(task.assignee_id, task.assigned_by, lr).nobody) return bad(res, nobodyCanApprove(lr), 409);
+  if (approversFor(task.assignee_id, task.assigned_by, lr).nobody) return bad(res, nobodyCanApprove(lr, task.assignee_id), 409);
   if (task.status === 'submitted') return bad(res, 'This task is already waiting for approval.', 409);
   if (task.status === 'completed') return bad(res, 'This task is already completed.', 409);
   const note = str(req.body.note, 4000);
@@ -578,7 +581,8 @@ app.post('/api/tasks/:id/submit', auth, canSubmit, withUploads, (req, res) => {
 // A manager/admin approving their own task is logged as "Self-approved by <name>".
 app.post('/api/tasks/:id/approve', auth, (req, res) => {
   const u = req.user, task = loadVisibleTask(req, res); if (!task) return;
-  if (!canReviewTask(u, task)) return bad(res, 'Only the person who assigned this task, the request team’s lead or a manager can approve it.', 403);
+  if (!canReviewTask(u, task)) return bad(res, u.id === task.assignee_id ? 'You can’t approve your own work.'
+    : 'Only the person who assigned this task, the request team’s lead or a manager can approve it.', 403);
   if (task.status !== 'submitted') return bad(res, 'This task isn’t waiting for approval.', 409);
   const note = str(req.body.note, 4000);
   db.transaction(() => {
@@ -594,7 +598,8 @@ app.post('/api/tasks/:id/approve', auth, (req, res) => {
 // Reviewer sends it back for more work (a reason is required).
 app.post('/api/tasks/:id/send-back', auth, (req, res) => {
   const u = req.user, task = loadVisibleTask(req, res); if (!task) return;
-  if (!canReviewTask(u, task)) return bad(res, 'Only the person who assigned this task, the request team’s lead or a manager can send it back.', 403);
+  if (!canReviewTask(u, task)) return bad(res, u.id === task.assignee_id ? 'You can’t send back your own work.'
+    : 'Only the person who assigned this task, the request team’s lead or a manager can send it back.', 403);
   if (task.status !== 'submitted') return bad(res, 'This task isn’t waiting for approval.', 409);
   const reason = str(req.body.reason, 4000);
   if (!reason) return bad(res, 'Write a reason so the assignee knows what to fix.');
@@ -708,11 +713,15 @@ function canSeeRequestFiles(u, r) {
   return isBoss(u) || r.requested_by === u.id || (u.team_id && u.team_id === r.target_team_id)
     || r.team_lead_id === u.id || (r.assignee_id && r.assignee_id === u.id);
 }
+// Members of the request's team, its lead (even when not a member) and managers/admins can take an open request.
+function canTakeRequest(u, r) {
+  return isBoss(u) || (!!u.team_id && u.team_id === r.target_team_id) || (!!r.team_lead_id && r.team_lead_id === u.id);
+}
 function requestFlags(u, r) {
-  const can_take = r.status === 'open' && (isBoss(u) || (!!u.team_id && u.team_id === r.target_team_id)); // managers: any team
+  const can_take = r.status === 'open' && canTakeRequest(u, r);
   return {
     can_take,
-    take_blocked: can_take && approversFor(u.id, u.id, r).nobody ? nobodyCanApprove(r) : null,
+    take_blocked: can_take && approversFor(u.id, u.id, r).nobody ? nobodyCanApprove(r, u.id) : null,
     can_send_to_team: r.status === 'needs_team' && isBoss(u),
     can_assign: r.status === 'open' && !!r.target_team_id && (isBoss(u) || r.team_lead_id === u.id),
     can_cancel: ['open', 'needs_team'].includes(r.status) && (r.requested_by === u.id || isBoss(u)),
@@ -809,8 +818,8 @@ app.post('/api/requests/:id/take', auth, (req, res) => {
   if (!r) return bad(res, 'Request not found.', 404);
   if (r.status === 'needs_team') return bad(res, 'A manager hasn’t chosen a team for this request yet.', 409);
   if (r.status !== 'open') return bad(res, 'This request has already been taken.', 409);
-  if (!isBoss(u) && (!u.team_id || u.team_id !== r.target_team_id)) return bad(res, 'Only members of the team this request is for can take it.', 403);
-  if (approversFor(u.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r), 409);
+  if (!canTakeRequest(u, r)) return bad(res, 'Only members of the team this request is for, its lead and managers can take it.', 403);
+  if (approversFor(u.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r, u.id), 409);
   sendRequestTask(res, r, u, u);
 });
 app.post('/api/requests/:id/assign', auth, (req, res) => {
@@ -821,8 +830,9 @@ app.post('/api/requests/:id/assign', auth, (req, res) => {
   if (r.status !== 'open') return bad(res, 'This request has already been taken.', 409);
   const a = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.body.user_id));
   if (!a || !a.active) return bad(res, 'Choose an active person.');
-  if (!isBoss(u) && a.team_id !== r.target_team_id) return bad(res, 'Choose an active member of the request’s team.'); // managers: anyone
-  if (approversFor(a.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r), 409);
+  // Managers: anyone. The lead: the team's members, or themself (same as "Take this task").
+  if (!isBoss(u) && a.id !== u.id && a.team_id !== r.target_team_id) return bad(res, 'Choose an active member of the request’s team.');
+  if (approversFor(a.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r, a.id), 409);
   sendRequestTask(res, r, a, u);
 });
 app.post('/api/requests/:id/cancel', auth, (req, res) => {
