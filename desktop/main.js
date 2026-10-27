@@ -55,6 +55,7 @@ const cleanUrl = u => String(u || '').trim().replace(/\/+$/, '');
 let mainWin = null, widgetWin = null, setupWin = null, tray = null, quitting = false;
 let lastSummary = { state: 'starting', open: 0, overdue: 0 };
 let pollTimer = null;
+let lastCheck = null; // { ok, time, open, reason } — shown in the menus and logged, to diagnose a missing badge
 
 function createMain() {
   mainWin = new BrowserWindow({
@@ -155,6 +156,7 @@ ipcMain.on('widget-drag-end', () => {
 ipcMain.on('widget-click', () => openDashboard());
 ipcMain.on('widget-menu', () => {
   Menu.buildFromTemplate([
+    ...infoItems(),
     { label: 'Open TaskDesk', click: () => openDashboard() },
     { label: 'Refresh', click: () => poll() }
   ]).popup({ window: widgetWin });
@@ -189,24 +191,47 @@ ipcMain.on('open-setup', () => openSetup());
 // ---------- task summary polling ----------
 function schedulePoll(ms) { clearTimeout(pollTimer); pollTimer = setTimeout(poll, ms); }
 
+function recordCheck(ok, info) {
+  lastCheck = Object.assign({ ok, time: new Date() }, info);
+  if (ok) console.log(`[summary] ok user=${info.user} open=${info.own} approvals=${info.approvals} badge=${info.open} overdue=${info.overdue}`
+    + ` team_requests=${info.teamRequests} ready=${info.ready} needs_team=${info.needsTeam}`);
+  else console.warn(`[summary] failed: ${info.reason}`);
+  buildTrayMenu();
+}
+function checkLine() {
+  if (!lastCheck) return 'Last check: not yet';
+  const t = lastCheck.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return lastCheck.ok ? `Last check: ${t} (${lastCheck.open} open)` : `Last check failed: ${lastCheck.reason}`;
+}
+// Disabled info lines at the top of both menus.
+function infoItems() {
+  return [{ label: `TaskDesk ${app.getVersion()}`, enabled: false }, { label: checkLine(), enabled: false }, { type: 'separator' }];
+}
+
 async function poll() {
   clearTimeout(pollTimer);
   try {
-    if (!cfg.server) return;
+    if (!cfg.server) return recordCheck(false, { reason: 'no server address set' });
     const cookies = await session.defaultSession.cookies.get({ url: cfg.server, name: 'sid' });
-    if (!cookies.length) return setSummary({ state: 'signed-out' });
+    if (!cookies.length) { recordCheck(false, { reason: 'not signed in (no session cookie)' }); return setSummary({ state: 'signed-out' }); }
     const r = await fetch(cfg.server + '/api/my-summary', {
       headers: { Cookie: 'sid=' + cookies[0].value }, signal: AbortSignal.timeout(10000)
     });
-    if (r.status === 401) return setSummary({ state: 'signed-out' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    if (r.status === 401) { recordCheck(false, { reason: 'signed out, session expired (HTTP 401)' }); return setSummary({ state: 'signed-out' }); }
+    if (!r.ok) { const e = new Error('server error'); e.status = r.status; throw e; }
     const data = await r.json();
     session.defaultSession.cookies.flushStore().catch(() => {}); // keep the sign-in after a restart
     notifyNewTasks(data);
     const approvals = (data.approvals || []).length;
     // Badge = my own open tasks + tasks waiting for my approval
     setSummary({ state: 'ok', open: data.open + approvals, own: data.open, approvals, overdue: data.overdue, name: data.user && data.user.name });
+    recordCheck(true, { user: data.user && data.user.id, own: data.open, approvals, open: data.open + approvals, overdue: data.overdue,
+      teamRequests: (data.team_requests || []).length, ready: (data.ready_requests || []).length, needsTeam: (data.needs_team_requests || []).length });
   } catch (e) {
+    // fetch wraps the network error; the useful code (ECONNREFUSED, ENOTFOUND, …) is on e.cause or its inner errors.
+    const cause = e.cause && (e.cause.code || (e.cause.errors && e.cause.errors[0] && e.cause.errors[0].code) || e.cause.message);
+    const reason = e.status ? `server error (HTTP ${e.status})` : e.name === 'TimeoutError' ? 'no answer from server (timeout)' : `can’t reach server (${cause || e.message})`;
+    recordCheck(false, { reason });
     setSummary({ state: 'offline' });
   } finally {
     pollTimer = setTimeout(poll, POLL_MS);
@@ -341,6 +366,7 @@ function applyAutoStart() {
 function buildTrayMenu() {
   if (!tray) return;
   tray.setContextMenu(Menu.buildFromTemplate([
+    ...infoItems(),
     { label: 'Open TaskDesk', click: () => openDashboard() },
     { label: 'My open tasks', click: () => openDashboard('/tasks?status=open') },
     { type: 'separator' },

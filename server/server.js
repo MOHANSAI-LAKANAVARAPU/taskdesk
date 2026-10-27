@@ -351,23 +351,34 @@ app.get('/api/tasks', auth, (req, res) => {
   res.json({ tasks: rows });
 });
 
+// Create tasks: one separate task per person in assignee_ids (or the single assignee_id, kept for compatibility).
+// Every person is checked with canAssignTo first; if anyone isn't allowed, nothing is created.
 app.post('/api/tasks', auth, (req, res) => {
   const u = req.user;
   if (u.role === 'employee') return bad(res, 'Only managers and team leads can assign tasks.', 403);
   const title = str(req.body.title, 200);
-  const assignee = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.body.assignee_id));
+  const rawIds = Array.isArray(req.body.assignee_ids) ? req.body.assignee_ids : req.body.assignee_id ? [req.body.assignee_id] : [];
+  const ids = [...new Set(rawIds.map(Number).filter(n => Number.isInteger(n) && n > 0))].slice(0, 200);
   const priority = req.body.priority || 'medium';
   const deadline = optDate(req.body.deadline), start_date = optDate(req.body.start_date);
   const project_id = req.body.project_id ? Number(req.body.project_id) : null;
   if (!title) return bad(res, 'Enter a task title.');
-  if (!canAssignTo(u, assignee)) return bad(res, 'You can’t assign tasks to this person.', 403);
+  if (!ids.length) return bad(res, 'Choose at least one person.');
+  const people = ids.map(id => ({ id, user: db.prepare('SELECT * FROM users WHERE id = ?').get(id) }));
+  const refused = people.filter(p => !canAssignTo(u, p.user)).map(p => p.user ? p.user.name : `unknown person #${p.id}`);
+  if (refused.length) return bad(res, `You can’t assign tasks to ${refused.join(', ')}. No tasks were created.`, 403);
   if (!PRIORITIES.includes(priority)) return bad(res, 'Choose a valid priority.');
   if (deadline === undefined || start_date === undefined) return bad(res, 'Dates must be in YYYY-MM-DD format.');
   if (project_id && !db.prepare('SELECT 1 FROM projects WHERE id = ?').get(project_id)) return bad(res, 'Project not found.');
-  const r = db.prepare(`INSERT INTO tasks (title, description, project_id, assignee_id, assigned_by, priority, start_date, deadline)
-    VALUES (?,?,?,?,?,?,?,?)`).run(title, str(req.body.description), project_id, assignee.id, u.id, priority, start_date, deadline);
-  db.prepare('INSERT INTO task_updates (task_id,user_id,message,status) VALUES (?,?,?,?)').run(r.lastInsertRowid, u.id, `Assigned to ${assignee.name}`, 'assigned');
-  res.json({ task: db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(r.lastInsertRowid) });
+  const description = str(req.body.description);
+  const created = db.transaction(() => people.map(({ user: a }) => {
+    const id = db.prepare(`INSERT INTO tasks (title, description, project_id, assignee_id, assigned_by, priority, start_date, deadline)
+      VALUES (?,?,?,?,?,?,?,?)`).run(title, description, project_id, a.id, u.id, priority, start_date, deadline).lastInsertRowid;
+    db.prepare('INSERT INTO task_updates (task_id,user_id,message,status) VALUES (?,?,?,?)').run(id, u.id, `Assigned to ${a.name}`, 'assigned');
+    return id;
+  }))();
+  const tasks = created.map(id => db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(id));
+  res.json({ task: tasks[0], tasks, count: tasks.length });
 });
 
 app.get('/api/tasks/:id', auth, (req, res) => {

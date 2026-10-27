@@ -107,7 +107,7 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | POST `/api/projects` | boss | Create project |
 | PATCH `/api/projects/:id` | boss | Edit name/description/status |
 | GET `/api/tasks` | signed in (scoped) | List; query `status` (assigned/in_progress/completed/open/overdue), `project`, `assignee`, `mine=assigned_by_me`; max 1000 |
-| POST `/api/tasks` | boss, lead (`canAssignTo`) | Create task |
+| POST `/api/tasks` | boss, lead (`canAssignTo`) | Create tasks: `assignee_ids` (array) creates one separate task per person, each with its own "Assigned to <name>" note; every person is checked first and if any isn't allowed nothing is created (the error names them). `assignee_id` still works. Returns `task` (first), `tasks`, `count` |
 | GET `/api/tasks/:id` | if `canSeeTask` | Task + updates + `can_edit`, `can_update` |
 | PATCH `/api/tasks/:id` | `canEditTask` | Edit fields / reassign |
 | DELETE `/api/tasks/:id` | `canEditTask` | Delete task |
@@ -150,6 +150,8 @@ To reset a dev database, stop the server and delete `data/` (dev only — never 
 - Default server address: `http://192.168.1.222:3000`, set in the app's `package.json` under `"taskdesk.defaultServer"`.
 - First-time installers for employee laptops: `../installers/` (`TaskDesk Setup <version>.exe` for Windows, `TaskDesk-<version>.AppImage` for Ubuntu; the .deb is no longer built).
 - The floating tick icon is always on: users **cannot hide or quit it** (no Quit, Hide or Show-icon/Start-at-login options; `showWidget` and `autoStart` are forced to true; closing the icon window is blocked or it is recreated). It only closes on a real shutdown, restart, logout or installer/uninstaller close. The dashboard window still just hides when closed. Builds need `env -u ELECTRON_RUN_AS_NODE` if that variable is set.
+
+- Diagnostics: the tray menu and the icon's right-click menu start with disabled lines "TaskDesk <version>" and "Last check: <time> (<n> open)" / "Last check failed: <reason>". Every summary check is logged to `~/.config/TaskDesk/taskdesk.log` (Windows: `%APPDATA%\TaskDesk\taskdesk.log`) as `[summary] ok user=… open=… approvals=… badge=…` or `[summary] failed: <reason> (HTTP <status>)`.
 
 ### Automatic updates
 

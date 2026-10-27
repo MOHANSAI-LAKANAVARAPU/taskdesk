@@ -256,6 +256,52 @@
     const nb = $('#newTask'); if (nb) nb.onclick = () => taskForm();
   }
 
+  // Person search with chips. Type 1+ letters to see matching people (name, role, team); arrow keys + Enter or click
+  // to pick; ✕ removes. `multiple: false` keeps one chip (picking replaces it).
+  function personPicker(root, people, { multiple = true, selected = [] } = {}) {
+    const input = root.querySelector('input'), list = root.querySelector('[role=listbox]'), chips = root.querySelector('.chips');
+    let chosen = selected.slice(), matches = [], active = 0;
+    const desc = p => [ROLE[p.role], p.team_name].filter(Boolean).join(' · ');
+    const renderChips = () => {
+      chips.innerHTML = chosen.map(p => `<span class="chip">${esc(p.name)}<button type="button" data-rm="${p.id}" aria-label="Remove ${esc(p.name)}">✕</button></span>`).join('');
+      chips.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { chosen = chosen.filter(p => p.id !== Number(b.dataset.rm)); renderChips(); input.focus(); });
+    };
+    const close = () => { list.hidden = true; input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); };
+    const renderList = () => {
+      const q = input.value.trim().toLowerCase();
+      matches = !q ? [] : people.filter(p => !chosen.some(c => c.id === p.id) && (p.name.toLowerCase().includes(q) || (p.team_name || '').toLowerCase().includes(q))).slice(0, 8);
+      if (!q) return close();
+      active = Math.min(active, Math.max(matches.length - 1, 0));
+      list.innerHTML = matches.length ? matches.map((p, i) => `<li role="option" id="pp-${p.id}" data-i="${i}" aria-selected="${i === active}">
+          <span>${esc(p.name)}</span><small>${esc(desc(p))}</small></li>`).join('')
+        : `<li class="none">No one matches “${esc(input.value.trim())}”.</li>`;
+      list.hidden = false; input.setAttribute('aria-expanded', 'true');
+      if (matches[active]) input.setAttribute('aria-activedescendant', 'pp-' + matches[active].id);
+      list.querySelectorAll('[data-i]').forEach(li => li.onmousedown = e => { e.preventDefault(); pick(Number(li.dataset.i)); });
+    };
+    const pick = i => {
+      const p = matches[i]; if (!p) return;
+      chosen = multiple ? chosen.concat(p) : [p];
+      input.value = ''; active = 0; close(); renderChips(); input.focus();
+    };
+    input.oninput = () => { active = 0; renderList(); };
+    input.onkeydown = e => {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault(); if (!matches.length) return renderList();
+        active = (active + (e.key === 'ArrowDown' ? 1 : -1) + matches.length) % matches.length; renderList();
+      } else if (e.key === 'Enter') { e.preventDefault(); pick(active); } // never submits the form
+      else if (e.key === 'Escape' && !list.hidden) { e.preventDefault(); e.stopPropagation(); close(); }
+      else if (e.key === 'Backspace' && !input.value && chosen.length) { chosen.pop(); renderChips(); }
+    };
+    input.onblur = () => setTimeout(close, 100);
+    renderChips();
+    return { values: () => chosen.map(p => p.id), people: () => chosen.slice() };
+  }
+  const pickerHtml = (label, hint) => `<div class="f picker"><span id="pickLabel">${label}</span>
+      <div class="picker-box"><span class="chips"></span><input type="text" role="combobox" aria-labelledby="pickLabel" aria-autocomplete="list"
+        aria-expanded="false" aria-controls="pickList" autocomplete="off" placeholder="Type a name…"></div>
+      <ul role="listbox" id="pickList" hidden></ul><small class="muted">${hint}</small></div>`;
+
   async function taskForm(task) {
     const [{ projects }, { users }] = await Promise.all([api('/projects'), api('/users')]);
     const assignable = users.filter(u => u.active); // the server only lists people this user may assign to
@@ -265,9 +311,8 @@
       <h2 style="font-size:1.25rem">${task ? 'Edit task' : 'Assign a task'}</h2>
       <label class="f"><span>Title</span><input name="title" required maxlength="200" value="${esc(t.title)}"></label>
       <label class="f"><span>Description</span><textarea name="description" placeholder="What needs to be done, and what counts as finished">${esc(t.description)}</textarea></label>
+      ${pickerHtml('Assign to', task ? 'One person. Pick someone else to reassign.' : 'Pick one or more people. Each gets their own copy of the task.')}
       <div class="grid2">
-        <label class="f"><span>Assign to</span><select name="assignee_id" required><option value="">Choose a person</option>
-          ${assignable.map(u => `<option value="${u.id}"${u.id === t.assignee_id ? ' selected' : ''}>${esc(u.name)} (${ROLE[u.role]})</option>`).join('')}</select></label>
         <label class="f"><span>Project</span><select name="project_id"><option value="">No project</option>
           ${projects.filter(p => p.status !== 'closed' || p.id === t.project_id).map(p => `<option value="${p.id}"${p.id === t.project_id ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
         <label class="f"><span>Priority</span><select name="priority">${options(PRIORITY, t.priority)}</select></label>
@@ -276,13 +321,22 @@
       ${modalActions(task ? 'Save changes' : 'Assign task')}`,
       async fd => {
         const body = Object.fromEntries(fd);
+        const ids = picker.values();
         if (!body.title.trim()) throw new Error('Enter a task title.');
-        if (!body.assignee_id) throw new Error('Choose who this task is for.');
-        if (task) { await api('/tasks/' + task.id, { method: 'PATCH', body }); toast('Task updated'); }
-        else { const r = await api('/tasks', { method: 'POST', body }); toast('Task assigned to ' + r.task.assignee_name); }
+        if (!ids.length) throw new Error(task ? 'Choose who this task is for.' : 'Choose at least one person.');
+        if (task) { body.assignee_id = ids[0]; await api('/tasks/' + task.id, { method: 'PATCH', body }); toast('Task updated'); }
+        else {
+          body.assignee_ids = ids;
+          const r = await api('/tasks', { method: 'POST', body });
+          toast(r.count > 1 ? `Task assigned to ${r.count} people` : 'Task assigned to ' + r.task.assignee_name);
+        }
         router();
       });
+    const current = task ? [assignable.find(u => u.id === task.assignee_id) || { id: task.assignee_id, name: task.assignee_name }] : [];
+    const picker = personPicker(modalForm.querySelector('.picker'), assignable, { multiple: !task, selected: current });
+    if (!task) modalForm.querySelector('[name=title]').focus();
   }
+
 
   // Status choices in the update form: "Completed" is only offered to people who may complete directly.
   function statusChoices(t, direct) {
