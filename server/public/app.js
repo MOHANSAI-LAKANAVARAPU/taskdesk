@@ -102,15 +102,17 @@
   function renderNav(route) {
     const items = [['#/', 'Dashboard'], ['#/tasks', me.role === 'employee' ? 'My tasks' : 'Tasks'], ['#/requests', 'Requests'], ['#/projects', 'Projects']];
     if (isBoss()) items.push(['#/people', 'People']);
-    items.push(['#/teams', 'Teams'], ['#/history', 'History']);
+    items.push(['#/teams', 'Teams'], ['#/chat', `Chat <span class="pill nav-count" id="chatCount"${chatUnread ? '' : ' hidden'}>${chatUnread > 99 ? '99+' : chatUnread}</span>`], ['#/history', 'History']);
     $('#nav').innerHTML = items.map(([h, l]) => {
       const cur = h === '#/' ? route === '' : route.startsWith(h.slice(2));
       return `<a href="${h}"${cur ? ' aria-current="page"' : ''}>${l}</a>`;
     }).join('');
     $('#meName').textContent = me.name; $('#meName').title = me.name; // long names are cut short with "…"
     $('#topbar').hidden = false;
+    document.documentElement.style.setProperty('--topbar-h', $('#topbar').offsetHeight + 'px'); // the chat page fills the rest
+    if (!stream || stream.readyState === EventSource.CLOSED) { openStream(); startChatPolling(); }
   }
-  $('#logoutBtn').onclick = async () => { await api('/logout', { method: 'POST' }).catch(() => {}); me = null; location.hash = '#/login'; };
+  $('#logoutBtn').onclick = async () => { closeStream(); await api('/logout', { method: 'POST' }).catch(() => {}); me = null; setChatUnread(0); location.hash = '#/login'; };
 
   async function router() {
     const route = location.hash.replace(/^#\/?/, '');
@@ -121,8 +123,10 @@
     // The old "My team" page (and People for non-managers) is now the Teams page.
     if (route === 'my-team' || (route.startsWith('people') && !isBoss())) return location.replace('#/teams');
     renderNav(route);
-    app.innerHTML = `<p class="muted">Loading…</p>`;
     const parts = route.split('?')[0].split('/');
+    // Moving between chats keeps the chat page (and its list) in place.
+    if (parts[0] === 'chat' && chatPage()) return viewChat(Number(parts[1]) || null).catch(e => toast(e.message));
+    app.innerHTML = `<p class="muted">Loading…</p>`;
     try {
       if (route === '') await viewDashboard();
       else if (parts[0] === 'tasks' && parts[1]) await viewTask(Number(parts[1]));
@@ -134,6 +138,7 @@
       else if (parts[0] === 'teams' && parts[1]) await viewTeam(Number(parts[1]));
       else if (parts[0] === 'teams') await viewTeams();
       else if (parts[0] === 'history') await viewHistory();
+      else if (parts[0] === 'chat') await viewChat(Number(parts[1]) || null);
       else if (parts[0] === 'account') viewAccount();
       else app.innerHTML = `<div class="empty">This page doesn’t exist. <a href="#/">Go to the dashboard</a>.</div>`;
     } catch (e) { app.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
@@ -919,6 +924,347 @@
       try { await api('/me/password', { method: 'POST', body: { current: fd.get('current'), next: fd.get('next') } }); e.target.reset(); $('#pwErr').textContent = ''; toast('Password changed'); }
       catch (err) { $('#pwErr').textContent = err.message; }
     };
+  }
+
+  // ---------- chat ----------
+  // #/chat and #/chat/:id. Live updates come from /api/stream (Server-Sent Events); while the stream is down the page
+  // polls every 10 seconds. Messages are read when the conversation is open and the page is visible.
+  const chat = { id: null, conv: null, members: [], messages: [], more: false, loading: false, pending: [], list: [] };
+  let chatUnread = 0, stream = null, chatPollTimer = null;
+  const MAX_CHAT_FILES = 5, MAX_CHAT_BYTES = 25 * 1048576;
+  const chatPage = () => !!$('#chat');
+  const parseTs = d => new Date(d.replace(' ', 'T') + (d.includes('Z') || d.includes('T') ? '' : 'Z'));
+  const fmtTime = d => parseTs(d).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  function dayLabel(d) {
+    const dt = parseTs(d), day = new Date(dt); day.setHours(0, 0, 0, 0);
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const diff = Math.round((today - day) / 864e5);
+    return diff === 0 ? 'Today' : diff === 1 ? 'Yesterday' : dt.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+  }
+  function listTime(d) {
+    if (!d) return '';
+    const l = dayLabel(d);
+    return l === 'Today' ? fmtTime(d) : l === 'Yesterday' ? l : parseTs(d).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+  }
+  // Text is escaped first; then web addresses become links. Line breaks are kept by CSS (pre-wrap).
+  const linkify = s => esc(s).replace(/https?:\/\/(?:(?!&quot;|&lt;|&gt;|&#39;)[^\s])+/g, m => {
+    const url = m.replace(/[.,;:!?)\]]+$/, ''), rest = m.slice(url.length);
+    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>${rest}`;
+  });
+  function setChatUnread(n) {
+    chatUnread = n || 0;
+    const el = $('#chatCount');
+    if (el) { el.textContent = chatUnread > 99 ? '99+' : chatUnread; el.hidden = !chatUnread; }
+  }
+
+  // ----- live updates -----
+  function openStream() {
+    if (stream) stream.close();
+    stream = new EventSource('/api/stream');
+    stream.addEventListener('message', e => onChatMessage(JSON.parse(e.data)));
+    stream.addEventListener('deleted', e => onChatDeleted(JSON.parse(e.data)));
+    stream.addEventListener('read', e => { const d = JSON.parse(e.data); setChatUnread(d.unread_total); if (chatPage()) refreshChatList(); });
+    stream.addEventListener('conversation', e => {
+      const d = JSON.parse(e.data) || {};
+      if (!chatPage()) return refreshChatCount();
+      refreshChatList();
+      if (chat.id && (!d.conversation_id || d.conversation_id === chat.id)) reloadConversation();
+    });
+    stream.onopen = () => refreshChatCount(); // catch up on anything missed while it was down
+  }
+  function closeStream() { if (stream) stream.close(); stream = null; clearInterval(chatPollTimer); chatPollTimer = null; }
+  // Fallback: every 10 s, if the stream isn't open, poll (and try to reopen a stream that gave up).
+  function startChatPolling() {
+    if (chatPollTimer) return;
+    chatPollTimer = setInterval(async () => {
+      if (!me) return;
+      if (stream && stream.readyState === EventSource.OPEN) return;
+      if (!stream || stream.readyState === EventSource.CLOSED) openStream();
+      await refreshChatCount();
+      if (chatPage() && chat.id) {
+        const last = chat.messages.length ? chat.messages[chat.messages.length - 1].id : 0;
+        try {
+          const r = await api(`/chat/${chat.id}/messages?after=${last}`);
+          let changed = false;
+          for (const m of r.messages) if (!chat.messages.some(x => x.id === m.id)) { chat.messages.push(m); changed = true; }
+          for (const id of r.deleted) { const m = chat.messages.find(x => x.id === id); if (m && !m.deleted) { Object.assign(m, { deleted: true, body: '', files: [] }); changed = true; } }
+          if (changed) { renderMessages(); markRead(); }
+        } catch (e) { /* next round */ }
+      }
+    }, 10000);
+  }
+  async function refreshChatCount() {
+    try { const r = await api('/chat'); setChatUnread(r.unread_total); if (chatPage()) { chat.list = r.conversations; renderChatList(); } } catch (e) { /* offline */ }
+  }
+  const refreshChatList = refreshChatCount;
+  function onChatMessage(d) {
+    setChatUnread(d.unread_total);
+    if (!chatPage()) return;
+    if (d.conversation_id === chat.id && !chat.messages.some(m => m.id === d.message.id)) { chat.messages.push(d.message); renderMessages(); markRead(); }
+    refreshChatList();
+  }
+  function onChatDeleted(d) {
+    setChatUnread(d.unread_total);
+    if (!chatPage()) return;
+    const m = chat.id === d.conversation_id && chat.messages.find(x => x.id === d.message_id);
+    if (m) { Object.assign(m, { deleted: true, body: '', files: [] }); renderMessages(); }
+    refreshChatList();
+  }
+  // Read when the conversation is on screen and the page is visible and focused.
+  async function markRead() {
+    if (!chatPage() || !chat.id || !chat.messages.length || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+    const last = chat.messages[chat.messages.length - 1].id;
+    if (last <= (chat.conv.last_read_message_id || 0)) return;
+    chat.conv.last_read_message_id = last;
+    try { const r = await api(`/chat/${chat.id}/read`, { method: 'POST', body: { message_id: last } }); setChatUnread(r.unread_total); } catch (e) { /* ignore */ }
+  }
+  document.addEventListener('visibilitychange', markRead);
+  window.addEventListener('focus', markRead);
+
+  // ----- page -----
+  async function viewChat(id) {
+    if (!chatPage()) {
+      app.innerHTML = `<div class="chat" id="chat">
+        <aside class="chat-side">
+          <div class="chat-side-head"><h1>Chat</h1><div class="inline-actions"><button class="btn small" id="newChat">New chat</button><button class="btn ghost small" id="newGroup">New group</button></div></div>
+          <input type="search" id="chatSearch" placeholder="Search messages and files" aria-label="Search your chats" autocomplete="off">
+          <ul class="chat-list" id="chatList" aria-label="Conversations"></ul>
+        </aside>
+        <section class="chat-main" id="chatMain" aria-live="polite"></section>
+      </div>`;
+      $('#newChat').onclick = newChatForm;
+      $('#newGroup').onclick = () => groupForm();
+      let st;
+      $('#chatSearch').oninput = e => { clearTimeout(st); st = setTimeout(() => chatSearch(e.target.value.trim()), 250); };
+      await refreshChatList();
+    }
+    await openConversation(id || null);
+  }
+  function renderChatList() {
+    const ul = $('#chatList'); if (!ul || $('#chatSearch').value.trim()) return;
+    ul.innerHTML = chat.list.length ? chat.list.map(c => `<li><a href="#/chat/${c.id}"${c.id === chat.id ? ' aria-current="true"' : ''} class="${c.unread ? 'unread' : ''}">
+        <span class="cl-top"><b>${esc(c.name)}</b><span class="cl-time">${esc(listTime(c.last_message_at))}</span></span>
+        <span class="cl-bottom"><span class="cl-preview">${c.type === 'team' ? '<span class="cl-tag">Team</span>' : c.type === 'group' ? '<span class="cl-tag">Group</span>' : ''}${c.last ? `${c.type !== 'direct' || c.last.sender_name === 'You' ? esc(c.last.sender_name) + ': ' : ''}${c.last.deleted ? '<i>This message was deleted</i>' : esc(c.last.text)}` : '<span class="muted">No messages yet</span>'}</span>
+          ${c.muted ? '<span title="Muted" aria-label="Muted">🔕</span>' : ''}${c.unread ? `<span class="pill accent cl-count" aria-label="${c.unread} unread">${c.unread > 99 ? '99+' : c.unread}</span>` : ''}</span></a></li>`).join('')
+      : `<li class="empty">No chats yet. Start one with “New chat”.</li>`;
+  }
+  async function chatSearch(q) {
+    const ul = $('#chatList');
+    if (!q) return renderChatList();
+    if (q.length < 2) { ul.innerHTML = `<li class="empty">Type at least 2 letters.</li>`; return; }
+    const { results } = await api('/chat/search?q=' + encodeURIComponent(q));
+    if ($('#chatSearch').value.trim() !== q) return;
+    ul.innerHTML = results.length ? results.map(r => `<li><a href="#/chat/${r.conversation_id}">
+        <span class="cl-top"><b>${esc(r.conversation_name)}</b><span class="cl-time">${esc(listTime(r.message.created_at))}</span></span>
+        <span class="cl-preview">${esc(r.message.sender_name || 'Former member')}: ${esc(r.message.body.slice(0, 140)) || esc(r.message.files.map(f => '📎 ' + f.name).join(', '))}</span></a></li>`).join('')
+      : `<li class="empty">Nothing found in your chats.</li>`;
+  }
+  async function reloadConversation() {
+    try { await openConversation(chat.id, true); }
+    catch (e) { chat.id = null; $('#chatMain').innerHTML = `<div class="empty">You’re no longer in this chat.</div>`; $('#chat').classList.remove('has-open'); }
+  }
+  async function openConversation(id, keepScroll) {
+    const main = $('#chatMain');
+    $('#chat').classList.toggle('has-open', !!id);
+    if (!id) { chat.id = null; main.innerHTML = `<div class="empty chat-empty">Choose a chat on the left, or start a new one.</div>`; renderChatList(); return; }
+    const d = await api('/chat/' + id).catch(e => { if (keepScroll) throw e; main.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return null; });
+    if (!d) { chat.id = null; return; }
+    const same = chat.id === id, draft = same && $('#chatText') ? $('#chatText').value : '';
+    Object.assign(chat, { id, conv: d.conversation, members: d.members });
+    if (!same || !keepScroll) { chat.messages = d.messages; chat.more = d.more; chat.pending = []; }
+    else for (const m of d.messages) { const i = chat.messages.findIndex(x => x.id === m.id); if (i < 0) chat.messages.push(m); else chat.messages[i] = m; }
+    const c = d.conversation;
+    const sub = c.type === 'direct' ? 'Direct chat' : `${c.type === 'team' ? 'Team chat' : 'Group'} · ${d.members.length} ${d.members.length === 1 ? 'person' : 'people'}`;
+    main.innerHTML = `<header class="chat-head">
+        <a href="#/chat" class="chat-back" aria-label="Back to chats">←</a>
+        <div class="chat-title"><h2>${esc(c.name)}</h2><small class="muted">${esc(sub)}</small></div>
+        <div class="inline-actions">
+          <button class="btn ghost small" id="chatMute" aria-pressed="${c.muted}">${c.muted ? '🔕 Unmute' : 'Mute'}</button>
+          ${c.type !== 'direct' ? `<button class="btn ghost small" id="chatPeople">People</button>` : ''}
+          ${c.can_manage ? `<button class="btn ghost small" id="chatRename">Rename</button>` : ''}
+          ${c.type === 'group' && !c.archived ? `<button class="btn danger small" id="chatLeave">Leave</button>` : ''}
+        </div></header>
+      <div class="chat-msgs" id="chatMsgs" tabindex="0" aria-label="Messages"></div>
+      ${c.archived ? `<p class="chat-archived">This team was deleted. You can read this chat, but nobody can post in it.</p>` : `
+      <form class="composer" id="composer">
+        <div class="pending" id="pending"></div>
+        <div class="composer-row">
+          <label class="btn ghost clip" title="Attach files (or drop or paste them here)"><span aria-hidden="true">📎</span><span class="sr">Attach files</span><input type="file" id="chatFiles" multiple accept="${FILE_ACCEPT}" hidden></label>
+          <textarea id="chatText" rows="1" maxlength="5000" placeholder="Write a message…" title="Enter sends, Shift+Enter starts a new line" aria-label="Message"></textarea>
+          <button class="btn" type="submit" id="chatSend">Send</button>
+        </div></form>`}
+      <div class="drop-hint" id="dropHint" hidden>Drop files to attach them</div>`;
+    renderMessages(!keepScroll || !same);
+    renderChatList();
+    $('#chatMute').onclick = async () => { await api(`/chat/${id}/mute`, { method: 'PUT', body: { muted: !c.muted } }); toast(c.muted ? 'Chat unmuted' : 'Chat muted – no notifications'); reloadConversation(); refreshChatList(); };
+    if ($('#chatPeople')) $('#chatPeople').onclick = peopleDialog;
+    if ($('#chatRename')) $('#chatRename').onclick = () => groupForm(c);
+    if ($('#chatLeave')) $('#chatLeave').onclick = async () => {
+      if (!confirm(`Leave “${c.name}”? You won’t see its messages any more.`)) return;
+      try { await api(`/chat/${id}/leave`, { method: 'POST' }); toast('You left the group'); location.hash = '#/chat'; } catch (e) { toast(e.message); }
+    };
+    const msgs = $('#chatMsgs');
+    msgs.onscroll = () => { if (msgs.scrollTop < 80) loadOlder(); };
+    msgs.onclick = e => {
+      const del = e.target.closest('[data-del]'), img = e.target.closest('[data-img]');
+      if (del) deleteMessage(Number(del.dataset.del));
+      if (img) lightbox(img.dataset.img, img.dataset.name, img.dataset.file);
+    };
+    if (!c.archived) { setupComposer(); if (draft) { $('#chatText').value = draft; $('#chatText').oninput(); } }
+    markRead();
+  }
+  function renderMessages(toBottom) {
+    const box = $('#chatMsgs'); if (!box) return;
+    const nearBottom = toBottom || box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+    let html = chat.more ? `<p class="chat-more muted">Scroll up for older messages</p>` : chat.messages.length ? '' : `<p class="empty">No messages yet. Say hello!</p>`;
+    let prev = null;
+    for (const m of chat.messages) {
+      const day = dayLabel(m.created_at);
+      if (!prev || dayLabel(prev.created_at) !== day) { html += `<div class="day-sep"><span>${esc(day)}</span></div>`; prev = null; }
+      const grouped = prev && prev.sender_id === m.sender_id && parseTs(m.created_at) - parseTs(prev.created_at) < 5 * 60e3;
+      const mine = m.sender_id === me.id;
+      html += `<div class="msg${mine ? ' mine' : ''}${grouped ? ' grouped' : ''}" data-id="${m.id}">
+        ${grouped ? '' : `<div class="msg-head"><b>${mine ? 'You' : esc(m.sender_name || 'Former member')}</b> <time datetime="${esc(m.created_at)}">${esc(fmtTime(m.created_at))}</time></div>`}
+        <div class="msg-line">${mine && !m.deleted ? `<button type="button" class="msg-del" data-del="${m.id}" title="Delete this message" aria-label="Delete this message">🗑</button>` : ''}${m.deleted ? `<div class="bubble deleted"><i>This message was deleted</i></div>` : `<div class="bubble" title="${esc(fmtTime(m.created_at))}">${m.body ? `<div class="msg-text">${linkify(m.body)}</div>` : ''}${m.files.map(fileHtml).join('')}</div>`}</div>
+      </div>`;
+      prev = m;
+    }
+    box.innerHTML = html;
+    if (nearBottom) box.scrollTop = box.scrollHeight;
+    // Images change the height once they load.
+    if (nearBottom) box.querySelectorAll('img').forEach(i => { if (!i.complete) i.onload = () => { box.scrollTop = box.scrollHeight; }; });
+  }
+  function fileHtml(f) {
+    if (f.is_image) return `<button type="button" class="thumb" data-img="/api/files/${f.id}?inline=1" data-file="${f.id}" data-name="${esc(f.name)}" aria-label="Open image ${esc(f.name)}"><img src="/api/files/${f.id}?inline=1" alt="${esc(f.name)}" loading="lazy"></button>`;
+    const ext = (f.name.split('.').pop() || '').slice(0, 4).toUpperCase();
+    return `<div class="file-card"><span class="file-ext">${esc(ext)}</span><span class="file-info"><b>${esc(f.name)}</b><small class="muted">${fmtSize(f.size)}</small></span>
+      <a class="btn ghost small" href="/api/files/${f.id}" download>Download</a></div>`;
+  }
+  async function loadOlder() {
+    if (!chat.more || chat.loading || !chat.messages.length) return;
+    chat.loading = true;
+    const box = $('#chatMsgs'), id = chat.id, fromBottom = box.scrollHeight - box.scrollTop;
+    try {
+      const r = await api(`/chat/${id}/messages?before=${chat.messages[0].id}`);
+      if (chat.id !== id) return;
+      chat.messages = r.messages.concat(chat.messages); chat.more = r.more;
+      renderMessages(); box.scrollTop = box.scrollHeight - fromBottom; // stay where you were
+    } finally { chat.loading = false; }
+  }
+  async function deleteMessage(mid) {
+    if (!confirm('Delete this message for everyone? Its files will no longer be available.')) return;
+    try { await api('/chat/messages/' + mid, { method: 'DELETE' }); const m = chat.messages.find(x => x.id === mid); if (m) Object.assign(m, { deleted: true, body: '', files: [] }); renderMessages(); }
+    catch (e) { toast(e.message); }
+  }
+  function lightbox(src, name, fileId) {
+    const lb = $('#lightbox');
+    lb.querySelector('img').src = src; lb.querySelector('img').alt = name;
+    lb.querySelector('.lb-name').textContent = name;
+    lb.querySelector('a').href = '/api/files/' + fileId;
+    lb.showModal();
+  }
+  $('#lightbox').onclick = e => { if (!e.target.closest('a')) $('#lightbox').close(); };
+
+  // ----- composer: text, paperclip, drag and drop, pasted images -----
+  function setupComposer() {
+    const form = $('#composer'), text = $('#chatText'), main = $('#chatMain');
+    const grow = () => { text.style.height = 'auto'; text.style.height = Math.min(text.scrollHeight, 160) + 'px'; };
+    text.oninput = grow;
+    text.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); form.requestSubmit(); } };
+    $('#chatFiles').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
+    text.onpaste = e => {
+      const files = [...(e.clipboardData && e.clipboardData.files) || []];
+      if (!files.length) return; // plain text pastes normally
+      e.preventDefault();
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
+      addFiles(files.map((f, i) => f.type.startsWith('image/') && (!f.name || f.name === 'image.png')
+        ? new File([f], `pasted-image-${stamp}${i ? '-' + i : ''}.${({ 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' })[f.type] || 'png'}`, { type: f.type }) : f));
+    };
+    let depth = 0;
+    const hasFiles = e => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+    main.ondragenter = e => { if (!hasFiles(e)) return; e.preventDefault(); depth++; $('#dropHint').hidden = false; };
+    main.ondragover = e => { if (hasFiles(e)) e.preventDefault(); };
+    main.ondragleave = () => { if (--depth <= 0) { depth = 0; $('#dropHint').hidden = true; } };
+    main.ondrop = e => { if (!hasFiles(e)) return; e.preventDefault(); depth = 0; $('#dropHint').hidden = true; addFiles([...e.dataTransfer.files]); };
+    form.onsubmit = async e => {
+      e.preventDefault();
+      const body = text.value.trim();
+      if (!body && !chat.pending.length) return;
+      const btn = $('#chatSend'); btn.disabled = true;
+      try {
+        const r = await api(`/chat/${chat.id}/messages`, { method: 'POST', body: formData({ body }, { files: chat.pending }) });
+        text.value = ''; grow(); chat.pending = []; renderPending();
+        if (!chat.messages.some(m => m.id === r.message.id)) chat.messages.push(r.message);
+        chat.conv.last_read_message_id = r.message.id;
+        renderMessages(true); refreshChatList();
+      } catch (err) { toast(err.message); }
+      finally { btn.disabled = false; text.focus(); }
+    };
+    renderPending();
+    text.focus();
+  }
+  function addFiles(files) {
+    const ok = FILE_ACCEPT.split(',');
+    for (const f of files) {
+      if (chat.pending.length >= MAX_CHAT_FILES) { toast(`You can attach up to ${MAX_CHAT_FILES} files to one message.`); break; }
+      if (!ok.includes('.' + (f.name.split('.').pop() || '').toLowerCase())) { toast(`“${f.name}” isn’t an allowed file type.`); continue; }
+      if (f.size > MAX_CHAT_BYTES) { toast(`“${f.name}” is bigger than 25 MB.`); continue; }
+      chat.pending.push(f);
+    }
+    renderPending();
+  }
+  function renderPending() {
+    const el = $('#pending'); if (!el) return;
+    el.innerHTML = chat.pending.map((f, i) => `<span class="chip">📎 ${esc(f.name)} <small>${fmtSize(f.size)}</small><button type="button" data-rmf="${i}" aria-label="Remove ${esc(f.name)}">✕</button></span>`).join('');
+    el.querySelectorAll('[data-rmf]').forEach(b => b.onclick = () => { chat.pending.splice(Number(b.dataset.rmf), 1); renderPending(); });
+  }
+
+  // ----- new chat / group / people -----
+  async function newChatForm() {
+    const { people } = await api('/chat/people');
+    openModal(`<h2 style="font-size:1.25rem">New chat</h2>${pickerHtml('Person', 'Type a name to find someone.')}${modalActions('Open chat')}`, async () => {
+      const id = picker.values()[0]; if (!id) throw new Error('Choose a person.');
+      const r = await api('/chat/direct', { method: 'POST', body: { user_id: id } });
+      location.hash = '#/chat/' + r.conversation_id;
+    });
+    const picker = personPicker(modalForm.querySelector('.picker'), people, { multiple: false });
+  }
+  async function groupForm(c) {
+    if (c) {
+      openModal(`<h2 style="font-size:1.25rem">Rename group</h2><label class="f"><span>Group name</span><input name="name" required maxlength="100" value="${esc(c.name)}"></label>${modalActions('Save')}`, async fd => {
+        await api('/chat/' + c.id, { method: 'PATCH', body: { name: fd.get('name') } }); toast('Group renamed'); reloadConversation(); refreshChatList();
+      });
+      return;
+    }
+    const { people } = await api('/chat/people');
+    openModal(`<h2 style="font-size:1.25rem">New group</h2><label class="f"><span>Group name</span><input name="name" required maxlength="100"></label>
+      ${pickerHtml('People', 'Type names to add people. You are added automatically.')}${modalActions('Create group')}`, async fd => {
+      const r = await api('/chat/groups', { method: 'POST', body: { name: fd.get('name'), user_ids: picker.values() } });
+      toast('Group created'); location.hash = '#/chat/' + r.conversation_id;
+    });
+    const picker = personPicker(modalForm.querySelector('.picker'), people);
+  }
+  async function peopleDialog() {
+    const c = chat.conv, manage = c.can_manage;
+    const people = manage ? (await api('/chat/people')).people.filter(p => !chat.members.some(m => m.id === p.id)) : [];
+    openModal(`<h2 style="font-size:1.25rem">People in ${esc(c.name)}</h2>
+      ${c.type === 'team' ? '<p class="muted">Team chats follow team membership (and include the team’s lead).</p>' : ''}
+      <ul class="rows chat-people">${chat.members.map(m => `<li><span><b>${esc(m.name)}</b>${m.id === me.id ? ' (you)' : ''}${m.id === c.created_by && c.type === 'group' ? ' <span class="pill accent">Made the group</span>' : ''}${m.active ? '' : ' <span class="muted">(deactivated)</span>'}
+        <small class="muted">${esc(m.team_name || '')}</small></span>
+        ${manage && m.id !== me.id ? `<button type="button" class="btn danger small" data-rmm="${m.id}">Remove</button>` : ''}</li>`).join('')}</ul>
+      ${manage ? pickerHtml('Add people', 'Type a name, then press “Add”.') : ''}
+      <div class="modal-actions"><button class="btn ghost" value="cancel" formnovalidate>Close</button>${manage ? '<button class="btn" type="submit">Add</button>' : ''}</div>`, async () => {
+      const ids = picker ? picker.values() : [];
+      if (!ids.length) throw new Error('Choose someone to add.');
+      for (const id of ids) await api(`/chat/${c.id}/members/${id}`, { method: 'PUT' });
+      toast(ids.length === 1 ? 'Person added' : 'People added'); reloadConversation();
+    });
+    const picker = manage ? personPicker(modalForm.querySelector('.picker'), people) : null;
+    modalForm.querySelectorAll('[data-rmm]').forEach(b => b.onclick = async () => {
+      const m = chat.members.find(x => x.id === Number(b.dataset.rmm));
+      if (!confirm(`Remove ${m.name} from “${c.name}”?`)) return;
+      try { await api(`/chat/${c.id}/members/${m.id}`, { method: 'DELETE' }); modal.close(); toast(m.name + ' removed'); reloadConversation(); } catch (e) { toast(e.message); }
+    });
   }
 
   router();

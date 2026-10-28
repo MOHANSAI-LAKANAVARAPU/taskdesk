@@ -53,7 +53,7 @@ const cleanUrl = u => String(u || '').trim().replace(/\/+$/, '');
 
 // ---------- windows ----------
 let mainWin = null, widgetWin = null, setupWin = null, tray = null, quitting = false;
-let lastSummary = { state: 'starting', open: 0, overdue: 0 };
+let lastSummary = { state: 'starting', open: 0, overdue: 0, chat: 0 };
 let pollTimer = null;
 let lastCheck = null; // { ok, time, open, reason } — shown in the menus and logged, to diagnose a missing badge
 
@@ -162,8 +162,8 @@ ipcMain.on('widget-ready', () => sendSummary());
 // Log where the badge actually is (only when it changes), e.g. to diagnose a badge that's missing on one laptop.
 let lastBadgeLog = '';
 ipcMain.on('widget-rendered', (e, i) => {
-  const outside = i.text && (i.x < 0 || i.y < 0 || i.x + i.w > i.iw || i.y + i.h > i.ih);
-  const line = `[widget] badge ${i.text ? `"${i.text}" at ${i.x},${i.y} ${i.w}x${i.h}` : 'hidden'} in ${i.iw}x${i.ih} page`
+  const outside = (i.text && (i.x < 0 || i.y < 0 || i.x + i.w > i.iw || i.y + i.h > i.ih)) || (i.chat && (i.cx < 0 || i.cy < 0 || i.cx + i.cw > i.iw || i.cy + i.ch > i.ih));
+  const line = `[widget] badge ${i.text ? `"${i.text}" at ${i.x},${i.y} ${i.w}x${i.h}` : 'hidden'}, chat ${i.chat ? `"${i.chat}" at ${i.cx},${i.cy} ${i.cw}x${i.ch}` : 'hidden'} in ${i.iw}x${i.ih} page`
     + ` (device scale ${i.dpr}, window ${widgetWin && !widgetWin.isDestroyed() ? widgetWin.getContentSize().join('x') : '?'})${outside ? ' OUTSIDE THE WINDOW' : ''}`;
   if (line !== lastBadgeLog) { lastBadgeLog = line; (outside ? console.warn : console.log)(line); }
 });
@@ -171,6 +171,7 @@ ipcMain.on('widget-menu', () => {
   Menu.buildFromTemplate([
     ...infoItems(),
     { label: 'Open TaskDesk', click: () => openDashboard() },
+    chatMenuItem(),
     { label: 'Refresh', click: () => refreshAll() }
   ]).popup({ window: widgetWin });
 });
@@ -207,7 +208,7 @@ function schedulePoll(ms) { clearTimeout(pollTimer); pollTimer = setTimeout(poll
 function recordCheck(ok, info) {
   lastCheck = Object.assign({ ok, time: new Date() }, info);
   if (ok) console.log(`[summary] ok user=${info.user} open=${info.own} approvals=${info.approvals} assign=${info.assign} badge=${info.open} overdue=${info.overdue}`
-    + ` team_requests=${info.teamRequests} ready=${info.ready} needs_team=${info.needsTeam}`);
+    + ` team_requests=${info.teamRequests} ready=${info.ready} needs_team=${info.needsTeam} chat=${info.chat}`);
   else console.warn(`[summary] failed: ${info.reason}`);
   buildTrayMenu();
 }
@@ -216,6 +217,7 @@ function checkLine() {
   const t = lastCheck.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   return lastCheck.ok ? `Last check: ${t} (${lastCheck.open} open)` : `Last check failed: ${lastCheck.reason}`;
 }
+const chatMenuItem = () => ({ label: `Unread messages: ${lastSummary.state === 'ok' ? lastSummary.chat || 0 : '–'}`, click: () => openDashboard('/chat') });
 // Disabled info lines at the top of both menus.
 function infoItems() {
   return [{ label: `TaskDesk ${app.getVersion()}`, enabled: false }, { label: checkLine(), enabled: false }, { type: 'separator' }];
@@ -248,11 +250,11 @@ async function poll() {
   try {
     if (!cfg.server) return recordCheck(false, { reason: 'no server address set' });
     const cookies = await session.defaultSession.cookies.get({ url: cfg.server, name: 'sid' });
-    if (!cookies.length) { recordCheck(false, { reason: 'not signed in (no session cookie)' }); return setSummary({ state: 'signed-out' }); }
+    if (!cookies.length) { stopStream('signed out'); recordCheck(false, { reason: 'not signed in (no session cookie)' }); return setSummary({ state: 'signed-out' }); }
     const r = await fetch(cfg.server + '/api/my-summary', {
       headers: { Cookie: 'sid=' + cookies[0].value }, signal: AbortSignal.timeout(10000)
     });
-    if (r.status === 401) { recordCheck(false, { reason: 'signed out, session expired (HTTP 401)' }); return setSummary({ state: 'signed-out' }); }
+    if (r.status === 401) { stopStream('session ended'); recordCheck(false, { reason: 'signed out, session expired (HTTP 401)' }); return setSummary({ state: 'signed-out' }); }
     if (!r.ok) { const e = new Error('server error'); e.status = r.status; throw e; }
     const data = await r.json();
     session.defaultSession.cookies.flushStore().catch(() => {}); // keep the sign-in after a restart
@@ -262,9 +264,10 @@ async function poll() {
     const assign = (data.assign_requests || []).length + (data.needs_team_requests || []).length;
     // Badge = my own open tasks + tasks waiting for my approval + requests waiting for me to assign them
     const badge = data.open + approvals + assign;
-    setSummary({ state: 'ok', open: badge, own: data.open, approvals, assign, overdue: data.overdue, name: data.user && data.user.name });
+    setSummary({ state: 'ok', open: badge, own: data.open, approvals, assign, overdue: data.overdue, name: data.user && data.user.name, chat: data.chat_unread || 0 });
     checkServerVersion();
-    recordCheck(true, { user: data.user && data.user.id, own: data.open, approvals, assign, open: badge, overdue: data.overdue,
+    startStream(cookies[0].value, data.user && data.user.id); // instant chat messages (no-op while connected for this user)
+    recordCheck(true, { user: data.user && data.user.id, own: data.open, approvals, assign, open: badge, overdue: data.overdue, chat: data.chat_unread || 0,
       teamRequests: (data.team_requests || []).length, ready: (data.ready_requests || []).length, needsTeam: (data.needs_team_requests || []).length });
   } catch (e) {
     // fetch wraps the network error; the useful code (ECONNREFUSED, ENOTFOUND, …) is on e.cause or its inner errors.
@@ -356,11 +359,110 @@ function notifyNewTasks(data) {
   if (shown.length && widgetWin && !widgetWin.isDestroyed()) widgetWin.webContents.send('new-task'); // wave and bounce the mascot
 }
 
+// ---------- chat: live stream (/api/stream, Server-Sent Events) ----------
+// The server pushes chat events; new messages notify at once and the chat badge follows the unread count. If the
+// stream drops it reconnects with a back-off (2 s doubling to 60 s); the summary check each minute keeps the count right.
+let streamCtl = null, streamSid = null, streamUser = null, streamRetry = null, streamDelay = 2000;
+function stopStream(why) {
+  clearTimeout(streamRetry); streamRetry = null;
+  if (streamCtl) { console.log(`[stream] stopped (${why})`); streamCtl.abort(); }
+  streamCtl = null; streamSid = null; streamUser = null;
+}
+function startStream(sid, userId) {
+  if (streamSid === sid && (streamCtl || streamRetry)) return; // already connected (or about to retry) for this sign-in
+  stopStream('new sign-in');
+  streamSid = sid; streamUser = userId;
+  connectStream();
+}
+async function connectStream() {
+  streamRetry = null;
+  const ctl = new AbortController(), sid = streamSid; streamCtl = ctl;
+  let reason = 'closed by the server';
+  try {
+    const r = await fetch(cfg.server + '/api/stream', { headers: { Cookie: 'sid=' + sid, Accept: 'text/event-stream' }, signal: ctl.signal });
+    if (r.status === 401) { console.warn('[stream] not signed in (HTTP 401)'); streamCtl = null; streamSid = null; return; } // the next summary check sorts it out
+    if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+    console.log('[stream] connected'); streamDelay = 2000;
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true }).replace(/\r\n?/g, '\n');
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) { // one event per blank-line-separated block
+        const block = buf.slice(0, i); buf = buf.slice(i + 2);
+        let event = 'message', data = '';
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim();
+          else if (line.startsWith('data:')) data += line.slice(5).trim();
+        }
+        if (data) { try { handleStreamEvent(event, JSON.parse(data)); } catch (e) { console.error('[stream] bad event', e && e.message); } }
+      }
+    }
+  } catch (e) {
+    if (ctl.signal.aborted) return; // stopped on purpose
+    reason = (e.cause && (e.cause.code || e.cause.message)) || e.message;
+  }
+  if (streamCtl !== ctl) return;
+  streamCtl = null;
+  console.warn(`[stream] disconnected: ${reason}; retrying in ${Math.round(streamDelay / 1000)} s`);
+  streamRetry = setTimeout(connectStream, streamDelay);
+  streamDelay = Math.min(streamDelay * 2, 60000);
+}
+function setChatCount(n) {
+  if (lastSummary.state !== 'ok' || typeof n !== 'number' || n === lastSummary.chat) return;
+  setSummary(Object.assign({}, lastSummary, { chat: n }));
+}
+function handleStreamEvent(event, d) {
+  if (event === 'message') { setChatCount(d.unread_total); queueChatNotification(d); }
+  else if (event === 'read' || event === 'deleted') setChatCount(d.unread_total);
+}
+// The conversation the user is looking at: dashboard window shown and focused on #/chat/<id>.
+function focusedChatId() {
+  if (!mainWin || mainWin.isDestroyed() || !mainWin.isVisible() || !mainWin.isFocused()) return null;
+  const m = /#\/chat\/(\d+)/.exec(mainWin.webContents.getURL());
+  return m ? Number(m[1]) : null;
+}
+// No notification for my own messages, muted chats, or the chat that is open and focused. Messages arriving within
+// 3 seconds of each other are collapsed into one notification.
+let chatQueue = [], chatQueueTimer = null;
+function queueChatNotification(d) {
+  if (!d || !d.message || d.message.sender_id === streamUser || d.muted || focusedChatId() === d.conversation_id) return;
+  chatQueue.push(d);
+  if (!chatQueueTimer) chatQueueTimer = setTimeout(flushChatNotifications, 3000);
+}
+function chatNotificationText(d) {
+  const m = d.message, sender = m.sender_name || 'Someone';
+  if (!m.body) return `${sender} sent a file${d.type === 'direct' ? '' : ` in ${d.conversation_name}`}`;
+  const preview = m.body.replace(/\s+/g, ' ').trim();
+  const short = preview.length > 100 ? preview.slice(0, 99) + '…' : preview;
+  return d.type === 'direct' ? `${sender}: ${short}` : `${sender} in ${d.conversation_name}: ${short}`;
+}
+function flushChatNotifications() {
+  chatQueueTimer = null;
+  const q = chatQueue.filter(d => focusedChatId() !== d.conversation_id); chatQueue = [];
+  if (!q.length) return;
+  const convs = [...new Set(q.map(d => d.conversation_id))];
+  let title, path;
+  if (q.length === 1) { title = chatNotificationText(q[0]); path = '/chat/' + q[0].conversation_id; }
+  else if (convs.length === 1) { title = `${q.length} new messages in ${q[0].conversation_name}`; path = '/chat/' + convs[0]; }
+  else { title = `${q.length} new messages in ${convs.length} chats`; path = '/chat'; }
+  console.log(`[chat] notify "${title}" -> ${path}`);
+  if (Notification.isSupported()) {
+    const n = new Notification({ title, body: 'Click to open the chat.', icon: ICON });
+    n.on('click', () => openDashboard(path));
+    n.show();
+  }
+  if (widgetWin && !widgetWin.isDestroyed()) widgetWin.webContents.send('new-task'); // wave the mascot
+}
+
 function setSummary(s) {
-  lastSummary = Object.assign({ open: 0, overdue: 0 }, s);
+  lastSummary = Object.assign({ open: 0, overdue: 0, chat: 0 }, s);
   sendSummary();
+  buildTrayMenu();
   if (tray) {
-    const tip = s.state === 'ok' ? `TaskDesk: ${s.own} open task${s.own === 1 ? '' : 's'}${s.approvals ? `, ${s.approvals} waiting for your approval` : ''}${s.assign ? `, ${s.assign} request${s.assign === 1 ? '' : 's'} to assign` : ''}${s.overdue ? `, ${s.overdue} overdue` : ''}`
+    const tip = s.state === 'ok' ? `TaskDesk: ${s.own} open task${s.own === 1 ? '' : 's'}${s.approvals ? `, ${s.approvals} waiting for your approval` : ''}${s.assign ? `, ${s.assign} request${s.assign === 1 ? '' : 's'} to assign` : ''}${s.overdue ? `, ${s.overdue} overdue` : ''}${s.chat ? `, ${s.chat} unread message${s.chat === 1 ? '' : 's'}` : ''}`
       : s.state === 'signed-out' ? 'TaskDesk: sign in to see your tasks'
       : s.state === 'offline' ? 'TaskDesk: can’t reach the server' : 'TaskDesk';
     tray.setToolTip(tip);
@@ -429,6 +531,7 @@ function buildTrayMenu() {
     ...infoItems(),
     { label: 'Open TaskDesk', click: () => openDashboard() },
     { label: 'My open tasks', click: () => openDashboard('/tasks?status=open') },
+    chatMenuItem(),
     { type: 'separator' },
     { label: 'Change server address…', click: () => openSetup() },
     { label: 'Refresh', click: () => refreshAll() }

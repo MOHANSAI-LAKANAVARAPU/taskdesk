@@ -212,12 +212,12 @@ function removeStoredFiles(rows) {
   for (const r of rows) if (/^[0-9a-f]{32}$/.test(r.stored_name)) fs.unlink(path.join(UPLOAD_DIR, r.stored_name), () => {});
 }
 function saveUploads(req, link) {
-  const ins = db.prepare(`INSERT INTO files (original_name, stored_name, size, mime, uploaded_by, task_id, update_id, request_id)
-    VALUES (?,?,?,?,?,?,?,?)`);
+  const ins = db.prepare(`INSERT INTO files (original_name, stored_name, size, mime, uploaded_by, task_id, update_id, request_id, message_id)
+    VALUES (?,?,?,?,?,?,?,?,?)`);
   for (const f of req.files || []) {
     const name = cleanFileName(f.originalname);
     ins.run(name, f.filename, f.size, FILE_TYPES[path.extname(name).toLowerCase()] || 'application/octet-stream',
-      req.user.id, link.task_id || null, link.update_id || null, link.request_id || null);
+      req.user.id, link.task_id || null, link.update_id || null, link.request_id || null, link.message_id || null);
   }
 }
 
@@ -297,6 +297,7 @@ app.post('/api/users', auth, requireBoss, (req, res) => {
   const r = db.prepare('INSERT INTO users (name,email,password_hash,role,lead_id,team_id) VALUES (?,?,?,?,?,?)')
     .run(name, email, bcrypt.hashSync(password, 10), role, lead_id, team_id);
   const became_lead = autoLead(r.lastInsertRowid);
+  syncTeamChats();
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(r.lastInsertRowid)), became_lead });
 });
 
@@ -339,6 +340,7 @@ app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
   if (f.role === 'employee' || f.active === 0) db.prepare('UPDATE teams SET lead_id = NULL WHERE lead_id = ?').run(target.id); // can no longer lead a team
   // Only when the team or the role changed (a manager may have cleared the team's lead on purpose).
   const became_lead = (f.team_id !== undefined && f.team_id !== target.team_id) || (f.role !== undefined && f.role !== target.role) ? autoLead(target.id) : null;
+  syncTeamChats(); // team chats follow team membership, leads and deactivation
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(target.id)), became_lead });
 });
 
@@ -695,6 +697,7 @@ function teamFields(req, res, current) {
 app.post('/api/teams', auth, requireBoss, (req, res) => {
   const f = teamFields(req, res); if (!f) return;
   const r = db.prepare('INSERT INTO teams (name, lead_id) VALUES (?, ?)').run(f.name, f.lead_id);
+  syncTeamChats();
   res.json({ team: db.prepare('SELECT * FROM teams WHERE id = ?').get(r.lastInsertRowid) });
 });
 app.patch('/api/teams/:id', auth, requireBoss, (req, res) => {
@@ -702,6 +705,7 @@ app.patch('/api/teams/:id', auth, requireBoss, (req, res) => {
   if (!team) return bad(res, 'Team not found.', 404);
   const f = teamFields(req, res, team); if (!f) return;
   db.prepare('UPDATE teams SET name = ?, lead_id = ? WHERE id = ?').run(f.name, f.lead_id, team.id);
+  syncTeamChats();
   res.json({ team: db.prepare('SELECT * FROM teams WHERE id = ?').get(team.id) });
 });
 app.delete('/api/teams/:id', auth, requireBoss, (req, res) => {
@@ -709,11 +713,15 @@ app.delete('/api/teams/:id', auth, requireBoss, (req, res) => {
   if (!team) return bad(res, 'Team not found.', 404);
   const active = db.prepare(`SELECT COUNT(*) AS n FROM requests WHERE target_team_id = ? AND status IN ('open','assigned','delivered')`).get(team.id).n;
   if (active) return bad(res, `This team has ${active} unfinished document request${active === 1 ? '' : 's'}. Finish or cancel them first.`, 409);
+  const chat = db.prepare(`SELECT id FROM conversations WHERE type = 'team' AND team_id = ?`).get(team.id);
   db.transaction(() => {
+    // The team's chat is archived: its members keep reading it, nobody can post.
+    db.prepare(`UPDATE conversations SET archived_at = datetime('now'), name = name || ' (team deleted)' WHERE type = 'team' AND team_id = ?`).run(team.id);
     db.prepare('UPDATE users SET team_id = NULL WHERE team_id = ?').run(team.id);
     db.prepare('DELETE FROM team_connections WHERE ? IN (team_a_id, team_b_id)').run(team.id);
     db.prepare('DELETE FROM teams WHERE id = ?').run(team.id);
   })();
+  if (chat) push(memberIds(chat.id), 'conversation', { conversation_id: chat.id });
   res.json({ ok: true });
 });
 // Add (or move) a person into a team / remove them. A person belongs to one team.
@@ -727,7 +735,9 @@ function memberTarget(req, res) {
 app.put('/api/teams/:id/members/:userId', auth, requireBoss, (req, res) => {
   const t = memberTarget(req, res); if (!t) return;
   db.prepare('UPDATE users SET team_id = ? WHERE id = ?').run(t.team.id, t.user.id);
-  res.json({ ok: true, became_lead: autoLead(t.user.id) });
+  const became_lead = autoLead(t.user.id);
+  syncTeamChats();
+  res.json({ ok: true, became_lead });
 });
 // Managers/admins: the full list of teams this team works with (replaces the old list).
 app.put('/api/teams/:id/connections', auth, requireBoss, (req, res) => {
@@ -745,6 +755,7 @@ app.put('/api/teams/:id/connections', auth, requireBoss, (req, res) => {
 app.delete('/api/teams/:id/members/:userId', auth, requireBoss, (req, res) => {
   const t = memberTarget(req, res); if (!t) return;
   db.prepare('UPDATE users SET team_id = NULL WHERE id = ? AND team_id = ?').run(t.user.id, t.team.id);
+  syncTeamChats();
   res.json({ ok: true });
 });
 
@@ -1060,11 +1071,271 @@ app.delete('/api/tasks/:id/permanent', auth, requireBoss, (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- live updates (Server-Sent Events) ----------
+// Each signed-in page (and the desktop app) keeps one GET /api/stream open. Events: message, deleted, read, conversation.
+const streams = new Map(); // user id -> Set of open responses
+function push(userIds, event, data) {
+  const line = `event: ${event}\ndata: ${JSON.stringify(typeof data === 'function' ? null : data)}\n\n`;
+  for (const id of new Set(userIds)) for (const res of streams.get(id) || []) {
+    try { res.write(typeof data === 'function' ? `event: ${event}\ndata: ${JSON.stringify(data(id))}\n\n` : line); } catch (e) { /* closed */ }
+  }
+}
+app.get('/api/stream', auth, (req, res) => {
+  const uid = req.user.id, token = req.cookies.sid;
+  res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-store', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.write('retry: 5000\n: connected\n\n');
+  const set = streams.get(uid) || new Set(); streams.set(uid, set);
+  set.add(res);
+  if (set.size > 10) { const oldest = set.values().next().value; set.delete(oldest); oldest.end(); }
+  // Ping every 25 s; also ends the stream once the session is gone (signed out, password changed, deactivated).
+  const sessionOk = db.prepare(`SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires_at > datetime('now') AND u.active = 1`);
+  const ping = setInterval(() => { if (!sessionOk.get(token)) return res.end(); res.write(': ping\n\n'); }, 25000);
+  const done = () => { clearInterval(ping); set.delete(res); if (!set.size && streams.get(uid) === set) streams.delete(uid); };
+  res.on('close', done);
+});
+
+// ---------- chat ----------
+// Only members of a conversation can read it, its files and its search hits — admins and managers included.
+// Every endpoint about one conversation starts with chatMember(); no membership = 404.
+const CHAT_PAGE = 50;
+const IMAGE_MIME = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+const chatMember = (u, convId) => db.prepare(`SELECT c.*, cm.last_read_message_id, cm.muted FROM conversations c
+  JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = ? WHERE c.id = ?`).get(u.id, Number(convId));
+const memberIds = convId => db.prepare('SELECT user_id FROM conversation_members WHERE conversation_id = ?').all(convId).map(r => r.user_id);
+const UNREAD = `(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = cm.conversation_id AND m.id > cm.last_read_message_id
+  AND m.deleted_at IS NULL AND (m.sender_id IS NULL OR m.sender_id != cm.user_id))`;
+// Unread messages in the user's unmuted chats (the menu count and the desktop badge).
+const chatUnreadTotal = uid => db.prepare(`SELECT COALESCE(SUM(${UNREAD}), 0) AS n FROM conversation_members cm WHERE cm.user_id = ? AND cm.muted = 0`).get(uid).n;
+// A direct chat is named after the other person.
+function chatName(c, uid) {
+  if (c.type !== 'direct') return c.name || 'Group';
+  const o = db.prepare(`SELECT us.name FROM conversation_members cm JOIN users us ON us.id = cm.user_id
+    WHERE cm.conversation_id = ? AND cm.user_id != ?`).get(c.id, uid);
+  return o ? o.name : 'Former member';
+}
+// Group creators and managers/admins (who are members) may rename a group and add/remove people.
+const canManageChat = (u, c) => c.type === 'group' && !c.archived_at && (c.created_by === u.id || isBoss(u));
+function messageViews(rows) {
+  const files = rows.length ? db.prepare(`SELECT id, message_id, original_name AS name, size, mime FROM files
+    WHERE message_id IN (${rows.map(() => '?').join(',')}) ORDER BY id`).all(...rows.map(m => m.id)) : [];
+  return rows.map(m => m.deleted_at
+    ? { id: m.id, sender_id: m.sender_id, sender_name: m.sender_name, created_at: m.created_at, deleted: true, body: '', files: [] }
+    : { id: m.id, sender_id: m.sender_id, sender_name: m.sender_name, created_at: m.created_at, deleted: false, body: m.body,
+        files: files.filter(f => f.message_id === m.id).map(({ message_id, ...f }) => ({ ...f, is_image: IMAGE_MIME.includes(f.mime) })) });
+}
+const MSG_SELECT = `SELECT m.*, s.name AS sender_name FROM messages m LEFT JOIN users s ON s.id = m.sender_id`;
+const ACTIVE_USER = id => db.prepare('SELECT id, name FROM users WHERE id = ? AND active = 1').get(Number(id));
+// Add people (their read marker starts at the latest message, so earlier history doesn't count as unread).
+function addChatMembers(convId, ids) {
+  const last = db.prepare('SELECT COALESCE(MAX(id), 0) AS n FROM messages WHERE conversation_id = ?').get(convId).n;
+  const ins = db.prepare('INSERT OR IGNORE INTO conversation_members (conversation_id, user_id, last_read_message_id) VALUES (?,?,?)');
+  return ids.filter(id => ins.run(convId, id, last).changes);
+}
+
+// Team chats: one per team; members = the team's active members plus its lead. Called after every change to teams or people.
+function syncTeamChats() {
+  const changed = [];
+  db.transaction(() => {
+    for (const t of db.prepare('SELECT id, name, lead_id FROM teams').all()) {
+      let c = db.prepare(`SELECT * FROM conversations WHERE type = 'team' AND team_id = ?`).get(t.id);
+      if (!c) c = db.prepare(`INSERT INTO conversations (type, name, team_id) VALUES ('team', ?, ?) RETURNING *`).get(t.name, t.id);
+      else if (c.name !== t.name) { db.prepare('UPDATE conversations SET name = ? WHERE id = ?').run(t.name, c.id); changed.push(...memberIds(c.id)); }
+      const want = db.prepare('SELECT id FROM users WHERE active = 1 AND (team_id = ? OR id = ?)').all(t.id, t.lead_id || 0).map(r => r.id);
+      const have = memberIds(c.id);
+      const gone = have.filter(id => !want.includes(id));
+      for (const id of gone) db.prepare('DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?').run(c.id, id);
+      changed.push(...gone, ...addChatMembers(c.id, want.filter(id => !have.includes(id))));
+    }
+  })();
+  if (changed.length) push(changed, 'conversation', {});
+}
+syncTeamChats();
+
+app.get('/api/chat', auth, (req, res) => {
+  const u = req.user;
+  const rows = db.prepare(`SELECT c.*, cm.muted, ${UNREAD} AS unread,
+      (SELECT COUNT(*) FROM conversation_members x WHERE x.conversation_id = c.id) AS member_count,
+      lm.id AS last_id, lm.body AS last_body, lm.deleted_at AS last_deleted, lm.sender_id AS last_sender_id, ls.name AS last_sender_name,
+      (SELECT original_name FROM files f WHERE f.message_id = lm.id ORDER BY f.id LIMIT 1) AS last_file
+    FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id
+    LEFT JOIN messages lm ON lm.id = (SELECT MAX(id) FROM messages WHERE conversation_id = c.id) LEFT JOIN users ls ON ls.id = lm.sender_id
+    WHERE cm.user_id = ? ORDER BY c.archived_at IS NOT NULL, COALESCE(c.last_message_at, c.created_at) DESC, c.id DESC`).all(u.id);
+  const conversations = rows.map(c => ({
+    id: c.id, type: c.type, name: chatName(c, u.id), muted: !!c.muted, archived: !!c.archived_at, unread: c.unread, member_count: c.member_count,
+    last_message_at: c.last_message_at, can_manage: canManageChat(u, c),
+    last: c.last_id ? { sender_name: c.last_sender_id === u.id ? 'You' : c.last_sender_name, deleted: !!c.last_deleted,
+      text: c.last_deleted ? 'This message was deleted' : c.last_body ? c.last_body.slice(0, 120) : c.last_file ? '📎 ' + c.last_file : '' } : null
+  }));
+  res.json({ conversations, unread_total: chatUnreadTotal(u.id) });
+});
+// Everyone active (name and team only), for "New chat" / "New group".
+app.get('/api/chat/people', auth, (req, res) => {
+  res.json({ people: db.prepare(`SELECT us.id, us.name, us.role, tm.name AS team_name FROM users us LEFT JOIN teams tm ON tm.id = us.team_id
+    WHERE us.active = 1 AND us.id != ? ORDER BY us.name`).all(req.user.id) });
+});
+app.post('/api/chat/direct', auth, (req, res) => {
+  const u = req.user, other = ACTIVE_USER(req.body.user_id);
+  if (!other || other.id === u.id) return bad(res, 'Choose another active person.');
+  const id = db.transaction(() => {
+    const c = db.prepare(`SELECT c.id FROM conversations c WHERE c.type = 'direct'
+      AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = c.id AND user_id = ?)
+      AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = c.id AND user_id = ?)`).get(u.id, other.id);
+    if (c) return c.id;
+    const n = db.prepare(`INSERT INTO conversations (type, created_by) VALUES ('direct', ?)`).run(u.id).lastInsertRowid;
+    addChatMembers(n, [u.id, other.id]);
+    return n;
+  })();
+  res.json({ conversation_id: id });
+});
+app.post('/api/chat/groups', auth, (req, res) => {
+  const u = req.user, name = str(req.body.name, 100);
+  if (!name) return bad(res, 'Enter a group name.');
+  const ids = [...new Set((Array.isArray(req.body.user_ids) ? req.body.user_ids : []).map(Number))].filter(id => id !== u.id);
+  if (!ids.length) return bad(res, 'Choose at least one person.');
+  if (ids.some(id => !ACTIVE_USER(id))) return bad(res, 'Choose active people only.');
+  const id = db.transaction(() => {
+    const n = db.prepare(`INSERT INTO conversations (type, name, created_by) VALUES ('group', ?, ?)`).run(name, u.id).lastInsertRowid;
+    addChatMembers(n, [u.id, ...ids]);
+    return n;
+  })();
+  push(ids, 'conversation', { conversation_id: id });
+  res.json({ conversation_id: id });
+});
+function managedChat(req, res) {
+  const c = chatMember(req.user, req.params.id);
+  if (!c) { bad(res, 'Conversation not found.', 404); return null; }
+  if (!canManageChat(req.user, c)) { bad(res, c.type === 'group' ? 'Only the person who made this group or a manager can change it.' : 'Only groups can be changed.', 403); return null; }
+  return c;
+}
+app.patch('/api/chat/:id', auth, (req, res) => {
+  const c = managedChat(req, res); if (!c) return;
+  const name = str(req.body.name, 100);
+  if (!name) return bad(res, 'Enter a group name.');
+  db.prepare('UPDATE conversations SET name = ? WHERE id = ?').run(name, c.id);
+  push(memberIds(c.id), 'conversation', { conversation_id: c.id });
+  res.json({ ok: true });
+});
+app.put('/api/chat/:id/members/:userId', auth, (req, res) => {
+  const c = managedChat(req, res); if (!c) return;
+  const p = ACTIVE_USER(req.params.userId);
+  if (!p) return bad(res, 'Choose an active person.');
+  addChatMembers(c.id, [p.id]);
+  push(memberIds(c.id), 'conversation', { conversation_id: c.id });
+  res.json({ ok: true });
+});
+app.delete('/api/chat/:id/members/:userId', auth, (req, res) => {
+  const c = managedChat(req, res); if (!c) return;
+  const uid = Number(req.params.userId);
+  if (uid === req.user.id) return bad(res, 'Use "Leave" to leave the group.');
+  const before = memberIds(c.id);
+  db.prepare('DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?').run(c.id, uid);
+  push(before, 'conversation', { conversation_id: c.id });
+  res.json({ ok: true });
+});
+app.post('/api/chat/:id/leave', auth, (req, res) => {
+  const c = chatMember(req.user, req.params.id);
+  if (!c) return bad(res, 'Conversation not found.', 404);
+  if (c.type !== 'group') return bad(res, c.type === 'team' ? 'Team chats follow team membership.' : 'You can’t leave a direct chat.');
+  const before = memberIds(c.id);
+  db.prepare('DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?').run(c.id, req.user.id);
+  push(before, 'conversation', { conversation_id: c.id });
+  res.json({ ok: true });
+});
+app.put('/api/chat/:id/mute', auth, (req, res) => {
+  const c = chatMember(req.user, req.params.id);
+  if (!c) return bad(res, 'Conversation not found.', 404);
+  db.prepare('UPDATE conversation_members SET muted = ? WHERE conversation_id = ? AND user_id = ?').run(req.body.muted ? 1 : 0, c.id, req.user.id);
+  push([req.user.id], 'read', { conversation_id: c.id, unread_total: chatUnreadTotal(req.user.id) });
+  res.json({ ok: true, muted: !!req.body.muted });
+});
+app.get('/api/chat/search', auth, (req, res) => {
+  const u = req.user, q = str(req.query.q, 100);
+  if (q.length < 2) return res.json({ results: [] });
+  const like = '%' + q.replace(/[\\%_]/g, c => '\\' + c) + '%';
+  const rows = db.prepare(`${MSG_SELECT} JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
+    JOIN conversations c ON c.id = m.conversation_id
+    WHERE m.deleted_at IS NULL AND (m.body LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM files f WHERE f.message_id = m.id AND f.original_name LIKE ? ESCAPE '\\'))
+    ORDER BY m.id DESC LIMIT 50`).all(u.id, like, like);
+  const names = {};
+  res.json({ results: messageViews(rows).map((m, i) => {
+    const cid = rows[i].conversation_id;
+    if (!(cid in names)) names[cid] = chatName(db.prepare('SELECT * FROM conversations WHERE id = ?').get(cid), u.id);
+    return { conversation_id: cid, conversation_name: names[cid], message: m };
+  }) });
+});
+app.get('/api/chat/:id', auth, (req, res) => {
+  const u = req.user, c = chatMember(u, req.params.id);
+  if (!c) return bad(res, 'Conversation not found.', 404);
+  const members = db.prepare(`SELECT us.id, us.name, us.active, tm.name AS team_name FROM conversation_members cm JOIN users us ON us.id = cm.user_id
+    LEFT JOIN teams tm ON tm.id = us.team_id WHERE cm.conversation_id = ? ORDER BY us.name`).all(c.id).map(m => ({ ...m, active: !!m.active }));
+  const rows = db.prepare(`${MSG_SELECT} WHERE m.conversation_id = ? ORDER BY m.id DESC LIMIT ?`).all(c.id, CHAT_PAGE).reverse();
+  res.json({ conversation: { id: c.id, type: c.type, name: chatName(c, u.id), muted: !!c.muted, archived: !!c.archived_at, created_by: c.created_by,
+    can_manage: canManageChat(u, c), last_read_message_id: c.last_read_message_id }, members, messages: messageViews(rows), more: rows.length === CHAT_PAGE });
+});
+// Older messages (before=<id>) or, for the polling fallback, newer ones (after=<id>).
+app.get('/api/chat/:id/messages', auth, (req, res) => {
+  const c = chatMember(req.user, req.params.id);
+  if (!c) return bad(res, 'Conversation not found.', 404);
+  if (req.query.after !== undefined) {
+    const rows = db.prepare(`${MSG_SELECT} WHERE m.conversation_id = ? AND m.id > ? ORDER BY m.id LIMIT 200`).all(c.id, Number(req.query.after) || 0);
+    const deleted = db.prepare('SELECT id FROM messages WHERE conversation_id = ? AND deleted_at IS NOT NULL').all(c.id).map(r => r.id);
+    return res.json({ messages: messageViews(rows), deleted });
+  }
+  const rows = db.prepare(`${MSG_SELECT} WHERE m.conversation_id = ? AND m.id < ? ORDER BY m.id DESC LIMIT ?`)
+    .all(c.id, Number(req.query.before) || Number.MAX_SAFE_INTEGER, CHAT_PAGE).reverse();
+  res.json({ messages: messageViews(rows), more: rows.length === CHAT_PAGE });
+});
+// Membership is checked before the upload is parsed.
+function chatPostable(req, res, next) {
+  const c = chatMember(req.user, req.params.id);
+  if (!c) return bad(res, 'Conversation not found.', 404);
+  if (c.archived_at) return bad(res, 'This chat is archived (the team was deleted). You can read it but not post.', 409);
+  req.chat = c; next();
+}
+app.post('/api/chat/:id/messages', auth, chatPostable, withUploads, (req, res) => {
+  const u = req.user, c = req.chat, body = typeof req.body.body === 'string' ? req.body.body.replace(/\r\n/g, '\n').trim() : '';
+  if (body.length > 5000) return bad(res, 'A message can be up to 5000 characters.');
+  if (!body && !(req.files || []).length) return bad(res, 'Write a message or attach a file.');
+  const id = db.transaction(() => {
+    const m = db.prepare('INSERT INTO messages (conversation_id, sender_id, body) VALUES (?,?,?)').run(c.id, u.id, body).lastInsertRowid;
+    saveUploads(req, { message_id: m });
+    db.prepare(`UPDATE conversations SET last_message_at = (SELECT created_at FROM messages WHERE id = ?) WHERE id = ?`).run(m, c.id);
+    db.prepare('UPDATE conversation_members SET last_read_message_id = ? WHERE conversation_id = ? AND user_id = ?').run(m, c.id, u.id);
+    return m;
+  })();
+  const message = messageViews([db.prepare(`${MSG_SELECT} WHERE m.id = ?`).get(id)])[0];
+  const muted = new Set(db.prepare('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND muted = 1').all(c.id).map(r => r.user_id));
+  push(memberIds(c.id), 'message', uid => ({ conversation_id: c.id, conversation_name: chatName(c, uid), type: c.type, muted: muted.has(uid),
+    unread_total: chatUnreadTotal(uid), message }));
+  res.json({ message });
+});
+app.delete('/api/chat/messages/:id', auth, (req, res) => {
+  const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(Number(req.params.id));
+  if (!m || !chatMember(req.user, m.conversation_id)) return bad(res, 'Message not found.', 404);
+  if (m.sender_id !== req.user.id) return bad(res, 'You can only delete your own messages.', 403);
+  db.prepare(`UPDATE messages SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`).run(m.id); // files stay on disk
+  push(memberIds(m.conversation_id), 'deleted', uid => ({ conversation_id: m.conversation_id, message_id: m.id, unread_total: chatUnreadTotal(uid) }));
+  res.json({ ok: true });
+});
+app.post('/api/chat/:id/read', auth, (req, res) => {
+  const u = req.user, c = chatMember(u, req.params.id);
+  if (!c) return bad(res, 'Conversation not found.', 404);
+  const upTo = Math.min(Number(req.body.message_id) || 0, db.prepare('SELECT COALESCE(MAX(id), 0) AS n FROM messages WHERE conversation_id = ?').get(c.id).n);
+  db.prepare('UPDATE conversation_members SET last_read_message_id = ? WHERE conversation_id = ? AND user_id = ? AND last_read_message_id < ?').run(upTo, c.id, u.id, upTo);
+  const last = Math.max(upTo, c.last_read_message_id), unread_total = chatUnreadTotal(u.id);
+  push([u.id], 'read', { conversation_id: c.id, last_read_message_id: last, unread_total });
+  res.json({ last_read_message_id: last, unread_total });
+});
+
 // ---------- file download (sign-in + same visibility as the task or request) ----------
 app.get('/api/files/:id', auth, (req, res) => {
   const u = req.user, f = db.prepare('SELECT * FROM files WHERE id = ?').get(Number(req.params.id));
-  let ok = false;
-  if (f && f.task_id) {
+  let ok = false, inline = false;
+  if (f && f.message_id) { // chat files: members of the conversation only, and only while the message isn't deleted
+    const m = db.prepare('SELECT conversation_id, deleted_at FROM messages WHERE id = ?').get(f.message_id);
+    ok = !!m && !m.deleted_at && !!chatMember(u, m.conversation_id);
+    inline = ok && req.query.inline === '1' && IMAGE_MIME.includes(f.mime); // image thumbnails
+  } else if (f && f.task_id) {
     const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(f.task_id);
     ok = !!task && canSeeTask(u, task);
     if (!ok) { // files of a delivered request's task are visible to the people on that request
@@ -1078,6 +1349,10 @@ app.get('/api/files/:id', auth, (req, res) => {
   if (!ok || !/^[0-9a-f]{32}$/.test(f.stored_name)) return bad(res, 'File not found.', 404);
   res.set({ 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store' });
   res.type(f.mime || 'application/octet-stream');
+  if (inline) {
+    res.set({ 'Content-Security-Policy': 'sandbox', 'Cache-Control': 'private, max-age=86400' });
+    return res.sendFile(path.join(UPLOAD_DIR, f.stored_name), err => { if (err && !res.headersSent) bad(res, 'File not found.', 404); });
+  }
   res.download(path.join(UPLOAD_DIR, f.stored_name), f.original_name, err => {
     if (err && !res.headersSent) bad(res, 'File not found.', 404);
   });
@@ -1215,7 +1490,7 @@ app.get('/api/my-summary', auth, (req, res) => {
       AND (r.withdrawn_from_id = ? OR tm.lead_id = ?) ORDER BY r.id DESC LIMIT 100`)
     .all(new Date(Date.now() - 3 * 864e5).toISOString(), u.id, u.id, u.id);
   res.json({ user: publicUser(u), open: counts.open || 0, overdue: counts.overdue || 0, tasks, recently_approved, approvals, team_requests,
-    ready_requests, needs_team_requests, assign_requests, unassigned_reminders, team_asks, withdrawn });
+    ready_requests, needs_team_requests, assign_requests, unassigned_reminders, team_asks, withdrawn, chat_unread: chatUnreadTotal(u.id) });
 });
 
 // ---------- dashboard ----------

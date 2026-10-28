@@ -213,6 +213,41 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
       PRIMARY KEY (team_a_id, team_b_id),
       CHECK (team_a_id < team_b_id)
     )`);
+  // Chat: direct (one per pair of people), group and team conversations (one per team, members kept in sync by server.js).
+  // Only members can read a conversation. archived_at: the team was deleted; members can still read it, nobody can post.
+  db.exec(`CREATE TABLE IF NOT EXISTS conversations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      name TEXT,
+      team_id INTEGER REFERENCES teams(id) ON DELETE SET NULL,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_message_at TEXT,
+      archived_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_team ON conversations(team_id) WHERE type = 'team';
+    CREATE TABLE IF NOT EXISTS conversation_members (
+      conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      joined_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_read_message_id INTEGER NOT NULL DEFAULT 0,
+      muted INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (conversation_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_conversation_members_user ON conversation_members(user_id);
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      body TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      edited_at TEXT,
+      deleted_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);`);
+  if (!db.prepare('PRAGMA table_info(files)').all().some(c => c.name === 'message_id'))
+    db.exec('ALTER TABLE files ADD COLUMN message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_files_message ON files(message_id)');
 })();
 
 // Create the first admin account if there are no users yet.

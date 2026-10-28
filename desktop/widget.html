@@ -16,6 +16,9 @@ html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden
   font:700 13px/24px "Segoe UI",Ubuntu,system-ui,sans-serif;text-align:center;box-shadow:0 0 0 2px #fff;display:none;pointer-events:none}
 #badge.over{background:#C02626}
 #badge.warn{background:#6B7280}
+/* Unread chat messages: a separate small blue number in the bottom-right corner (never merged with the task count). */
+#chat{position:absolute;right:4px;bottom:4px;min-width:20px;max-width:34px;height:20px;padding:0 5px;overflow:hidden;box-sizing:border-box;border-radius:10px;background:#1565C0;color:#fff;
+  font:700 11px/20px "Segoe UI",Ubuntu,system-ui,sans-serif;text-align:center;box-shadow:0 0 0 2px #fff;display:none;pointer-events:none}
 </style></head>
 <body>
 <div id="stage">
@@ -53,9 +56,10 @@ html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden
 </g>
 </svg></div>
 <div id="badge"></div>
+<div id="chat"></div>
 </div>
 <script>
-const btn=document.getElementById('btn'), badge=document.getElementById('badge');
+const btn=document.getElementById('btn'), badge=document.getElementById('badge'), chat=document.getElementById('chat');
 const stage=document.getElementById('stage');
 function fit(){ const s=Math.min(innerWidth, innerHeight)/104; stage.style.transform = Math.abs(s-1)<0.01 ? '' : `scale(${s})`; }
 addEventListener('resize', fit); fit();
@@ -63,18 +67,21 @@ addEventListener('resize', fit); fit();
 function render(s){
   fit();
   btn.classList.toggle('dim', s.state==='offline');
-  badge.className=''; badge.style.display='none';
+  badge.className=''; badge.style.display='none'; chat.style.display='none';
   if(s.state==='ok'){
-    btn.title = s.open ? [`${s.own} open task${s.own===1?'':'s'}`, s.approvals?`${s.approvals} waiting for your approval`:'', s.overdue?`${s.overdue} overdue`:''].filter(Boolean).join(', ')+'. Click to open TaskDesk.' : 'No open tasks. Click to open TaskDesk.';
+    const msgs = s.chat ? `${s.chat} unread message${s.chat===1?'':'s'}` : '';
+    btn.title = (s.open ? [`${s.own} open task${s.own===1?'':'s'}`, s.approvals?`${s.approvals} waiting for your approval`:'', s.overdue?`${s.overdue} overdue`:'', msgs].filter(Boolean).join(', ') : ['No open tasks', msgs].filter(Boolean).join(', '))+'. Click to open TaskDesk.';
     if(s.open){ badge.textContent = s.open>99?'99+':s.open; badge.style.display='block'; if(s.overdue) badge.className='over'; }
+    if(s.chat){ chat.textContent = s.chat>9?'9+':s.chat; chat.style.display='block'; }
   } else if(s.state==='signed-out'){
     btn.title='Click to sign in to TaskDesk'; badge.textContent='!'; badge.className='warn'; badge.style.display='block';
   } else if(s.state==='offline'){
     btn.title='Can’t reach the TaskDesk server. Check you’re on the office network.';
   }
-  const r=badge.getBoundingClientRect();
+  const r=badge.getBoundingClientRect(), c=chat.getBoundingClientRect();
   window.td.rendered({ text: badge.style.display==='none' ? '' : badge.textContent, x: Math.round(r.left), y: Math.round(r.top),
-    w: Math.round(r.width), h: Math.round(r.height), iw: innerWidth, ih: innerHeight, dpr: devicePixelRatio });
+    w: Math.round(r.width), h: Math.round(r.height), iw: innerWidth, ih: innerHeight, dpr: devicePixelRatio,
+    chat: chat.style.display==='none' ? '' : chat.textContent, cx: Math.round(c.left), cy: Math.round(c.top), cw: Math.round(c.width), ch: Math.round(c.height) });
 }
 window.td.onSummary(render);
 window.td.ready(); // ask for the latest summary as soon as the page can show it
