@@ -61,6 +61,7 @@ h2{font-size:1.0625rem;margin:0 0 12px}
 input,select,textarea{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%}
 textarea{resize:vertical;min-height:80px}
 label.f{display:block;margin-bottom:14px}
+label.f[hidden]{display:none}
 label.f > span{display:block;font-weight:600;font-size:.875rem;margin-bottom:5px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
 @media (max-width:560px){.grid2{grid-template-columns:1fr}}
@@ -357,3 +358,18 @@ details.group[open] > summary::before{transform:rotate(90deg)}
 .team-head select{width:auto;margin-left:auto;min-width:160px}
 .back-link{text-decoration:none;font-weight:500}
 @media (max-width:620px){.team-head select{margin-left:0;flex:1 1 100%}}
+
+/* Email: account page, signed-out pages */
+.account-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr));gap:16px;align-items:start}
+.account-grid .card{margin:0}
+.check-row{display:flex;gap:10px;align-items:flex-start;padding:7px 0;font-size:.9375rem;cursor:pointer}
+.check-row input{width:auto;margin-top:3px;flex:none}
+.kv{width:100%;border-collapse:collapse;font-size:.875rem}
+.kv th{text-align:left;font-weight:600;color:var(--muted);padding:6px 12px 6px 0;vertical-align:top;white-space:nowrap;width:1%}
+.kv td{padding:6px 0;overflow-wrap:anywhere}
+.kv tr+tr th,.kv tr+tr td{border-top:1px solid var(--line)}
+.ok-note,.err-note{padding:10px 12px;border-radius:8px;font-size:.875rem;margin:12px 0 0}
+.ok-note{background:var(--s-done-bg);color:var(--s-done)}
+.err-note{background:var(--s-over-bg);color:var(--s-over)}
+.login .ok-note{margin:0 0 16px}
+.err-inline{color:var(--s-over);font-weight:600}

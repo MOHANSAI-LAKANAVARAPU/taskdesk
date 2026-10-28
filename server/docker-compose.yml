@@ -5,7 +5,7 @@ services:
     container_name: taskdesk
     restart: unless-stopped
     env_file:
-      - .env   # ADMIN_NAME, ADMIN_EMAIL, ADMIN_PASSWORD (copy .env.example)
+      - .env   # ADMIN_*, SMTP_*, APP_URL (copy .env.example; never commit .env)
     ports:
       - "3000:3000"
     environment:

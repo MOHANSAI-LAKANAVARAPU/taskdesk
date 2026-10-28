@@ -12,7 +12,8 @@
     "better-sqlite3": "^11.8.1",
     "cookie-parser": "^1.4.7",
     "express": "^4.21.2",
-    "multer": "^2.5.0"
+    "multer": "^2.5.0",
+    "nodemailer": "^7.0.13"
   },
   "engines": {
     "node": ">=18"

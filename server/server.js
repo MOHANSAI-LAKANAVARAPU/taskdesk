@@ -6,6 +6,7 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const db = require('./db');
+const mailer = require('./mailer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,7 +28,7 @@ app.use(express.static(path.join(__dirname, 'public'), {
 const BUILD_ID = (() => {
   const h = crypto.createHash('sha1');
   const add = f => { try { h.update(f + '\0' + fs.readFileSync(f)); } catch (e) { /* missing file */ } };
-  for (const f of ['server.js', 'db.js', 'package.json']) add(path.join(__dirname, f));
+  for (const f of ['server.js', 'db.js', 'mailer.js', 'package.json']) add(path.join(__dirname, f));
   const pub = path.join(__dirname, 'public');
   for (const f of fs.readdirSync(pub).sort()) add(path.join(pub, f));
   return h.digest('hex').slice(0, 12);
@@ -170,7 +171,8 @@ function linkedRequestFull(taskId) { return db.prepare(`${REQ_SELECT} WHERE r.ta
 // When a task linked to a document request is completed, the request is delivered (and undone if the task is reopened).
 function syncRequestWithTask(taskId, newStatus, oldStatus) {
   if (newStatus === 'completed' && oldStatus !== 'completed') {
-    db.prepare(`UPDATE requests SET status = 'delivered', delivered_at = ? WHERE task_id = ? AND status = 'assigned'`).run(new Date().toISOString(), taskId);
+    if (db.prepare(`UPDATE requests SET status = 'delivered', delivered_at = ? WHERE task_id = ? AND status = 'assigned'`).run(new Date().toISOString(), taskId).changes)
+      emailRequestReady(taskId);
   } else if (newStatus !== 'completed' && oldStatus === 'completed') {
     db.prepare(`UPDATE requests SET status = 'assigned', delivered_at = NULL WHERE task_id = ? AND status = 'delivered'`).run(taskId);
   }
@@ -292,6 +294,146 @@ app.post('/api/me/password', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- email: password links, settings, preferences ----------
+// One-time "Set your password" links. Only the SHA-256 of the token is stored; the token travels after the # in the link,
+// so it never shows up in server logs or Referer headers. A new link replaces the person's earlier unused ones.
+const TOKEN_HOURS = { welcome: 48, reset: 1 };
+const hashToken = t => crypto.createHash('sha256').update(String(t)).digest('hex');
+function issueToken(user, purpose, byId) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  db.transaction(() => {
+    db.prepare(`UPDATE password_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL`).run(user.id);
+    db.prepare(`INSERT INTO password_tokens (user_id, token_hash, purpose, created_by, expires_at) VALUES (?,?,?,?,datetime('now', ?))`)
+      .run(user.id, hashToken(token), purpose, byId || null, `+${TOKEN_HOURS[purpose]} hours`);
+  })();
+  return mailer.link(`set-password?token=${token}`);
+}
+// A token that can still be used (not used, not expired, person active and not removed), with its person.
+function liveToken(token) {
+  if (typeof token !== 'string' || token.length < 20 || token.length > 100) return null;
+  return db.prepare(`SELECT pt.id, pt.purpose, pt.user_id, u.name FROM password_tokens pt JOIN users u ON u.id = pt.user_id
+    WHERE pt.token_hash = ? AND pt.used_at IS NULL AND pt.expires_at > datetime('now') AND u.active = 1 AND u.removed_at IS NULL`).get(hashToken(token));
+}
+function sendWelcome(user, by) {
+  const url = issueToken(user, 'welcome', by && by.id);
+  return mailer.queue(user.email, 'Welcome to TaskDesk', mailer.layout({
+    heading: `Welcome to TaskDesk, ${user.name}`,
+    lines: [`${by ? by.name : 'Your admin'} added you to TaskDesk, Hi-Focus's task and request tracker. Your sign-in email is ${user.email}.`,
+      'Choose your password to get started. The link works once and expires in 48 hours.'],
+    button: { label: 'Set your password', url },
+    after: ['If the link has expired, ask your manager to resend it, or use "Forgot password?" on the sign-in page.']
+  }));
+}
+// Simple in-memory counters: { key → {n, reset} }; true when over the limit.
+const limits = new Map();
+function overLimit(key, max, windowMs) {
+  const now = Date.now(), rec = limits.get(key) || { n: 0, reset: now + windowMs };
+  if (now > rec.reset) { rec.n = 0; rec.reset = now + windowMs; }
+  rec.n++; limits.set(key, rec);
+  if (limits.size > 5000) for (const [k, v] of limits) if (now > v.reset) limits.delete(k);
+  return rec.n > max;
+}
+
+// Forgot password: always the same answer, so it never reveals whether an account exists. At most 3 links per email and
+// 10 requests per IP an hour; over the limit nothing is sent (same answer).
+app.post('/api/password/forgot', (req, res) => {
+  const email = str(req.body.email, 200).toLowerCase();
+  const answer = () => res.json({ ok: true, message: 'If that email exists, we’ve sent a link to reset your password.' });
+  if (!/^\S+@\S+\.\S+$/.test(email)) return bad(res, 'Enter a valid email.');
+  const ipOver = overLimit('forgot-ip:' + req.ip, 10, 3600e3), emailOver = overLimit('forgot-email:' + email, 3, 3600e3);
+  if (ipOver || emailOver) { console.log(`[email] forgot-password limit reached (${ipOver ? 'IP' : 'email'}); nothing sent`); return answer(); }
+  const user = db.prepare('SELECT * FROM users WHERE email = ? AND active = 1 AND removed_at IS NULL').get(email);
+  if (user && mailer.enabled()) {
+    mailer.queue(user.email, 'Reset your TaskDesk password', mailer.layout({
+      heading: 'Reset your password',
+      lines: [`Hi ${user.name}, someone asked to reset the password for your TaskDesk account.`,
+        'The link works once and expires in 1 hour. Using it signs you out everywhere.'],
+      button: { label: 'Choose a new password', url: issueToken(user, 'reset', null) },
+      after: ['If you didn\'t ask for this, you can ignore this email; your password stays the same.']
+    }));
+  }
+  answer();
+});
+const DEAD_LINK = 'This link has expired or was already used. Ask for a new one with "Forgot password?".';
+app.get('/api/password/check', (req, res) => {
+  if (overLimit('pwlink-ip:' + req.ip, 60, 15 * 60e3)) return bad(res, 'Too many attempts. Try again in 15 minutes.', 429);
+  const t = liveToken(req.query.token);
+  if (!t) return bad(res, DEAD_LINK, 410);
+  res.json({ ok: true, purpose: t.purpose, name: t.name });
+});
+// Set the password with a link: single use; ends all of the person's sessions and cancels their other links.
+app.post('/api/password/set', (req, res) => {
+  if (overLimit('pwlink-ip:' + req.ip, 60, 15 * 60e3)) return bad(res, 'Too many attempts. Try again in 15 minutes.', 429);
+  const password = typeof req.body.password === 'string' ? req.body.password : '';
+  if (password.length < 8) return bad(res, 'Password must be at least 8 characters.');
+  const t = liveToken(req.body.token);
+  if (!t) return bad(res, DEAD_LINK, 410);
+  const ok = db.transaction(() => {
+    if (!db.prepare(`UPDATE password_tokens SET used_at = datetime('now') WHERE id = ? AND used_at IS NULL`).run(t.id).changes) return false;
+    db.prepare(`UPDATE password_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL`).run(t.user_id);
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), t.user_id);
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(t.user_id);
+    return true;
+  })();
+  if (!ok) return bad(res, DEAD_LINK, 410);
+  console.log(`[password] ${t.purpose} link used by user ${t.user_id}; sessions ended`);
+  res.json({ ok: true });
+});
+
+// Email settings (admins): what is configured (never the password), the last error, and a test email to themself.
+app.get('/api/email/status', auth, requireAdmin, (req, res) => res.json(mailer.status()));
+app.post('/api/email/test', auth, requireAdmin, async (req, res) => {
+  const error = await mailer.sendNow(req.user.email, 'TaskDesk test email', mailer.layout({
+    heading: 'Email is working',
+    lines: [`Hi ${req.user.name}, this is a test email from TaskDesk. If you can read it, TaskDesk can send email.`],
+    button: { label: 'Open TaskDesk', url: mailer.link('') }
+  }));
+  res.json(error ? { ok: false, error, status: mailer.status() } : { ok: true, to: req.user.email, status: mailer.status() });
+});
+
+// Optional notification emails (all off by default). "Still unassigned" only for people who lead a team.
+const EMAIL_PREFS = ['email_assigned', 'email_approval', 'email_ready', 'email_unassigned'];
+const leadsAnyTeam = u => !!db.prepare('SELECT 1 FROM team_leads WHERE user_id = ?').get(u.id);
+const prefsOf = u => ({ ...Object.fromEntries(EMAIL_PREFS.map(k => [k, !!u[k]])), can_unassigned: leadsAnyTeam(u), email_enabled: mailer.enabled() });
+app.get('/api/me/email-prefs', auth, (req, res) => res.json(prefsOf(req.user)));
+app.put('/api/me/email-prefs', auth, (req, res) => {
+  const f = {};
+  for (const k of EMAIL_PREFS) if (req.body[k] !== undefined) f[k] = req.body[k] ? 1 : 0;
+  if (f.email_unassigned && !leadsAnyTeam(req.user)) return bad(res, '"Still unassigned" emails are for team leads.', 403);
+  const keys = Object.keys(f);
+  if (keys.length) db.prepare(`UPDATE users SET ${keys.map(k => k + ' = ?').join(', ')} WHERE id = ?`).run(...keys.map(k => f[k]), req.user.id);
+  res.json(prefsOf(db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id)));
+});
+
+// Notification emails: short, the title and names only (never files, descriptions or chat), a button to open the item.
+// Only to active people who turned that email on, never to the person who did the action.
+function notifyEmail(userId, pref, subject, heading, lines, label, hashPath, actorId) {
+  if (!mailer.enabled() || !userId || userId === actorId) return;
+  const p = db.prepare(`SELECT name, email FROM users WHERE id = ? AND active = 1 AND removed_at IS NULL AND ${pref} = 1`).get(userId);
+  if (!p) return;
+  mailer.queue(p.email, subject, mailer.layout({ heading, lines: [`Hi ${p.name},`, ...lines], button: { label, url: mailer.link(hashPath) },
+    after: ['You get this because it is turned on under Email notifications on your Account page in TaskDesk.'] }));
+}
+function emailAssigned(taskId, actor) {
+  const t = db.prepare(`SELECT t.id, t.title, t.deadline, t.assignee_id, b.name AS by_name FROM tasks t LEFT JOIN users b ON b.id = t.assigned_by WHERE t.id = ?`).get(taskId);
+  if (!t) return;
+  notifyEmail(t.assignee_id, 'email_assigned', `New task: ${t.title}`, 'A task was assigned to you',
+    [`${actor ? actor.name : t.by_name} assigned you "${t.title}"${t.deadline ? `, due ${t.deadline}` : ''}.`], 'Open the task', `tasks/${t.id}`, actor && actor.id);
+}
+function emailApprovers(taskId, actor) {
+  if (!mailer.enabled()) return;
+  const t = db.prepare(`SELECT t.*, a.name AS assignee_name FROM tasks t JOIN users a ON a.id = t.assignee_id WHERE t.id = ?`).get(taskId);
+  if (!t || t.status !== 'submitted') return;
+  for (const u of db.prepare('SELECT * FROM users WHERE active = 1 AND removed_at IS NULL AND email_approval = 1 AND id != ?').all(t.assignee_id))
+    if (canReviewTask(u, t)) notifyEmail(u.id, 'email_approval', `Waiting for your approval: ${t.title}`, 'A task is waiting for your approval',
+      [`${t.assignee_name} submitted "${t.title}" for approval.`], 'Review the task', `tasks/${t.id}`, actor && actor.id);
+}
+function emailRequestReady(taskId, actor) {
+  const r = db.prepare(`SELECT id, title, requested_by FROM requests WHERE task_id = ? AND status = 'delivered' AND deleted_at IS NULL`).get(taskId);
+  if (r) notifyEmail(r.requested_by, 'email_ready', `Your request is ready: ${r.title}`, 'Your request is ready',
+    [`"${r.title}" has been delivered. Open it to get the files and mark it as received.`], 'Open the request', `requests/${r.id}`, actor && actor.id);
+}
+
 // ---------- users ----------
 app.get('/api/users', auth, (req, res) => {
   const u = req.user;
@@ -312,14 +454,31 @@ app.post('/api/users', auth, requireBoss, (req, res) => {
   if (!name || !/^\S+@\S+\.\S+$/.test(email)) return bad(res, 'Enter a name and a valid email.');
   if (!ROLES.includes(role)) return bad(res, 'Choose a valid role.');
   if (role === 'admin' && req.user.role !== 'admin') return bad(res, 'Only an admin can create another admin.', 403);
-  if (password.length < 8) return bad(res, 'Password must be at least 8 characters.');
+  // Welcome email with a "Set your password" link (when email is set up), or a password typed by the manager as before.
+  const welcome = req.body.send_welcome !== undefined ? !!req.body.send_welcome && !password : !password;
+  if (welcome && !mailer.enabled()) return bad(res, 'Email isn’t set up, so enter a temporary password for this person.');
+  if (!welcome && password.length < 8) return bad(res, 'Password must be at least 8 characters.');
   if (lead_id && !db.prepare(`SELECT 1 FROM users WHERE id = ? AND role IN ('lead','manager','admin')`).get(lead_id)) return bad(res, 'Choose a valid team lead.');
   if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return bad(res, 'A user with this email already exists.');
   const r = db.prepare('INSERT INTO users (name,email,password_hash,role,lead_id,team_id) VALUES (?,?,?,?,?,?)')
-    .run(name, email, bcrypt.hashSync(password, 10), role, lead_id, team_id);
+    .run(name, email, bcrypt.hashSync(welcome ? crypto.randomBytes(32).toString('hex') : password, 10), role, lead_id, team_id);
   const became_lead = autoLead(r.lastInsertRowid, req.user.id);
   syncTeamChats();
-  res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(r.lastInsertRowid)), became_lead });
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(r.lastInsertRowid);
+  const welcome_sent = welcome && sendWelcome(user, req.user);
+  res.json({ user: publicUser(user), became_lead, welcome_sent });
+});
+
+// Resend the welcome email: a new "Set your password" link (48 h); earlier links stop working. Same rule as editing the person.
+app.post('/api/users/:id/welcome', auth, requireBoss, (req, res) => {
+  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
+  if (!target) return bad(res, 'User not found.', 404);
+  if (target.removed_at) return bad(res, 'This person was removed. An admin can restore them first.', 409);
+  if (target.role === 'admin' && req.user.role !== 'admin') return bad(res, 'Only an admin can change an admin account.', 403);
+  if (!target.active) return bad(res, 'This account is deactivated. Activate it first.', 409);
+  if (!mailer.enabled()) return bad(res, 'Email isn’t set up. Set a password for this person instead.', 409);
+  sendWelcome(target, req.user);
+  res.json({ ok: true, email: target.email });
 });
 
 app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
@@ -594,6 +753,7 @@ app.post('/api/tasks', auth, (req, res) => {
     return id;
   }))();
   const tasks = created.map(id => db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(id));
+  for (const id of created) emailAssigned(id, u);
   res.json({ task: tasks[0], tasks, count: tasks.length });
 });
 
@@ -651,6 +811,7 @@ app.patch('/api/tasks/:id', auth, (req, res) => {
   const keys = Object.keys(f);
   if (keys.length) db.prepare(`UPDATE tasks SET ${keys.map(k => k + ' = ?').join(', ')}, updated_at = datetime('now') WHERE id = ?`).run(...keys.map(k => f[k]), task.id);
   for (const n of notes) db.prepare('INSERT INTO task_updates (task_id,user_id,message) VALUES (?,?,?)').run(task.id, u.id, n);
+  if (f.assignee_id) emailAssigned(task.id, u);
   res.json({ task: db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(task.id) });
 });
 
@@ -773,6 +934,7 @@ app.post('/api/tasks/:id/submit', auth, canSubmit, withUploads, (req, res) => {
       .run(task.id, u.id, 'Submitted for approval: ' + note, task.progress, 'submitted');
     saveUploads(req, { task_id: task.id, update_id: up.lastInsertRowid });
   })();
+  emailApprovers(task.id, u);
   taskResponse(res, task.id);
 });
 
@@ -1104,18 +1266,19 @@ app.post('/api/requests', auth, withUploads, (req, res) => {
       return bad(res, `You can only ask people in your own team or in teams connected to it. ${p.team_name} isn’t one of them.`, 403);
     const pseudo = { asked_person_id: p.id, requested_by: u.id, target_team_id: p.team_id, team_name: p.team_name };
     if (approversFor(p.id, u.id, pseudo).nobody) return bad(res, nobodyCanApprove(pseudo, p.id), 409);
-    let id;
+    let id, taskId;
     db.transaction(() => {
       id = db.prepare(`INSERT INTO requests (title, description, needed_by, requested_by, target_team_id, status, asked_person_id)
         VALUES (?,?,?,?,?,'assigned',?)`).run(title, description, needed_by, u.id, p.team_id, p.id).lastInsertRowid;
       const desc = [description, `Document request #${id} from ${u.name}, sent to you.`].filter(Boolean).join('\n\n');
-      const taskId = db.prepare('INSERT INTO tasks (title, description, assignee_id, assigned_by, deadline) VALUES (?,?,?,?,?)')
+      taskId = db.prepare('INSERT INTO tasks (title, description, assignee_id, assigned_by, deadline) VALUES (?,?,?,?,?)')
         .run(title, desc, p.id, u.id, needed_by).lastInsertRowid;
       db.prepare('UPDATE requests SET task_id = ? WHERE id = ?').run(taskId, id);
       db.prepare('INSERT INTO task_updates (task_id,user_id,message,status) VALUES (?,?,?,?)').run(taskId, u.id, `${u.name} asked ${p.name} (document request #${id})`, 'assigned');
       db.prepare('INSERT INTO request_events (request_id, user_id, message) VALUES (?,?,?)').run(id, u.id, `Sent to ${p.name} by ${u.name}`);
       saveUploads(req, { request_id: id });
     })();
+    emailAssigned(taskId, u);
     return res.json({ request: getRequest(id) });
   }
   // No team ("Not sure, let a manager decide") -> needs_team; a manager picks the team later.
@@ -1168,7 +1331,7 @@ function createRequestTask(r, assignee, by) {
   })();
 }
 function sendRequestTask(res, r, assignee, by) {
-  try { const taskId = createRequestTask(r, assignee, by); res.json({ request: getRequest(r.id), task_id: taskId }); }
+  try { const taskId = createRequestTask(r, assignee, by); emailAssigned(taskId, by); res.json({ request: getRequest(r.id), task_id: taskId }); }
   catch (e) { if (e.status) return bad(res, e.message, e.status); throw e; }
 }
 app.post('/api/requests/:id/take', auth, (req, res) => {
@@ -1666,11 +1829,19 @@ app.get('/api/history', auth, (req, res) => {
 // A request still open (nobody took it) 24 hours after it became open — posted, sent to a team or given back — is
 // marked once with reminded_at; the desktop app then reminds the team's lead and managers/admins ("Still unassigned").
 // Runs on every summary check (each desktop app checks every minute), so no timer is needed.
+// It also runs every 10 minutes for the "Still unassigned" emails (sent once per request, to the team's leads who turned them on).
 function remindStaleRequests() {
-  db.prepare(`UPDATE requests SET reminded_at = ? WHERE status = 'open' AND deleted_at IS NULL AND reminded_at IS NULL
-    AND MAX(created_at, COALESCE((SELECT MAX(e.created_at) FROM request_events e WHERE e.request_id = requests.id), '')) < datetime('now', '-24 hours')`)
-    .run(new Date().toISOString());
+  const flagged = db.prepare(`UPDATE requests SET reminded_at = ? WHERE status = 'open' AND deleted_at IS NULL AND reminded_at IS NULL
+    AND MAX(created_at, COALESCE((SELECT MAX(e.created_at) FROM request_events e WHERE e.request_id = requests.id), '')) < datetime('now', '-24 hours')
+    RETURNING id, title, target_team_id`).all(new Date().toISOString());
+  for (const r of flagged) {
+    const team = db.prepare('SELECT name FROM teams WHERE id = ?').get(r.target_team_id);
+    for (const l of leadsOf(r.target_team_id)) notifyEmail(l.id, 'email_unassigned', `Still unassigned: ${r.title}`, 'A request is still unassigned',
+      [`"${r.title}" for ${team ? team.name : 'your team'} has been waiting for more than 24 hours. Assign it to someone, or take it yourself.`],
+      'Open the request', `requests/${r.id}`);
+  }
 }
+setInterval(remindStaleRequests, 10 * 60e3).unref();
 // Open requests waiting for someone to assign them: for teams the user leads (managers/admins: all teams).
 const LEAD_OPEN_REQUESTS = `SELECT r.id, r.title, r.needed_by, r.status, r.reminded_at, tm.name AS team_name, rb.name AS requested_by_name
   FROM requests r JOIN teams tm ON tm.id = r.target_team_id JOIN users rb ON rb.id = r.requested_by WHERE r.status = 'open' AND r.deleted_at IS NULL`;

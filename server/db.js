@@ -272,6 +272,21 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   if (!userCols.includes('removed_at')) db.exec('ALTER TABLE users ADD COLUMN removed_at TEXT');
   if (!userCols.includes('removed_by')) db.exec('ALTER TABLE users ADD COLUMN removed_by INTEGER REFERENCES users(id) ON DELETE SET NULL');
   if (!userCols.includes('original_email')) db.exec('ALTER TABLE users ADD COLUMN original_email TEXT');
+  // Email: one-time "Set your password" links (welcome 48 h, reset 1 h; only the SHA-256 of the token is stored)
+  // and the optional notification emails each person turns on (all off by default).
+  db.exec(`CREATE TABLE IF NOT EXISTS password_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      purpose TEXT NOT NULL,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_password_tokens_user ON password_tokens(user_id);`);
+  for (const c of ['email_assigned', 'email_approval', 'email_ready', 'email_unassigned'])
+    if (!userCols.includes(c)) db.exec(`ALTER TABLE users ADD COLUMN ${c} INTEGER NOT NULL DEFAULT 0`);
 })();
 
 // Create the first admin account if there are no users yet.

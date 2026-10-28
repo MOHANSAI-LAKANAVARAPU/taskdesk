@@ -115,10 +115,15 @@
 
   async function router() {
     const route = location.hash.replace(/^#\/?/, '');
-    if (!me && route !== 'login') {
+    // Signed-out pages: sign in, "Forgot password?" and the "Set your password" link from an email.
+    const page = route.split('?')[0];
+    if (page === 'login' || page === 'forgot' || page === 'set-password') {
+      $('#topbar').hidden = true;
+      return page === 'login' ? viewLogin() : page === 'forgot' ? viewForgot() : viewSetPassword();
+    }
+    if (!me) {
       try { me = (await api('/me')).user; } catch (e) { location.hash = '#/login'; return; }
     }
-    if (route === 'login') { $('#topbar').hidden = true; return viewLogin(); }
     // The old "My team" page (and People for non-managers) is now the Teams page.
     if (route === 'my-team') return location.replace('#/teams');
     // People is part of the Teams page now ("All people", managers/admins); old links still work.
@@ -139,7 +144,7 @@
       else if (parts[0] === 'teams') await viewTeams();
       else if (parts[0] === 'history') await viewHistory();
       else if (parts[0] === 'chat') await viewChat(Number(parts[1]) || null);
-      else if (parts[0] === 'account') viewAccount();
+      else if (parts[0] === 'account') await viewAccount();
       else app.innerHTML = `<div class="empty">This page doesn’t exist. <a href="#/">Go to the dashboard</a>.</div>`;
     } catch (e) { app.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
     app.focus({ preventScroll: true });
@@ -158,7 +163,7 @@
         <p class="err" id="loginErr"></p>
         <button class="btn" style="width:100%">Sign in</button>
       </form>
-      <p class="muted" style="font-size:.875rem;margin-top:14px">Forgot your password? Ask your manager or admin to reset it.</p>
+      <p style="font-size:.875rem;margin-top:14px"><a href="#/forgot">Forgot password?</a></p>
     </div>`;
     $('#loginForm').onsubmit = async e => {
       e.preventDefault();
@@ -167,6 +172,66 @@
         me = (await api('/login', { method: 'POST', body: { email: fd.get('email'), password: fd.get('password') } })).user;
         location.hash = '#/';
       } catch (err) { $('#loginErr').textContent = err.message; }
+    };
+  }
+
+  // The card used by the signed-out pages (banner, brand, heading, body).
+  const loginCard = (title, body, id = '') => `<div class="login">
+      <form class="card login-card"${id ? ` id="${id}"` : ''} novalidate>
+        <img class="login-banner" src="/branding/hifocus-banner.png" alt="Hi-Focus – Enhancing your sixth sense" width="1600" height="820">
+        <div class="brand"><span class="brand-mark" aria-hidden="true"></span>TaskDesk</div>
+        <h1 style="font-size:1.25rem;margin-bottom:16px">${title}</h1>${body}
+      </form>
+      <p style="font-size:.875rem;margin-top:14px"><a href="#/login">Back to sign in</a></p>
+    </div>`;
+  // "Forgot password?": always the same answer, whether or not the email has an account.
+  function viewForgot() {
+    app.innerHTML = loginCard('Reset your password', `
+        <p class="muted" style="margin:-6px 0 14px;font-size:.9375rem">Enter your email and we’ll send you a link to choose a new password.</p>
+        <label class="f"><span>Email</span><input name="email" type="email" autocomplete="username" required></label>
+        <p class="err" id="fErr"></p>
+        <button class="btn" style="width:100%">Send link</button>`, 'forgotForm');
+    $('#forgotForm').onsubmit = async e => {
+      e.preventDefault();
+      const btn = e.target.querySelector('button'); btn.disabled = true;
+      try {
+        const r = await api('/password/forgot', { method: 'POST', body: { email: new FormData(e.target).get('email') } });
+        e.target.querySelector('h1').insertAdjacentHTML('afterend', `<p class="ok-note" role="status">${esc(r.message)} Check your inbox (and spam folder). The link works for 1 hour.</p>`);
+        e.target.querySelectorAll('label, .err, button').forEach(x => x.remove());
+        e.target.querySelector('p.muted').remove();
+      } catch (err) { $('#fErr').textContent = err.message; btn.disabled = false; }
+    };
+  }
+  // The link from a welcome or reset email: #/set-password?token=… The token is taken off the address bar once read.
+  let pwToken = '';
+  async function viewSetPassword() {
+    const t = new URLSearchParams(location.hash.split('?')[1] || '').get('token');
+    if (t) { pwToken = t; history.replaceState(null, '', '#/set-password'); }
+    const dead = msg => {
+      app.innerHTML = loginCard('This link can’t be used', `<p style="margin-bottom:16px">${esc(msg)}</p><a class="btn" style="width:100%;text-align:center" href="#/forgot">Send a new link</a>`);
+    };
+    if (!pwToken) return dead('Open the link from your email again. Each link works once.');
+    let info;
+    try { info = await api('/password/check?token=' + encodeURIComponent(pwToken)); } catch (err) { return dead(err.message); }
+    const welcome = info.purpose === 'welcome';
+    app.innerHTML = loginCard(welcome ? 'Set your password' : 'Choose a new password', `
+        <p class="muted" style="margin:-6px 0 14px;font-size:.9375rem">${welcome ? `Welcome, ${esc(info.name)}. Choose the password you’ll use to sign in.` : `Hi ${esc(info.name)}. Choose a new password. This signs you out everywhere.`}</p>
+        <label class="f"><span>New password</span><input name="password" type="password" minlength="8" autocomplete="new-password" required></label>
+        <label class="f"><span>Repeat the password</span><input name="again" type="password" minlength="8" autocomplete="new-password" required></label>
+        <p class="muted" style="font-size:.8125rem;margin-top:-6px">At least 8 characters.</p>
+        <p class="err" id="spErr"></p>
+        <button class="btn" style="width:100%">${welcome ? 'Set password' : 'Change password'}</button>`, 'setPwForm');
+    $('#setPwForm').onsubmit = async e => {
+      e.preventDefault();
+      const fd = new FormData(e.target), pw = fd.get('password');
+      if (pw.length < 8) return $('#spErr').textContent = 'Password must be at least 8 characters.';
+      if (pw !== fd.get('again')) return $('#spErr').textContent = 'The two passwords don’t match.';
+      const btn = e.target.querySelector('button'); btn.disabled = true;
+      try {
+        await api('/password/set', { method: 'POST', body: { token: pwToken, password: pw } });
+        pwToken = ''; me = null; closeStream();
+        app.innerHTML = loginCard('Password set', `<p class="ok-note" role="status">Password set. Sign in with your new password.</p><a class="btn" style="width:100%;text-align:center" href="#/login">Sign in</a>`);
+      } catch (err) { $('#spErr').textContent = err.message; btn.disabled = false; }
     };
   }
 
@@ -702,7 +767,9 @@
     return ROLE[u.role];
   }
   // Add or edit a person (name, email, role, team, password, active). The server keeps the admin-only rules.
-  function personForm(u, teams) {
+  // New people get a welcome email with a "Set your password" link when email is set up; a typed password is the fallback.
+  async function personForm(u, teams) {
+    const emailOn = (await api('/me/email-prefs').catch(() => ({}))).email_enabled;
     const roles = me.role === 'admin' ? ROLE : { manager: 'Manager', lead: 'Team lead', employee: 'Employee' };
     openModal(`
       <h2 style="font-size:1.25rem">${u ? 'Edit ' + esc(u.name) : 'Add a person'}</h2>
@@ -713,7 +780,9 @@
         <label class="f"><span>Team</span><select name="team_id"><option value="">No team</option>
           ${teams.map(t => `<option value="${t.id}"${u && t.id === u.team_id ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select></label>
       </div>
-      <label class="f"><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="8" autocomplete="new-password" ${u ? '' : 'required'}></label>
+      ${!u && emailOn ? `<label class="check-row"><input type="checkbox" name="send_welcome" id="sendWelcome" checked> Send a welcome email with a “Set your password” link (valid 48 hours)</label>` : ''}
+      <label class="f" id="pwField"${!u && emailOn ? ' hidden' : ''}><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="8" autocomplete="new-password" ${u || emailOn ? '' : 'required'}></label>
+      ${u && emailOn && u.active && !u.removed && canEditPerson(u) ? `<p style="margin:-6px 0 12px;font-size:.875rem"><button type="button" class="btn ghost small" id="resendWelcome">Resend welcome email</button> <span class="muted">A new “Set your password” link to ${esc(u.email)}; earlier links stop working.</span></p>` : ''}
       ${u && u.id !== me.id ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
       <p class="muted" style="font-size:.8125rem;margin-top:-4px">A team’s leads can assign tasks to the people in that team.</p>
       <div class="modal-actions">${canRemovePerson(u) ? '<button type="button" class="btn danger" id="removePersonBtn" style="margin-right:auto">Remove person</button>' : ''}
@@ -722,10 +791,20 @@
         const body = Object.fromEntries(fd);
         if (u && u.id !== me.id) body.active = fd.get('active') === 'on';
         if (u && !body.password) delete body.password;
+        if (!u && emailOn) { body.send_welcome = fd.get('send_welcome') === 'on'; if (body.send_welcome) delete body.password; }
         const r = await api(u ? '/users/' + u.id : '/users', { method: u ? 'PATCH' : 'POST', body });
         const lead = r.became_lead ? `${r.became_lead.name} is now a lead of ${r.became_lead.team_name}.` : '';
-        toast(u ? lead || 'Changes saved' : `${body.name} added. ${lead} Share their email and temporary password with them.`); router();
+        toast(u ? lead || 'Changes saved' : [`${body.name} added.`, lead, r.welcome_sent ? `Welcome email sent to ${body.email}.` : 'Share their email and temporary password with them.'].filter(Boolean).join(' ')); router();
       });
+    const sw = $('#sendWelcome');
+    if (sw) sw.onchange = () => { $('#pwField').hidden = sw.checked; $('#pwField input').required = !sw.checked; };
+    const rw = $('#resendWelcome');
+    if (rw) rw.onclick = async () => {
+      if (!confirm(`Send ${u.name} a new welcome email with a “Set your password” link? Earlier links stop working.`)) return;
+      rw.disabled = true;
+      try { const r = await api(`/users/${u.id}/welcome`, { method: 'POST' }); toast(`Welcome email sent to ${r.email}`); }
+      catch (err) { $('#mErr').textContent = err.message; } finally { rw.disabled = false; }
+    };
     const rb = $('#removePersonBtn'); if (rb) rb.onclick = () => { modal.close(); removePerson(u); };
   }
   // Admins only, never their own account (the server enforces both).
@@ -1164,21 +1243,59 @@
 
 
   // ---------- account ----------
-  function viewAccount() {
+  async function viewAccount() {
+    const prefs = await api('/me/email-prefs');
+    const emailRows = [['email_assigned', 'A task is assigned to me'], ['email_approval', 'A task is waiting for my approval'],
+      ['email_ready', 'My request is ready'], ...(prefs.can_unassigned ? [['email_unassigned', 'A request for my team is still unassigned after 24 hours']] : [])];
     app.innerHTML = `
       <div class="page-head"><div><h1>Your account</h1><p>${esc(me.name)} · ${esc(me.email)} · ${ROLE[me.role]}</p></div></div>
-      <form class="card" id="pwForm" style="max-width:420px">
-        <h2>Change password</h2>
-        <label class="f"><span>Current password</span><input type="password" name="current" required autocomplete="current-password"></label>
-        <label class="f"><span>New password</span><input type="password" name="next" required minlength="8" autocomplete="new-password"></label>
-        <p class="err" id="pwErr"></p>
-        <button class="btn">Change password</button>
-      </form>`;
+      <div class="account-grid">
+        <form class="card" id="pwForm">
+          <h2>Change password</h2>
+          <label class="f"><span>Current password</span><input type="password" name="current" required autocomplete="current-password"></label>
+          <label class="f"><span>New password</span><input type="password" name="next" required minlength="8" autocomplete="new-password"></label>
+          <p class="err" id="pwErr"></p>
+          <button class="btn">Change password</button>
+        </form>
+        <form class="card" id="prefsForm">
+          <h2>Email notifications</h2>
+          <p class="muted" style="font-size:.875rem;margin-top:-4px">Short emails to ${esc(me.email)} with a button to open the item. All are off until you turn them on.</p>
+          ${prefs.email_enabled ? '' : '<p class="warn-text">Email isn’t set up on the server yet, so nothing will be sent.</p>'}
+          ${emailRows.map(([k, l]) => `<label class="check-row"><input type="checkbox" name="${k}"${prefs[k] ? ' checked' : ''}> ${l}</label>`).join('')}
+          <button class="btn" style="margin-top:8px">Save</button>
+        </form>
+        ${me.role === 'admin' ? '<section class="card" id="emailSettings"><h2>Email settings</h2><p class="muted">Loading…</p></section>' : ''}
+      </div>`;
     $('#pwForm').onsubmit = async e => {
       e.preventDefault();
       const fd = new FormData(e.target);
       try { await api('/me/password', { method: 'POST', body: { current: fd.get('current'), next: fd.get('next') } }); e.target.reset(); $('#pwErr').textContent = ''; toast('Password changed'); }
       catch (err) { $('#pwErr').textContent = err.message; }
+    };
+    $('#prefsForm').onsubmit = async e => {
+      e.preventDefault();
+      const body = Object.fromEntries(emailRows.map(([k]) => [k, e.target.elements[k].checked]));
+      try { await api('/me/email-prefs', { method: 'PUT', body }); toast('Email notifications saved'); } catch (err) { toast(err.message); }
+    };
+    if (me.role === 'admin') renderEmailSettings(await api('/email/status'));
+  }
+  // Admins: what the server uses (never the password), the last error, and "Send test email" with the exact result.
+  function renderEmailSettings(st, result) {
+    const box = $('#emailSettings'); if (!box) return;
+    const row = (k, v) => `<tr><th>${k}</th><td>${v}</td></tr>`;
+    box.innerHTML = `<h2>Email settings</h2>
+      <p class="muted" style="font-size:.875rem;margin-top:-4px">Set in <code>server/.env</code> on the server (SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASS, SMTP_FROM, APP_URL); restart the server after changing them.</p>
+      ${st.configured ? '' : '<p class="warn-text">Email is off: SMTP_HOST, SMTP_USER or SMTP_PASS is missing.</p>'}
+      <table class="kv">${row('Server', esc(`${st.host || '—'}:${st.port || '—'}`) + (st.ssl ? ' (SSL)' : ''))}${row('Sign-in', esc(st.user || '—'))}
+        ${row('App password', st.password_set ? 'Set' : '<span class="warn-text">Missing</span>')}${row('Sender', esc(st.from))}${row('Links open', esc(st.app_url || '—'))}
+        ${row('Sent since start', `${st.sent}${st.waiting ? ` · ${st.waiting} waiting` : ''}${st.failed ? ` · ${st.failed} failed` : ''}`)}
+        ${row('Last error', st.last_error ? `<span class="err-inline">${esc(st.last_error.reason)}</span><br><span class="muted">${fmtDateTime(st.last_error.at)} · to ${esc(st.last_error.to)} · “${esc(st.last_error.subject)}”</span>` : '<span class="muted">None</span>')}</table>
+      <div class="inline-actions" style="margin-top:12px"><button class="btn" id="testEmail"${st.configured ? '' : ' disabled'}>Send test email to ${esc(me.email)}</button></div>
+      ${result ? `<p class="${result.ok ? 'ok-note' : 'err-note'}" role="status" id="testResult">${result.ok ? `Sent to ${esc(result.to)}. Check your inbox.` : `Not sent: ${esc(result.error)}`}</p>` : ''}`;
+    $('#testEmail').onclick = async e => {
+      e.target.disabled = true; e.target.textContent = 'Sending…';
+      try { const r = await api('/email/test', { method: 'POST' }); renderEmailSettings(r.status, r); }
+      catch (err) { renderEmailSettings(st, { ok: false, error: err.message }); }
     };
   }
 
