@@ -667,7 +667,8 @@
       <label class="f"><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="8" autocomplete="new-password" ${u ? '' : 'required'}></label>
       ${u && u.id !== me.id ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
       <p class="muted" style="font-size:.8125rem;margin-top:-4px">A team’s leads can assign tasks to the people in that team.</p>
-      ${modalActions(u ? 'Save changes' : 'Add person')}`,
+      <div class="modal-actions">${canRemovePerson(u) ? '<button type="button" class="btn danger" id="removePersonBtn" style="margin-right:auto">Remove person</button>' : ''}
+        <button class="btn ghost" value="cancel" formnovalidate>Cancel</button><button class="btn" type="submit">${u ? 'Save changes' : 'Add person'}</button></div>`,
       async fd => {
         const body = Object.fromEntries(fd);
         if (u && u.id !== me.id) body.active = fd.get('active') === 'on';
@@ -676,6 +677,30 @@
         const lead = r.became_lead ? `${r.became_lead.name} is now a lead of ${r.became_lead.team_name}.` : '';
         toast(u ? lead || 'Changes saved' : `${body.name} added. ${lead} Share their email and temporary password with them.`); router();
       });
+    const rb = $('#removePersonBtn'); if (rb) rb.onclick = () => { modal.close(); removePerson(u); };
+  }
+  // Admins only, never their own account (the server enforces both).
+  const canRemovePerson = u => !!u && me.role === 'admin' && u.id !== me.id && !u.removed;
+  // "Remove person": the server counts their records first. None → the account is deleted; otherwise it is kept for
+  // History, marked "(removed)", signed out, taken out of teams, lead roles and group/team chats, and its email freed.
+  async function removePerson(u) {
+    let r;
+    try { r = await api(`/users/${u.id}/removal`); } catch (e) { toast(e.message); return; }
+    const list = Object.values(r.counts).filter(c => c.n);
+    const leads = r.leads.length ? `lead of ${r.leads.map(l => esc(l.name)).join(', ')}` : '';
+    openModal(`<h2 style="font-size:1.25rem">Remove ${esc(u.name)}?</h2>
+      ${r.mode === 'delete'
+        ? `<p>${esc(u.name)} has no tasks, approvals, requests, updates, files or chat messages. <b>Their account will be deleted completely</b>, with their sign-ins and chat memberships${leads ? ` (and their role as ${leads})` : ''}.</p>`
+        : `<p>${esc(u.name)} has:</p><ul class="remove-counts">${list.map(c => `<li><b>${c.n}</b> ${esc(c.label)}</li>`).join('')}${leads ? `<li>${leads}</li>` : ''}</ul>
+          <p>To keep History complete, <b>their account stays but is marked removed</b>: they are signed out and can’t sign in, they leave ${[u.team_name ? 'their team (' + esc(u.team_name) + ')' : '', leads ? 'their lead roles' : '', 'group and team chats'].filter(Boolean).join(', ')}, and they are shown as “${esc(u.name)} (removed)” wherever their name appears. Their email <b>${esc(u.email)}</b> becomes free for a new account. An admin can restore them later from All people → Removed.</p>`}
+      <div class="modal-actions"><button class="btn ghost" value="cancel" formnovalidate>Cancel</button><button class="btn danger-solid" type="submit">Remove person</button></div>`, async () => {
+      const x = await api('/users/' + u.id, { method: 'DELETE' });
+      toast(x.mode === 'deleted' ? `${u.name} was deleted` : `${u.name} was removed (kept in History)`); router();
+    });
+  }
+  async function restorePerson(u) {
+    if (!confirm(`Restore ${u.name.replace(/ \(removed\)$/, '')}? They can sign in again with their original email and password. Their team and team-lead roles are not given back – set them again on the Teams page.`)) return;
+    try { await api(`/users/${u.id}/restore`, { method: 'POST' }); toast('Restored. Add them to a team again if needed.'); router(); } catch (e) { toast(e.message); }
   }
   const canEditPerson = u => !(u.role === 'admin' && me.role !== 'admin');
   // The view switch at the top of the Teams page (managers/admins only).
@@ -684,11 +709,12 @@
   // "All people" (the former People page): everyone, including people without a team and deactivated accounts.
   async function viewAllPeople() {
     const { q, go } = pageQuery('teams');
-    const [{ users }, { teams }] = await Promise.all([api('/users'), api('/teams')]);
-    const byId = Object.fromEntries(users.map(u => [u.id, u]));
     const team = q.get('team') || '', role = q.get('role') || '', status = q.get('status') || '', text = (q.get('q') || '').toLowerCase();
+    // Removed people only appear with the "Removed" status filter.
+    const [{ users }, { teams }] = await Promise.all([api('/users' + (status === 'removed' ? '?removed=1' : '')), api('/teams')]);
+    const byId = Object.fromEntries(users.map(u => [u.id, u]));
     const list = users.filter(u => (!team || (team === 'none' ? !u.team_id : String(u.team_id) === team))
-      && (!role || u.role === role) && (!status || (status === 'active' ? u.active : !u.active))
+      && (!role || u.role === role) && (status === 'removed' ? u.removed : !u.removed && (!status || (status === 'active' ? u.active : !u.active)))
       && (!text || u.name.toLowerCase().includes(text) || u.email.toLowerCase().includes(text)));
     app.innerHTML = `
       <div class="page-head"><div><h1>All people</h1><p>${list.length} of ${users.length} people. Add people and choose their team. A team lead added to a team becomes one of its leads.</p></div>
@@ -699,15 +725,16 @@
           ${teams.map(t => `<option value="${t.id}"${String(t.id) === team ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
         <select id="pRole" aria-label="Filter by role"><option value="">All roles</option>${options(ROLE, role)}</select>
         <select id="pStatus" aria-label="Filter by status"><option value="">Active and deactivated</option>
-          <option value="active"${status === 'active' ? ' selected' : ''}>Active</option><option value="inactive"${status === 'inactive' ? ' selected' : ''}>Deactivated</option></select>
+          <option value="active"${status === 'active' ? ' selected' : ''}>Active</option><option value="inactive"${status === 'inactive' ? ' selected' : ''}>Deactivated</option><option value="removed"${status === 'removed' ? ' selected' : ''}>Removed</option></select>
       </div>
       ${list.length ? `<div class="card table-wrap"><table>
         <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Team</th><th>Status</th><th></th></tr></thead>
         <tbody>${list.map(u => `<tr>
           <td><a href="#/tasks?assignee=${u.id}&team=all">${esc(u.name)}</a></td><td>${esc(u.email)}</td><td>${roleCell(u, teams)}</td>
           <td>${u.team_name ? `<a href="#/teams/${u.team_id}">${esc(u.team_name)}</a>` : '<span class="muted">No team</span>'}</td>
-          <td>${u.active ? 'Active' : '<span class="muted">Deactivated</span>'}</td>
-          <td>${canEditPerson(u) ? `<button class="btn ghost small" data-edit="${u.id}">Edit</button>` : ''}</td></tr>`).join('')}</tbody></table></div>`
+          <td>${u.removed ? '<span class="muted">Removed</span>' : u.active ? 'Active' : '<span class="muted">Deactivated</span>'}</td>
+          <td><div class="inline-actions">${u.removed ? (me.role === 'admin' ? `<button class="btn ghost small" data-restore="${u.id}">Restore</button>` : '')
+            : `${canEditPerson(u) ? `<button class="btn ghost small" data-edit="${u.id}">Edit</button>` : ''}${canRemovePerson(u) ? `<button class="btn danger small" data-removep="${u.id}">Remove person</button>` : ''}`}</div></td></tr>`).join('')}</tbody></table></div>`
         : '<div class="card empty">Nobody matches these filters.</div>'}`;
     wireSearch('pSearch', go);
     $('#pTeam').onchange = e => go({ team: e.target.value });
@@ -715,6 +742,8 @@
     $('#pStatus').onchange = e => go({ status: e.target.value });
     $('#newUser').onclick = () => personForm(null, teams);
     app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => personForm(byId[b.dataset.edit], teams));
+    app.querySelectorAll('[data-removep]').forEach(b => b.onclick = () => removePerson(byId[b.dataset.removep]));
+    app.querySelectorAll('[data-restore]').forEach(b => b.onclick = () => restorePerson(byId[b.dataset.restore]));
   }
 
   // ---------- teams (everyone: company directory; managers and admins manage them) ----------

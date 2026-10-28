@@ -267,6 +267,11 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
       PRIMARY KEY (project_id, team_id)
     );
     CREATE INDEX IF NOT EXISTS idx_project_teams_team ON project_teams(team_id);`);
+  // "Remove person" (admins): someone with history is kept but marked removed; their email is freed (original_email).
+  const userCols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  if (!userCols.includes('removed_at')) db.exec('ALTER TABLE users ADD COLUMN removed_at TEXT');
+  if (!userCols.includes('removed_by')) db.exec('ALTER TABLE users ADD COLUMN removed_by INTEGER REFERENCES users(id) ON DELETE SET NULL');
+  if (!userCols.includes('original_email')) db.exec('ALTER TABLE users ADD COLUMN original_email TEXT');
 })();
 
 // Create the first admin account if there are no users yet.

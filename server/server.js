@@ -51,7 +51,7 @@ function publicUser(u) {
   if (!u) return u;
   const team = u.team_id ? db.prepare('SELECT name FROM teams WHERE id = ?').get(u.team_id) : null;
   return { id: u.id, name: u.name, email: u.email, role: u.role, lead_id: u.lead_id, team_id: u.team_id || null,
-    team_name: team ? team.name : null, active: !!u.active };
+    team_name: team ? team.name : null, active: !!u.active, removed: !!u.removed_at };
 }
 // Teams can have several leads (team_leads), all equal: every check is "any lead of the team". teams.lead_id is only
 // kept equal to the first lead for compatibility (syncLegacyLead); users.lead_id is no longer used.
@@ -260,6 +260,7 @@ function auth(req, res, next) {
   next();
 }
 function requireBoss(req, res, next) { return isBoss(req.user) ? next() : bad(res, 'Only managers and admins can do this.', 403); }
+function requireAdmin(req, res, next) { return req.user.role === 'admin' ? next() : bad(res, 'Only admins can do this.', 403); }
 
 app.post('/api/login', (req, res) => {
   if (rateLimited(req.ip)) return bad(res, 'Too many sign-in attempts. Try again in 15 minutes.', 429);
@@ -295,7 +296,8 @@ app.post('/api/me/password', auth, (req, res) => {
 app.get('/api/users', auth, (req, res) => {
   const u = req.user;
   let rows;
-  if (isBoss(u)) rows = db.prepare('SELECT * FROM users ORDER BY active DESC, name').all();
+  // Removed people are left out of every list and picker; managers/admins can ask for them (All people → "Removed").
+  if (isBoss(u)) rows = db.prepare(`SELECT * FROM users ${req.query.removed === '1' ? '' : 'WHERE removed_at IS NULL'} ORDER BY active DESC, name`).all();
   else if (u.role === 'lead') rows = db.prepare(`SELECT * FROM users WHERE id = ? OR id IN ${LED_MEMBERS} ORDER BY name`).all(u.id, u.id);
   else rows = [u];
   res.json({ users: rows.map(publicUser) });
@@ -323,6 +325,7 @@ app.post('/api/users', auth, requireBoss, (req, res) => {
 app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
   const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
   if (!target) return bad(res, 'User not found.', 404);
+  if (target.removed_at) return bad(res, 'This person was removed. An admin can restore them first.', 409);
   if (target.role === 'admin' && req.user.role !== 'admin') return bad(res, 'Only an admin can change an admin account.', 403);
   const f = {};
   if (req.body.name !== undefined) { f.name = str(req.body.name, 120); if (!f.name) return bad(res, 'Name cannot be empty.'); }
@@ -365,6 +368,76 @@ app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
   const became_lead = (f.team_id !== undefined && f.team_id !== target.team_id) || (f.role === 'lead' && target.role !== 'lead') ? autoLead(target.id, req.user.id) : null;
   syncTeamChats(); // team chats follow team membership, leads and deactivation
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(target.id)), became_lead });
+});
+
+// ---------- remove person (admins only) ----------
+// Everything that ties a person to history. Logins, chat memberships and lead roles are not history: they just go.
+const PERSON_RECORDS = [
+  ['tasks', ['task assigned to them', 'tasks assigned to them'], 'SELECT COUNT(*) n FROM tasks WHERE assignee_id = @id'],
+  ['assigned', ['task they assigned', 'tasks they assigned'], 'SELECT COUNT(*) n FROM tasks WHERE assigned_by = @id AND assignee_id != assigned_by'],
+  ['approvals', ['task they approved', 'tasks they approved'], 'SELECT COUNT(*) n FROM tasks WHERE approved_by = @id'],
+  ['requests', ['document request they made', 'document requests they made'], 'SELECT COUNT(*) n FROM requests WHERE requested_by = @id'],
+  ['updates', ['task update or request activity', 'task updates and request activity'], 'SELECT (SELECT COUNT(*) FROM task_updates WHERE user_id = @id) + (SELECT COUNT(*) FROM request_events WHERE user_id = @id) n'],
+  ['files', ['file they uploaded', 'files they uploaded'], 'SELECT COUNT(*) n FROM files WHERE uploaded_by = @id'],
+  ['messages', ['chat message', 'chat messages'], 'SELECT COUNT(*) n FROM messages WHERE sender_id = @id'],
+  ['other', ['other record (deleted items, asked/withdrawn requests, projects, chats or team links they made)', 'other records (deleted items, asked/withdrawn requests, projects, chats or team links they made)'], `SELECT
+      (SELECT COUNT(*) FROM tasks WHERE deleted_by = @id) + (SELECT COUNT(*) FROM requests WHERE deleted_by = @id OR asked_person_id = @id OR withdrawn_from_id = @id)
+      + (SELECT COUNT(*) FROM projects WHERE created_by = @id) + (SELECT COUNT(*) FROM conversations WHERE created_by = @id)
+      + (SELECT COUNT(*) FROM team_connections WHERE created_by = @id) + (SELECT COUNT(*) FROM team_leads WHERE added_by = @id) n`]
+];
+function personRecords(id) {
+  const counts = {};
+  for (const [key, [one, many], q] of PERSON_RECORDS) { const n = db.prepare(q).get({ id }).n; counts[key] = { label: n === 1 ? one : many, n }; }
+  const total = Object.values(counts).reduce((a, c) => a + c.n, 0);
+  const leads = db.prepare('SELECT tm.id, tm.name FROM team_leads tl JOIN teams tm ON tm.id = tl.team_id WHERE tl.user_id = ? ORDER BY tm.name').all(id);
+  return { counts, total, leads };
+}
+function removalTarget(req, res) {
+  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
+  if (!target) { bad(res, 'User not found.', 404); return null; }
+  if (target.id === req.user.id) { bad(res, 'You can’t remove your own account.', 403); return null; }
+  return target;
+}
+// What removing this person would do (for the confirmation dialog).
+app.get('/api/users/:id/removal', auth, requireAdmin, (req, res) => {
+  const t = removalTarget(req, res); if (!t) return;
+  if (t.removed_at) return bad(res, 'This person has already been removed.', 409);
+  const r = personRecords(t.id);
+  res.json({ user: publicUser(t), ...r, mode: r.total ? 'keep' : 'delete' });
+});
+// Remove: no records → the row is deleted; otherwise it is kept for History, marked removed, signed out, taken out of
+// teams/leads/group and team chats, and its email is freed for a new account.
+app.delete('/api/users/:id', auth, requireAdmin, (req, res) => {
+  const t = removalTarget(req, res); if (!t) return;
+  if (t.removed_at) return bad(res, 'This person has already been removed.', 409);
+  const r = personRecords(t.id);
+  const led = r.leads.map(l => l.id);
+  db.transaction(() => {
+    if (!r.total) {
+      db.prepare('UPDATE users SET lead_id = NULL WHERE lead_id = ?').run(t.id);
+      db.prepare('DELETE FROM users WHERE id = ?').run(t.id); // sessions, chat memberships (and mutes), lead roles go with it
+    } else {
+      const name = /\(removed\)$/.test(t.name) ? t.name : `${t.name} (removed)`; // shown like this wherever the name appears
+      db.prepare(`UPDATE users SET active = 0, team_id = NULL, removed_at = datetime('now'), removed_by = ?, original_email = email,
+        email = ?, name = ? WHERE id = ?`).run(req.user.id, `removed-${t.id}@removed.local`, name, t.id);
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(t.id);
+      db.prepare('DELETE FROM team_leads WHERE user_id = ?').run(t.id);
+      db.prepare(`DELETE FROM conversation_members WHERE user_id = ? AND conversation_id IN (SELECT id FROM conversations WHERE type IN ('group','team'))`).run(t.id);
+    }
+    for (const id of led) syncLegacyLead(id);
+  })();
+  syncTeamChats();
+  res.json({ ok: true, mode: r.total ? 'kept' : 'deleted' });
+});
+// Restore a removed person: their original email must still be free. Teams and lead roles are not given back.
+app.post('/api/users/:id/restore', auth, requireAdmin, (req, res) => {
+  const t = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
+  if (!t || !t.removed_at) return bad(res, 'This person isn’t removed.', 404);
+  if (db.prepare('SELECT 1 FROM users WHERE email = ? AND id != ?').get(t.original_email, t.id))
+    return bad(res, `${t.original_email} is now used by another account, so ${t.name.replace(/ \(removed\)$/, '')} can’t be restored.`, 409);
+  db.prepare(`UPDATE users SET active = 1, email = original_email, original_email = NULL, removed_at = NULL, removed_by = NULL,
+    name = ? WHERE id = ?`).run(t.name.replace(/ \(removed\)$/, ''), t.id);
+  res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(t.id)) });
 });
 
 // ---------- projects ----------
@@ -821,7 +894,7 @@ app.delete('/api/teams/:id', auth, requireBoss, (req, res) => {
 function memberTarget(req, res) {
   const team = db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.params.id));
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.userId));
-  if (!team || !user) { bad(res, 'Team or person not found.', 404); return null; }
+  if (!team || !user || user.removed_at) { bad(res, 'Team or person not found.', 404); return null; }
   if (user.role === 'admin' && req.user.role !== 'admin') { bad(res, 'Only an admin can change an admin account.', 403); return null; }
   return { team, user };
 }

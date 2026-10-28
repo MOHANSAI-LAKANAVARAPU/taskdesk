@@ -57,6 +57,12 @@ Roles: `admin`, `manager`, `lead`, `employee`. `isBoss(u)` = admin or manager.
 
 **Team connections (1.0.12).** `team_connections` links two teams that work together (two-way, one row per pair, smaller id first). Managers/admins tick them on the team page ("Connected teams" checkboxes → `PUT /api/teams/:id/connections {team_ids}`, which replaces the team's whole list); everyone sees the list on the team page and "Works with: …" on the team blocks. Nothing is seeded: until a manager connects teams, employees can request only from their own team (or "Not sure").
 
+**Remove person (admins only, never their own account).** In Teams → All people and in the person Edit form. `GET /api/users/:id/removal` counts the person's records (`personRecords`: tasks as assignee, tasks they assigned, approvals, requests, task updates + request activity, files, chat messages, and other references — deleted-by, asked/withdrawn requests, projects/chats/team links/lead roles they created) plus the teams they lead; the dialog shows them. `DELETE /api/users/:id`:
+- **No records** → the user row is deleted (sessions, chat memberships and mutes, lead roles go with it by cascade).
+- **Records** → the row stays for History: `removed_at`/`removed_by` set, `active = 0`, sessions ended, `team_id` cleared, lead roles removed (`syncLegacyLead`), removed from group and team chats (direct chats stay readable for the other person), `original_email` = their email and `email` = `removed-<id>@removed.local` (so the address can be used for a new account), and `name` gets " (removed)" — so every place that shows the name (History, CSV, tasks, requests, chat) shows "<name> (removed)".
+- Removed people are left out of `GET /api/users` (so All people, pickers, filters) unless managers/admins ask for `?removed=1` (All people → status "Removed"); they have no team and are inactive, so they're also out of team members, leads, New chat, assignment and ask-a-person lists. They can't be edited or added to a team (409/404) until restored.
+- `POST /api/users/:id/restore` (admins): only if `original_email` isn't used by another account (409 otherwise); reactivates the account, puts the email and name back, and does **not** give back teams or lead roles.
+
 Other rules: a user cannot deactivate themself; only admins can create admins or modify admin accounts. Deadlines/start dates are `YYYY-MM-DD`.
 
 **No performance scores.** The dashboard shows only counts: tasks assigned (total), completed, in progress, not started, overdue — overall, per project and per employee — plus tasks due in 7 days and completed in the last 7 days. Do not add ratings/scores/rankings.
@@ -129,7 +135,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 
 ## Database tables ([db.js](db.js))
 
-- **users**: id, name, email (unique, NOCASE), password_hash, role (admin|manager|lead|employee), lead_id → users, active (1/0), created_at
+- **users**: id, name, email (unique, NOCASE), password_hash, role (admin|manager|lead|employee), lead_id → users, active (1/0), created_at, removed_at, removed_by → users (SET NULL), original_email ("Remove person"; added with `ALTER TABLE`, backup `../backups/taskdesk-before-remove-person-2026-10-28.*`)
 - **sessions**: token (PK), user_id → users (cascade), expires_at
 - **projects**: id, name, description, status (active|on_hold|closed), created_by → users, created_at
 - **project_teams**: project_id → projects (cascade), team_id → teams (cascade); primary key (project_id, team_id). A project's teams (team tabs); none = "No team". Added for team tabs, backup `../backups/taskdesk-before-team-tabs-2026-10-28.*`.
@@ -156,9 +162,10 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | POST `/api/logout` | any | End session |
 | GET `/api/me` | signed in | Current user |
 | POST `/api/me/password` | signed in | Change own password (`current`, `next` ≥ 8 chars) |
-| GET `/api/users` | signed in (scoped by role) | List users |
+| GET `/api/users` | signed in (scoped by role) | List users (without removed people; `?removed=1` for managers/admins includes them, with `removed: true`) |
 | POST `/api/users` | boss | Add person (returns `became_lead`) |
-| PATCH `/api/users/:id` | boss | Edit name/email/role/lead_id/active/password |
+| PATCH `/api/users/:id` | boss | Edit name/email/role/lead_id/active/password (not a removed person) |
+| GET `/api/users/:id/removal`, DELETE `/api/users/:id`, POST `/api/users/:id/restore` | admin (not themself) | Remove person: preview the records / remove (delete or keep-as-removed) / restore |
 | GET `/api/projects` | signed in | Projects (with `teams`) and total/completed counts over visible tasks; `team=<id>` = that team's projects counted over that team's tasks, `team=none` = projects without a team |
 | POST `/api/projects` | boss | Create project (optional `team_ids`) |
 | PATCH `/api/projects/:id` | boss | Edit name/description/status; `team_ids` replaces the project's teams (left out = unchanged) |
