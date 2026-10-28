@@ -343,3 +343,17 @@ details.group[open] > summary::before{transform:rotate(90deg)}
 .btn.danger-solid{background:var(--s-over);border-color:var(--s-over);color:#fff}
 .remove-counts{margin:0 0 12px;padding-left:20px}
 .remove-counts li{margin:2px 0}
+/* team blocks: landing view of Tasks, Requests and Projects (Teams page card style) */
+.block-card{display:flex;flex-direction:column;gap:10px}
+.block-stats{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;margin:0!important;font-size:.875rem;color:var(--muted)}
+.block-stats b{display:block;font-size:1.375rem;line-height:1.2;color:var(--ink);font-variant-numeric:tabular-nums}
+.block-stats .over b{color:var(--s-over)}
+.block-stats .warn b{color:var(--s-prog)}
+.all-card{border-style:dashed}
+.results-head{font-size:1rem;margin:4px 0 12px}
+/* inside a team: "← All teams", the team's name and a switch */
+.team-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 14px}
+.team-head h2{margin:0;font-size:1.25rem}
+.team-head select{width:auto;margin-left:auto;min-width:160px}
+.back-link{text-decoration:none;font-weight:500}
+@media (max-width:620px){.team-head select{margin-left:0;flex:1 1 100%}}

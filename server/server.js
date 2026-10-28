@@ -457,6 +457,21 @@ app.get('/api/projects', auth, (req, res) => {
     FROM projects p ${where} ORDER BY p.status = 'closed', p.name`).all(...s.params, ...tp, ...s.params, ...tp, ...tp);
   res.json({ projects: rows.map(p => ({ ...p, teams: projectTeams(p.id) })) });
 });
+// Per team: its projects and their combined progress over that team's visible tasks (as the team tab counts them);
+// "none": projects without a team; "all": every project over all visible tasks.
+app.get('/api/projects/summary', auth, (req, res) => {
+  const s = taskScope(req.user);
+  const sum = (projectWhere, taskExtra, params) => db.prepare(`SELECT
+      (SELECT COUNT(*) FROM projects p WHERE ${projectWhere}) AS projects,
+      (SELECT COUNT(*) FROM tasks t JOIN projects p ON p.id = t.project_id WHERE ${projectWhere} AND ${s.sql}${taskExtra}) AS total,
+      (SELECT COUNT(*) FROM tasks t JOIN projects p ON p.id = t.project_id WHERE ${projectWhere} AND t.status = 'completed' AND ${s.sql}${taskExtra}) AS completed`)
+    .get(...params.p, ...params.p, ...s.params, ...params.t, ...params.p, ...s.params, ...params.t);
+  const teams = {};
+  for (const t of db.prepare('SELECT id FROM teams').all())
+    teams[t.id] = sum('p.id IN (SELECT project_id FROM project_teams WHERE team_id = ?)', ' AND t.assignee_id IN (SELECT id FROM users WHERE team_id = ?)', { p: [t.id], t: [t.id] });
+  teams.none = sum('p.id NOT IN (SELECT project_id FROM project_teams)', '', { p: [], t: [] });
+  res.json({ teams, all: sum('1=1', '', { p: [], t: [] }) });
+});
 // Managers/admins: replace a project's teams. Returns an error text or null.
 function setProjectTeams(projectId, teamIds) {
   if (!Array.isArray(teamIds)) return null;
@@ -510,6 +525,21 @@ const TASK_SELECT = `SELECT t.*, a.name AS assignee_name, a.team_id, tm.name AS 
   FROM tasks t JOIN users a ON a.id = t.assignee_id JOIN users b ON b.id = t.assigned_by LEFT JOIN projects p ON p.id = t.project_id
   LEFT JOIN teams tm ON tm.id = a.team_id`;
 
+// ---------- team blocks: per-team counts for the landing grids (Tasks, Requests, Projects) ----------
+// Same scopes as the lists, so a card never counts anything its list wouldn't show. Keys: team id, "none", and "all"
+// (everything the user can see, which can be more than the sum of the team cards).
+const teamKey = id => id === null || id === undefined ? 'none' : String(id);
+const WEEK_DONE = `t.status = 'completed' AND date(t.completed_at) >= date('now','localtime','-6 days')`; // as the dashboard
+app.get('/api/tasks/summary', auth, (req, res) => {
+  const s = taskScope(req.user);
+  const cols = `COUNT(*) AS total, COALESCE(SUM(t.status != 'completed'), 0) AS open,
+    COALESCE(SUM(t.status != 'completed' AND t.deadline IS NOT NULL AND t.deadline < date('now','localtime')), 0) AS overdue,
+    COALESCE(SUM(t.status = 'submitted'), 0) AS submitted, COALESCE(SUM(${WEEK_DONE}), 0) AS done_week`;
+  const from = `FROM tasks t JOIN users a ON a.id = t.assignee_id WHERE ${s.sql}`;
+  const teams = {};
+  for (const r of db.prepare(`SELECT a.team_id, ${cols} ${from} GROUP BY a.team_id`).all(...s.params)) { const { team_id, ...c } = r; teams[teamKey(team_id)] = c; }
+  res.json({ teams, all: db.prepare(`SELECT ${cols} ${from}`).get(...s.params) });
+});
 app.get('/api/tasks', auth, (req, res) => {
   const s = taskScope(req.user);
   const where = [s.sql], params = [...s.params];
@@ -1017,6 +1047,22 @@ app.get('/api/requests', auth, (req, res) => {
     target_team_id: r.target_team_id, team_name: r.team_name, requester_team_id: r.requester_team_id, requester_team_name: r.requester_team_name,
     needed_by: r.needed_by, status: r.status, assignee_name: r.assignee_name,
     asked_person_name: r.asked_person_name, created_at: r.created_at })) });
+});
+// Per team: incoming requests waiting for someone (open, or needs a team → "none"), requests the team's members sent that
+// aren't finished (needs_team/open/assigned/delivered, the "Not finished" filter), and requests delivered to others in
+// the last 7 days (by the team they were sent to).
+app.get('/api/requests/summary', auth, (req, res) => {
+  const sc = requestScope(req.user), since = new Date(Date.now() - 7 * 864e5).toISOString();
+  const from = `FROM requests r JOIN users rb ON rb.id = r.requested_by WHERE ${sc.sql}`;
+  const teams = {};
+  const put = (id, k, n) => { const t = teams[teamKey(id)] = teams[teamKey(id)] || { incoming: 0, sent: 0, delivered_week: 0 }; t[k] = n; };
+  const INCOMING = `r.status IN ('open','needs_team')`, SENT = `r.status IN ('needs_team','open','assigned','delivered')`;
+  const DELIVERED = `r.status IN ('delivered','closed') AND r.delivered_at >= ?`;
+  for (const r of db.prepare(`SELECT r.target_team_id AS id, COUNT(*) n ${from} AND ${INCOMING} GROUP BY r.target_team_id`).all(...sc.params)) put(r.id, 'incoming', r.n);
+  for (const r of db.prepare(`SELECT rb.team_id AS id, COUNT(*) n ${from} AND ${SENT} GROUP BY rb.team_id`).all(...sc.params)) put(r.id, 'sent', r.n);
+  for (const r of db.prepare(`SELECT r.target_team_id AS id, COUNT(*) n ${from} AND ${DELIVERED} GROUP BY r.target_team_id`).all(...sc.params, since)) put(r.id, 'delivered_week', r.n);
+  const one = (w, ...p) => db.prepare(`SELECT COUNT(*) n ${from} AND ${w}`).get(...sc.params, ...p).n;
+  res.json({ teams, all: { incoming: one(INCOMING), sent: one(SENT), delivered_week: one(DELIVERED, since) } });
 });
 // The New request form: teams this user may send to, and people they may ask.
 app.get('/api/request-targets', auth, (req, res) => res.json({ teams: allowedTargetTeams(req.user), people: askablePeople(req.user) }));

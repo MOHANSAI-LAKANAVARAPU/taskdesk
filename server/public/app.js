@@ -268,7 +268,38 @@
   }
   // Wire the tab buttons, and a search box that applies its text 300 ms after typing stops (and keeps the focus).
   let refocusSearch = null;
-  function wireTabs(go) { app.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => go({ team: b.dataset.tab })); }
+  function wireTabs(go) {
+    app.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => go({ team: b.dataset.tab }));
+    const sw = $('#teamSwitch'); if (sw) sw.onchange = () => go({ team: sw.value });
+  }
+  // ---------- team blocks (landing view of Tasks, Requests and Projects) ----------
+  // Shown when the URL names no team and no list filter (old links with filters keep opening a list). Employees who
+  // only see their own team skip it. Cards = the teams the user could pick as a tab, own team first; then "All teams".
+  const LIST_KEYS = { tasks: ['status', 'project', 'assignee', 'mine', 'due', 'priority', 'review', 'sort', 'view'], requests: ['status', 'dir'], projects: [] };
+  const isLanding = (page, q, tabs) => !q.get('team') && tabs.length > 0 && !LIST_KEYS[page].some(k => q.get(k)) && !(me.role === 'employee' && tabs.length <= 2);
+  async function renderLanding({ page, title, sub, actions = '', placeholder, body, tabs, q, go, results }) {
+    const sum = await api(`/${page}/summary`);
+    const own = String(me.team_id || '');
+    const ids = tabs.filter(t => t.id !== 'all').map(t => t.id).sort((a, b) => (b === own) - (a === own));
+    const card = (id, name, c, mine) => `<a class="card team-card block-card${mine ? ' mine' : ''}${id === 'all' ? ' all-card' : ''}" href="#/${page}?team=${esc(id)}">
+        <div class="row-top"><h2>${esc(name)}</h2>${mine ? '<span class="pill accent">Your team</span>' : ''}</div>${body(c || {})}</a>`;
+    const searching = !!q.get('q');
+    app.innerHTML = `
+      <div class="page-head"><div><h1>${title}</h1><p>${sub}</p></div>${actions}</div>
+      <div class="filters"><input type="search" id="landSearch" class="search" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" value="${esc(q.get('q') || '')}"></div>
+      ${searching ? `<h2 class="results-head">Results in all your teams</h2>${results}`
+        : `<div class="team-grid">${ids.map(id => card(id, tabs.find(t => t.id === id).name, sum.teams[id], id === own)).join('')}${card('all', 'All teams', sum.all, false)}</div>`}`;
+    wireSearch('landSearch', go);
+  }
+  const stat = (n, label, cls = '') => `<span class="${cls}"><b>${n || 0}</b> ${label}</span>`;
+  // Inside a team: "← All teams", the team's name, and a dropdown to switch team directly.
+  function teamHeaderHtml(page, tabs, cur) {
+    if (!tabs.length) return '';
+    const name = cur === 'all' ? 'All teams' : (tabs.find(t => t.id === cur) || {}).name || '';
+    const back = !(me.role === 'employee' && tabs.length <= 2); // those employees have no grid to go back to
+    return `<div class="team-head">${back ? `<a href="#/${page}" class="back-link">← All teams</a>` : ''}<h2>${esc(name)}</h2>
+      <select id="teamSwitch" aria-label="Switch team">${tabs.map(t => `<option value="${esc(t.id)}"${t.id === cur ? ' selected' : ''}>${t.id === 'all' ? 'All teams' : esc(t.name)}</option>`).join('')}</select></div>`;
+  }
   function wireSearch(id, go, key = 'q') {
     const box = $('#' + id); if (!box) return;
     let t;
@@ -304,24 +335,31 @@
   async function viewTasks() {
     const { q, go } = pageQuery('tasks');
     const { teams } = await api('/teams');
-    const tabs = teamTabsFor(teams), cur = currentTeamTab(q, teams, tabs);
+    const tabs = teamTabsFor(teams), landing = isLanding('tasks', q, tabs), cur = landing ? 'all' : currentTeamTab(q, teams, tabs);
     const params = new URLSearchParams();
     for (const k of ['status', 'project', 'assignee', 'mine', 'q', 'due', 'priority', 'review', 'sort']) if (q.get(k)) params.set(k, q.get(k));
     if (cur !== 'all') params.set('team', cur);
-    const [{ tasks }, { projects }, { users }] = await Promise.all([api('/tasks?' + params), api('/projects'), api('/users')]);
+    const [{ tasks }, { projects }, { users }] = landing && !q.get('q') ? [{ tasks: [] }, { projects: [] }, { users: [] }]
+      : await Promise.all([api('/tasks?' + params), api('/projects'), api('/users')]);
     const board = q.get('view') === 'board';
     const filtered = ['status', 'project', 'assignee', 'mine', 'q', 'due', 'priority', 'review'].some(k => q.get(k));
     const people = /^\d+$/.test(cur) ? users.filter(u => u.team_id === Number(cur)) : cur === 'none' ? users.filter(u => !u.team_id) : users;
 
-    const row = t => `<li><a href="#/tasks/${t.id}">
+    const row = (t, withTeam) => `<li><a href="#/tasks/${t.id}">
         <span class="t-title">${esc(t.title)}</span>
-        <span class="t-meta"><span>${esc(dueText(t))}</span>${me.role !== 'employee' ? `<span>${esc(t.assignee_name)}</span>` : `<span>From ${esc(t.assigned_by_name)}</span>`}${t.project_name ? `<span>${esc(t.project_name)}</span>` : ''}<span class="pr-${t.priority}">${PRIORITY[t.priority]} priority</span></span>
+        <span class="t-meta">${withTeam ? `<span>${esc(t.team_name || 'No team')}</span>` : ''}<span>${esc(dueText(t))}</span>${me.role !== 'employee' ? `<span>${esc(t.assignee_name)}</span>` : `<span>From ${esc(t.assigned_by_name)}</span>`}${t.project_name ? `<span>${esc(t.project_name)}</span>` : ''}<span class="pr-${t.priority}">${PRIORITY[t.priority]} priority</span></span>
         <span class="t-side">${statusPill(t)}<span class="mini" aria-label="${t.progress}% done"><i style="width:${t.progress}%"></i></span></span>
       </a></li>`;
     const counts = list => {
       const open = list.filter(t => t.status !== 'completed').length, over = list.filter(t => t.overdue).length;
       return `(${list.length}) · ${open} open${over ? ` · <span class="over">${over} overdue</span>` : ''}`;
     };
+    if (landing) return renderLanding({ page: 'tasks', title: me.role === 'employee' ? 'My tasks' : 'Tasks', tabs, q, go,
+      sub: 'Choose a team, or open all teams.', placeholder: 'Search tasks in all your teams',
+      actions: canAssign() ? `<button class="btn" id="newTask">Assign a task</button>` : '',
+      body: c => `<p class="block-stats">${stat(c.open, 'open')}${stat(c.overdue, 'overdue', c.overdue ? 'over' : '')}${stat(c.submitted, 'waiting for approval')}${stat(c.done_week, 'completed in 7 days')}</p>`,
+      results: tasks.length ? `<ul class="task-list">${tasks.map(t => row(t, true)).join('')}</ul>` : '<div class="card empty">No tasks match.</div>'
+    }).then(() => { const nb = $('#newTask'); if (nb) nb.onclick = () => taskForm(); });
     let body;
     if (!tasks.length) body = `<div class="card empty">${filtered ? 'No tasks match these filters.' : canAssign() ? 'No tasks yet. Assign the first one to get started.' : 'No tasks have been assigned to you yet.'}</div>`;
     else if (board) {
@@ -338,8 +376,8 @@
       }).join('')}</div>`;
     } else if (cur === 'all' && tabs.length) {
       body = byTeam(tasks, t => t.team_id, t => t.team_name, tabs).map(g =>
-        groupHtml('tasks:' + g.id, g.name, counts(g.rows), `<ul class="task-list">${g.rows.map(row).join('')}</ul>`)).join('');
-    } else body = `<ul class="task-list">${tasks.map(row).join('')}</ul>`;
+        groupHtml('tasks:' + g.id, g.name, counts(g.rows), `<ul class="task-list">${g.rows.map(t => row(t)).join('')}</ul>`)).join('');
+    } else body = `<ul class="task-list">${tasks.map(t => row(t)).join('')}</ul>`;
 
     const chip = (key, val, label) => `<button type="button" class="chip-filter" data-chip="${key}=${val}" aria-pressed="${q.get(key) === val}">${label}</button>`;
     app.innerHTML = `
@@ -347,7 +385,7 @@
         <div class="inline-actions"><div class="seg" role="group" aria-label="View">
           <button type="button" data-view="" aria-pressed="${!board}">List</button><button type="button" data-view="board" aria-pressed="${board}">Board</button></div>
         ${canAssign() ? `<button class="btn" id="newTask">Assign a task</button>` : ''}</div></div>
-      ${tabsHtml(tabs, cur)}
+      ${teamHeaderHtml('tasks', tabs, cur)}
       <div class="filters">
         <input type="search" id="tSearch" class="search" placeholder="Search title or description" aria-label="Search tasks" value="${esc(q.get('q') || '')}">
         <select id="fStatus" aria-label="Filter by status">
@@ -598,8 +636,8 @@
   async function viewProjects() {
     const { q, go } = pageQuery('projects');
     const { teams } = await api('/teams');
-    const tabs = teamTabsFor(teams), cur = currentTeamTab(q, teams, tabs);
-    const { projects } = await api('/projects' + (cur !== 'all' ? '?team=' + encodeURIComponent(cur) : ''));
+    const tabs = teamTabsFor(teams), landing = isLanding('projects', q, tabs), cur = landing ? 'all' : currentTeamTab(q, teams, tabs);
+    const { projects } = landing && !q.get('q') ? { projects: [] } : await api('/projects' + (cur !== 'all' ? '?team=' + encodeURIComponent(cur) : ''));
     const teamChips = p => p.teams.length ? `<div class="team-chips">${p.teams.map(t => `<span class="pill">${esc(t.name)}</span>`).join('')}</div>` : '';
     const table = list => `<div class="card table-wrap"><table>
         <thead><tr><th>Project</th><th>Status</th><th class="n">Assigned</th><th class="n">Completed</th><th style="min-width:140px">Progress</th>${isBoss() ? '<th></th>' : ''}</tr></thead>
@@ -608,6 +646,15 @@
           <td>${PSTATUS[p.status]}</td><td class="n">${p.total}</td><td class="n">${p.completed}</td>
           <td>${bar(p.total, p.completed)}<div class="num" style="margin-top:4px">${p.total ? Math.round(p.completed / p.total * 100) : 0}%</div></td>
           ${isBoss() ? `<td><button class="btn ghost small" data-edit="${p.id}">Edit</button></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+    if (landing) {
+      const text = (q.get('q') || '').toLowerCase(), found = projects.filter(p => (p.name + ' ' + (p.description || '')).toLowerCase().includes(text));
+      return renderLanding({ page: 'projects', title: 'Projects', tabs, q, go,
+        sub: 'Progress counts completed tasks against all tasks. Choose a team, or open all teams.', placeholder: 'Search projects in all your teams',
+        actions: isBoss() ? `<button class="btn" id="newProj">New project</button>` : '',
+        body: c => `<p class="block-stats">${stat(c.projects, c.projects === 1 ? 'project' : 'projects')}${stat(c.total, 'tasks')}</p>${bar(c.total, c.completed)}<div class="num" style="margin-top:4px">${c.total ? Math.round(c.completed / c.total * 100) : 0}% completed</div>`,
+        results: found.length ? table(found) : '<div class="card empty">No projects match.</div>'
+      }).then(() => { wireProjectButtons(); });
+    }
     let body;
     if (!projects.length) body = `<div class="card empty">${cur !== 'all' ? 'No projects for this team yet.' : isBoss() ? 'No projects yet. Create one to group related tasks.' : 'No projects yet.'}</div>`;
     else if (cur === 'all' && tabs.length) {
@@ -619,10 +666,14 @@
     app.innerHTML = `
       <div class="page-head"><div><h1>Projects</h1><p>Progress counts completed tasks against all tasks in each project${/^\d+$/.test(cur) ? ' (this team’s tasks only)' : ''}.</p></div>
         ${isBoss() ? `<button class="btn" id="newProj">New project</button>` : ''}</div>
-      ${tabsHtml(tabs, cur)}
+      ${teamHeaderHtml('projects', tabs, cur)}
       ${body}`;
-    wireTabs(go); wireGroups();
-    const form = p => {
+    wireTabs(go); wireGroups(); wireProjectButtons();
+    function wireProjectButtons() {
+      const nb = $('#newProj'); if (nb) nb.onclick = () => form();
+      app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => form(projects.find(p => p.id === +b.dataset.edit)));
+    }
+    function form(p) {
       const picks = teams.map(t => ({ id: t.id, name: t.name }));
       openModal(`
       <h2 style="font-size:1.25rem">${p ? 'Edit project' : 'New project'}</h2>
@@ -639,9 +690,7 @@
         toast(p ? 'Project updated' : 'Project created'); router();
       });
       const picker = personPicker(modalForm.querySelector('.picker'), picks, { selected: p ? picks.filter(t => p.teams.some(x => x.id === t.id)) : [] });
-    };
-    const nb = $('#newProj'); if (nb) nb.onclick = () => form();
-    app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => form(projects.find(p => p.id === +b.dataset.edit)));
+    }
   }
 
   // ---------- people (managers/admins: Teams page → "All people", and Edit on a team's member rows) ----------
@@ -865,12 +914,12 @@
   async function viewRequests() {
     const { q, go } = pageQuery('requests');
     const { teams } = await api('/teams');
-    const tabs = teamTabsFor(teams), cur = currentTeamTab(q, teams, tabs);
+    const tabs = teamTabsFor(teams), landing = isLanding('requests', q, tabs), cur = landing ? 'all' : currentTeamTab(q, teams, tabs);
     const sent = q.get('dir') === 'out';
     const params = new URLSearchParams();
     for (const k of ['status', 'q']) if (q.get(k)) params.set(k, q.get(k));
     if (cur !== 'all') params.set(sent ? 'from_team' : 'team', cur);
-    const { requests } = await api('/requests?' + params);
+    const { requests } = landing && !q.get('q') ? { requests: [] } : await api('/requests?' + params);
     const table = list => `<div class="card table-wrap"><table>
         <thead><tr><th>Title</th><th>Requested by</th><th>${sent ? 'Sent to' : 'For team'}</th><th>Needed by</th><th>Status</th><th>Taken by</th></tr></thead>
         <tbody>${list.map(r => `<tr><td><a href="#/requests/${r.id}">${esc(r.title)}</a></td>
@@ -878,6 +927,12 @@
           <td>${r.team_name ? esc(r.team_name) : r.status === 'needs_team' ? '<span class="muted">Not decided yet</span>' : '<span class="muted">—</span>'}</td><td>${fmtDate(r.needed_by)}</td><td>${reqPill(r)}</td>
           <td>${r.assignee_name ? esc(r.assignee_name) : '<span class="muted">—</span>'}</td></tr>`).join('')}</tbody></table></div>`;
     const open = list => list.filter(r => ['needs_team', 'open'].includes(r.status)).length;
+    if (landing) return renderLanding({ page: 'requests', title: 'Document requests', tabs, q, go,
+      sub: 'Ask another team for a document. Choose a team to see what it was asked for and what it sent, or open all teams.',
+      placeholder: 'Search requests in all your teams', actions: '<button class="btn" id="newReq">New request</button>',
+      body: c => `<p class="block-stats">${stat(c.incoming, 'incoming, waiting for someone', c.incoming ? 'warn' : '')}${stat(c.sent, 'sent, not finished')}${stat(c.delivered_week, 'delivered in 7 days')}</p>`,
+      results: requests.length ? table(requests) : '<div class="card empty">No requests match.</div>'
+    }).then(() => { $('#newReq').onclick = () => requestForm(); });
     const body = !requests.length ? `<div class="card empty">${q.get('status') || q.get('q') ? 'No requests match these filters.' : cur === 'all' ? 'No document requests yet.' : sent ? 'This team hasn’t sent any requests.' : 'No requests for this team.'}</div>`
       : cur === 'all' && tabs.length ? byTeam(requests, r => r.target_team_id, r => r.team_name, tabs, 'Not decided yet').map(g =>
           groupHtml('requests:' + g.id, g.name, `(${g.rows.length}) · ${open(g.rows)} waiting for someone`, table(g.rows))).join('')
@@ -885,7 +940,7 @@
     app.innerHTML = `
       <div class="page-head"><div><h1>Document requests</h1><p>Ask another team for a document. A member of that team takes it on, and you’re told when it’s ready.</p></div>
         <button class="btn" id="newReq">New request</button></div>
-      ${tabsHtml(tabs, cur)}
+      ${teamHeaderHtml('requests', tabs, cur)}
       ${cur !== 'all' ? `<div class="seg sub-tabs" role="group" aria-label="Direction"><button type="button" data-dir="" aria-pressed="${!sent}">Incoming</button><button type="button" data-dir="out" aria-pressed="${sent}">Sent</button></div>` : ''}
       <div class="filters">
         <input type="search" id="rSearch" class="search" placeholder="Search title or details" aria-label="Search requests" value="${esc(q.get('q') || '')}">
