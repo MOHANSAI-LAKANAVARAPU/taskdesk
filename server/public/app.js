@@ -101,7 +101,6 @@
   // ---------- shell ----------
   function renderNav(route) {
     const items = [['#/', 'Dashboard'], ['#/tasks', me.role === 'employee' ? 'My tasks' : 'Tasks'], ['#/requests', 'Requests'], ['#/projects', 'Projects']];
-    if (isBoss()) items.push(['#/people', 'People']);
     items.push(['#/teams', 'Teams'], ['#/chat', `Chat <span class="pill nav-count" id="chatCount"${chatUnread ? '' : ' hidden'}>${chatUnread > 99 ? '99+' : chatUnread}</span>`], ['#/history', 'History']);
     $('#nav').innerHTML = items.map(([h, l]) => {
       const cur = h === '#/' ? route === '' : route.startsWith(h.slice(2));
@@ -121,7 +120,9 @@
     }
     if (route === 'login') { $('#topbar').hidden = true; return viewLogin(); }
     // The old "My team" page (and People for non-managers) is now the Teams page.
-    if (route === 'my-team' || (route.startsWith('people') && !isBoss())) return location.replace('#/teams');
+    if (route === 'my-team') return location.replace('#/teams');
+    // People is part of the Teams page now ("All people", managers/admins); old links still work.
+    if (route.split('?')[0] === 'people') return location.replace(isBoss() ? '#/teams?view=people' : '#/teams');
     renderNav(route);
     const parts = route.split('?')[0].split('/');
     // Moving between chats keeps the chat page (and its list) in place.
@@ -132,7 +133,6 @@
       else if (parts[0] === 'tasks' && parts[1]) await viewTask(Number(parts[1]));
       else if (parts[0] === 'tasks') await viewTasks();
       else if (parts[0] === 'projects') await viewProjects();
-      else if (parts[0] === 'people') await viewPeople();
       else if (parts[0] === 'requests' && parts[1]) await viewRequest(Number(parts[1]));
       else if (parts[0] === 'requests') await viewRequests();
       else if (parts[0] === 'teams' && parts[1]) await viewTeam(Number(parts[1]));
@@ -235,24 +235,121 @@
   }
 
   // ---------- task list ----------
-  async function viewTasks() {
+  // ---------- team tabs (Tasks, Requests, Projects, History) ----------
+  // "All", then the teams the user works with: managers/admins every team + "No team"; leads the teams they lead and
+  // their own team; employees their own team (no bar without a team). The tab only narrows what the server already
+  // allows (the lists filter with ?team= inside the user's normal scope). The choice is kept in the URL.
+  function teamTabsFor(teams) {
+    const tab = t => ({ id: String(t.id), name: t.name });
+    if (isBoss()) return [{ id: 'all', name: 'All' }, ...teams.map(tab), { id: 'none', name: 'No team' }];
+    const led = teams.filter(t => t.leads.some(l => l.id === me.id));
+    const own = teams.find(t => t.id === me.team_id);
+    const mine = own && !led.includes(own) ? [...led, own] : led;
+    return mine.length ? [{ id: 'all', name: 'All' }, ...mine.map(tab)] : [];
+  }
+  // Without ?team=: managers "All", leads their first led team, employees their team.
+  function currentTeamTab(q, teams, tabs) {
+    const v = q.get('team');
+    if (tabs.some(t => t.id === v)) return v;
+    if (!tabs.length || isBoss()) return 'all';
+    const led = teams.find(t => t.leads.some(l => l.id === me.id));
+    return String(led ? led.id : me.team_id);
+  }
+  const tabsHtml = (tabs, cur) => tabs.length ? `<nav class="team-tabs" aria-label="Teams">${tabs.map(t =>
+    `<button type="button" data-tab="${esc(t.id)}" aria-pressed="${t.id === cur}">${esc(t.name)}</button>`).join('')}</nav>` : '';
+  // The page's query string: read it, and change some keys (empty value = remove) by going to the new URL.
+  function pageQuery(page) {
     const q = new URLSearchParams(location.hash.split('?')[1] || '');
-    const params = new URLSearchParams();
-    for (const k of ['status', 'project', 'assignee', 'mine']) if (q.get(k)) params.set(k, q.get(k));
-    const [{ tasks }, { projects }, { users }] = await Promise.all([api('/tasks?' + params), api('/projects'), api('/users')]);
-    const setQ = (k, v) => { if (v) q.set(k, v); else q.delete(k); location.hash = '#/tasks' + (q.toString() ? '?' + q : ''); };
+    const go = changes => {
+      for (const [k, v] of Object.entries(changes)) { if (v) q.set(k, v); else q.delete(k); }
+      location.hash = `#/${page}` + (q.toString() ? '?' + q : '');
+    };
+    return { q, go };
+  }
+  // Wire the tab buttons, and a search box that applies its text 300 ms after typing stops (and keeps the focus).
+  let refocusSearch = null;
+  function wireTabs(go) { app.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => go({ team: b.dataset.tab })); }
+  function wireSearch(id, go, key = 'q') {
+    const box = $('#' + id); if (!box) return;
+    let t;
+    box.oninput = () => { clearTimeout(t); t = setTimeout(() => { refocusSearch = id; go({ [key]: box.value.trim() }); }, 300); };
+    // After the page re-renders (the router then focuses the page), put the cursor back at the end of the search text.
+    if (refocusSearch === id) { refocusSearch = null; setTimeout(() => { box.focus(); box.setSelectionRange(box.value.length, box.value.length); }); }
+  }
+  // Collapsible groups ("R&D (5) · 3 open"): open/closed is remembered for this browser session.
+  const groupKey = k => 'td-group:' + k;
+  function groupOpen(k) { try { return sessionStorage.getItem(groupKey(k)) !== 'closed'; } catch (e) { return true; } }
+  function wireGroups() {
+    app.querySelectorAll('details[data-group]').forEach(d => d.ontoggle = () => {
+      try { sessionStorage.setItem(groupKey(d.dataset.group), d.open ? 'open' : 'closed'); } catch (e) { /* private mode */ }
+    });
+  }
+  const groupHtml = (key, title, meta, body) => `<details class="group" data-group="${esc(key)}"${groupOpen(key) ? ' open' : ''}>
+    <summary><span class="g-title">${esc(title)}</span> <span class="g-meta">${meta}</span></summary>${body}</details>`;
+  // Group rows by team: the tab order first, then any other team (alphabetical), then "No team" / the fallback.
+  function byTeam(rows, idOf, nameOf, tabs, none = 'No team') {
+    const groups = new Map();
+    for (const r of rows) {
+      const id = idOf(r) ? String(idOf(r)) : 'none';
+      if (!groups.has(id)) groups.set(id, { id, name: id === 'none' ? none : nameOf(r), rows: [] });
+      groups.get(id).rows.push(r);
+    }
+    const order = tabs.map(t => t.id);
+    return [...groups.values()].sort((a, b) => (a.id === 'none') - (b.id === 'none')
+      || ((order.indexOf(a.id) + 1 || 1e6) - (order.indexOf(b.id) + 1 || 1e6)) || a.name.localeCompare(b.name));
+  }
 
-    const list = tasks.length ? `<ul class="task-list">${tasks.map(t => `<li><a href="#/tasks/${t.id}">
+  // Tasks: team tabs (a task belongs to its assignee's team), List (grouped by team on "All") or Board, search, quick
+  // filter chips and sort — all in the URL, all applied by the server inside the user's normal task scope.
+  async function viewTasks() {
+    const { q, go } = pageQuery('tasks');
+    const { teams } = await api('/teams');
+    const tabs = teamTabsFor(teams), cur = currentTeamTab(q, teams, tabs);
+    const params = new URLSearchParams();
+    for (const k of ['status', 'project', 'assignee', 'mine', 'q', 'due', 'priority', 'review', 'sort']) if (q.get(k)) params.set(k, q.get(k));
+    if (cur !== 'all') params.set('team', cur);
+    const [{ tasks }, { projects }, { users }] = await Promise.all([api('/tasks?' + params), api('/projects'), api('/users')]);
+    const board = q.get('view') === 'board';
+    const filtered = ['status', 'project', 'assignee', 'mine', 'q', 'due', 'priority', 'review'].some(k => q.get(k));
+    const people = /^\d+$/.test(cur) ? users.filter(u => u.team_id === Number(cur)) : cur === 'none' ? users.filter(u => !u.team_id) : users;
+
+    const row = t => `<li><a href="#/tasks/${t.id}">
         <span class="t-title">${esc(t.title)}</span>
         <span class="t-meta"><span>${esc(dueText(t))}</span>${me.role !== 'employee' ? `<span>${esc(t.assignee_name)}</span>` : `<span>From ${esc(t.assigned_by_name)}</span>`}${t.project_name ? `<span>${esc(t.project_name)}</span>` : ''}<span class="pr-${t.priority}">${PRIORITY[t.priority]} priority</span></span>
         <span class="t-side">${statusPill(t)}<span class="mini" aria-label="${t.progress}% done"><i style="width:${t.progress}%"></i></span></span>
-      </a></li>`).join('')}</ul>`
-      : `<div class="card empty">${q.toString() ? 'No tasks match these filters.' : canAssign() ? 'No tasks yet. Assign the first one to get started.' : 'No tasks have been assigned to you yet.'}</div>`;
+      </a></li>`;
+    const counts = list => {
+      const open = list.filter(t => t.status !== 'completed').length, over = list.filter(t => t.overdue).length;
+      return `(${list.length}) · ${open} open${over ? ` · <span class="over">${over} overdue</span>` : ''}`;
+    };
+    let body;
+    if (!tasks.length) body = `<div class="card empty">${filtered ? 'No tasks match these filters.' : canAssign() ? 'No tasks yet. Assign the first one to get started.' : 'No tasks have been assigned to you yet.'}</div>`;
+    else if (board) {
+      // Board: one column per status; Completed shows the 20 most recently completed.
+      const cols = [['assigned', 'Not started'], ['in_progress', 'In progress'], ['submitted', 'Waiting for approval'], ['completed', 'Completed']];
+      const card = t => `<a class="b-card" href="#/tasks/${t.id}"><b>${esc(t.title)}</b>
+        <span class="muted">${esc(t.assignee_name)}</span>
+        <span class="b-meta"><span class="${t.overdue ? 'over' : 'muted'}">${esc(dueText(t))}</span><span class="pr-${t.priority}">${PRIORITY[t.priority]}</span></span></a>`;
+      body = `<div class="board">${cols.map(([st, label]) => {
+        let list = tasks.filter(t => t.status === st), more = 0;
+        if (st === 'completed') { list = list.sort((a, b) => String(b.completed_at).localeCompare(String(a.completed_at))); more = Math.max(0, list.length - 20); list = list.slice(0, 20); }
+        return `<section class="board-col" aria-label="${label}"><h2>${label} <span class="muted">${list.length + more}</span></h2>
+          ${list.map(card).join('') || '<p class="muted b-empty">None</p>'}${more ? `<p class="muted b-empty">+${more} more in the list view</p>` : ''}</section>`;
+      }).join('')}</div>`;
+    } else if (cur === 'all' && tabs.length) {
+      body = byTeam(tasks, t => t.team_id, t => t.team_name, tabs).map(g =>
+        groupHtml('tasks:' + g.id, g.name, counts(g.rows), `<ul class="task-list">${g.rows.map(row).join('')}</ul>`)).join('');
+    } else body = `<ul class="task-list">${tasks.map(row).join('')}</ul>`;
 
+    const chip = (key, val, label) => `<button type="button" class="chip-filter" data-chip="${key}=${val}" aria-pressed="${q.get(key) === val}">${label}</button>`;
     app.innerHTML = `
       <div class="page-head"><div><h1>${me.role === 'employee' ? 'My tasks' : 'Tasks'}</h1><p>${tasks.length} task${tasks.length === 1 ? '' : 's'}</p></div>
-        ${canAssign() ? `<button class="btn" id="newTask">Assign a task</button>` : ''}</div>
+        <div class="inline-actions"><div class="seg" role="group" aria-label="View">
+          <button type="button" data-view="" aria-pressed="${!board}">List</button><button type="button" data-view="board" aria-pressed="${board}">Board</button></div>
+        ${canAssign() ? `<button class="btn" id="newTask">Assign a task</button>` : ''}</div></div>
+      ${tabsHtml(tabs, cur)}
       <div class="filters">
+        <input type="search" id="tSearch" class="search" placeholder="Search title or description" aria-label="Search tasks" value="${esc(q.get('q') || '')}">
         <select id="fStatus" aria-label="Filter by status">
           <option value="">All statuses</option>
           <option value="open"${q.get('status') === 'open' ? ' selected' : ''}>All open</option>
@@ -262,13 +359,19 @@
         <select id="fProject" aria-label="Filter by project"><option value="">All projects</option>
           ${projects.map(p => `<option value="${p.id}"${String(p.id) === q.get('project') ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select>
         ${me.role !== 'employee' ? `<select id="fAssignee" aria-label="Filter by person"><option value="">Everyone</option>
-          ${users.map(u => `<option value="${u.id}"${String(u.id) === q.get('assignee') ? ' selected' : ''}>${esc(u.name)}</option>`).join('')}</select>
+          ${people.map(u => `<option value="${u.id}"${String(u.id) === q.get('assignee') ? ' selected' : ''}>${esc(u.name)}</option>`).join('')}</select>
           <select id="fMine" aria-label="Filter by who assigned"><option value="">Assigned by anyone</option><option value="assigned_by_me"${q.get('mine') ? ' selected' : ''}>Assigned by me</option></select>` : ''}
+        <select id="fSort" aria-label="Sort"><option value="">Sort: deadline</option><option value="priority"${q.get('sort') === 'priority' ? ' selected' : ''}>Sort: priority</option><option value="newest"${q.get('sort') === 'newest' ? ' selected' : ''}>Sort: newest</option></select>
       </div>
-      ${list}`;
-    $('#fStatus').onchange = e => setQ('status', e.target.value);
-    $('#fProject').onchange = e => setQ('project', e.target.value);
-    if ($('#fAssignee')) { $('#fAssignee').onchange = e => setQ('assignee', e.target.value); $('#fMine').onchange = e => setQ('mine', e.target.value); }
+      <div class="chips-row" role="group" aria-label="Quick filters">${chip('due', 'overdue', 'Overdue')}${chip('due', 'week', 'Due this week')}${chip('priority', 'high', 'Urgent/High')}${canAssign() ? chip('review', 'mine', 'Waiting for my approval') : ''}</div>
+      ${body}`;
+    wireTabs(go); wireGroups(); wireSearch('tSearch', go);
+    app.querySelectorAll('[data-view]').forEach(b => b.onclick = () => go({ view: b.dataset.view }));
+    app.querySelectorAll('[data-chip]').forEach(b => b.onclick = () => { const [k, v] = b.dataset.chip.split('='); go({ [k]: q.get(k) === v ? '' : v }); });
+    $('#fStatus').onchange = e => go({ status: e.target.value });
+    $('#fProject').onchange = e => go({ project: e.target.value });
+    $('#fSort').onchange = e => go({ sort: e.target.value });
+    if ($('#fAssignee')) { $('#fAssignee').onchange = e => go({ assignee: e.target.value }); $('#fMine').onchange = e => go({ mine: e.target.value }); }
     const nb = $('#newTask'); if (nb) nb.onclick = () => taskForm();
   }
 
@@ -490,58 +593,69 @@
   }
 
   // ---------- projects ----------
+  // Projects: team tabs show that team's projects (progress over that team's tasks); "All" shows every project grouped by
+  // team (a project with two teams is listed under both), "No team" last. Managers/admins set a project's teams.
   async function viewProjects() {
-    const { projects } = await api('/projects');
-    app.innerHTML = `
-      <div class="page-head"><div><h1>Projects</h1><p>Progress counts completed tasks against all tasks in each project.</p></div>
-        ${isBoss() ? `<button class="btn" id="newProj">New project</button>` : ''}</div>
-      ${projects.length ? `<div class="card table-wrap"><table>
+    const { q, go } = pageQuery('projects');
+    const { teams } = await api('/teams');
+    const tabs = teamTabsFor(teams), cur = currentTeamTab(q, teams, tabs);
+    const { projects } = await api('/projects' + (cur !== 'all' ? '?team=' + encodeURIComponent(cur) : ''));
+    const teamChips = p => p.teams.length ? `<div class="team-chips">${p.teams.map(t => `<span class="pill">${esc(t.name)}</span>`).join('')}</div>` : '';
+    const table = list => `<div class="card table-wrap"><table>
         <thead><tr><th>Project</th><th>Status</th><th class="n">Assigned</th><th class="n">Completed</th><th style="min-width:140px">Progress</th>${isBoss() ? '<th></th>' : ''}</tr></thead>
-        <tbody>${projects.map(p => `<tr>
-          <td><a href="#/tasks?project=${p.id}">${esc(p.name)}</a>${p.description ? `<div class="muted" style="font-size:.8125rem">${esc(p.description)}</div>` : ''}</td>
+        <tbody>${list.map(p => `<tr>
+          <td><a href="#/tasks?project=${p.id}${/^\d+$/.test(cur) ? '&team=' + cur : '&team=all'}">${esc(p.name)}</a>${p.description ? `<div class="muted" style="font-size:.8125rem">${esc(p.description)}</div>` : ''}${teamChips(p)}</td>
           <td>${PSTATUS[p.status]}</td><td class="n">${p.total}</td><td class="n">${p.completed}</td>
           <td>${bar(p.total, p.completed)}<div class="num" style="margin-top:4px">${p.total ? Math.round(p.completed / p.total * 100) : 0}%</div></td>
-          ${isBoss() ? `<td><button class="btn ghost small" data-edit="${p.id}">Edit</button></td>` : ''}</tr>`).join('')}</tbody></table></div>`
-      : `<div class="card empty">${isBoss() ? 'No projects yet. Create one to group related tasks.' : 'No projects yet.'}</div>`}`;
-    const form = p => openModal(`
+          ${isBoss() ? `<td><button class="btn ghost small" data-edit="${p.id}">Edit</button></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+    let body;
+    if (!projects.length) body = `<div class="card empty">${cur !== 'all' ? 'No projects for this team yet.' : isBoss() ? 'No projects yet. Create one to group related tasks.' : 'No projects yet.'}</div>`;
+    else if (cur === 'all' && tabs.length) {
+      // One row per (project, team); projects without a team go to "No team".
+      const pairs = projects.flatMap(p => p.teams.length ? p.teams.map(t => ({ p, id: t.id, name: t.name })) : [{ p, id: null }]);
+      body = byTeam(pairs, x => x.id, x => x.name, tabs).map(g => groupHtml('projects:' + g.id, g.name,
+        `(${g.rows.length} project${g.rows.length === 1 ? '' : 's'})`, table(g.rows.map(x => x.p)))).join('');
+    } else body = table(projects);
+    app.innerHTML = `
+      <div class="page-head"><div><h1>Projects</h1><p>Progress counts completed tasks against all tasks in each project${/^\d+$/.test(cur) ? ' (this team’s tasks only)' : ''}.</p></div>
+        ${isBoss() ? `<button class="btn" id="newProj">New project</button>` : ''}</div>
+      ${tabsHtml(tabs, cur)}
+      ${body}`;
+    wireTabs(go); wireGroups();
+    const form = p => {
+      const picks = teams.map(t => ({ id: t.id, name: t.name }));
+      openModal(`
       <h2 style="font-size:1.25rem">${p ? 'Edit project' : 'New project'}</h2>
       <label class="f"><span>Name</span><input name="name" required maxlength="160" value="${esc(p?.name)}"></label>
       <label class="f"><span>Description</span><textarea name="description">${esc(p?.description)}</textarea></label>
       ${p ? `<label class="f"><span>Status</span><select name="status">${options(PSTATUS, p.status)}</select></label>` : ''}
+      ${pickerHtml('Teams', 'Type a team name. The project shows on these teams’ tabs; leave empty for “No team”.').replace('Type a name…', 'Type a team…')}
       ${modalActions(p ? 'Save changes' : 'Create project')}`,
       async fd => {
         const body = Object.fromEntries(fd);
         if (!body.name.trim()) throw new Error('Enter a project name.');
+        body.team_ids = picker.values();
         await api(p ? '/projects/' + p.id : '/projects', { method: p ? 'PATCH' : 'POST', body });
         toast(p ? 'Project updated' : 'Project created'); router();
       });
+      const picker = personPicker(modalForm.querySelector('.picker'), picks, { selected: p ? picks.filter(t => p.teams.some(x => x.id === t.id)) : [] });
+    };
     const nb = $('#newProj'); if (nb) nb.onclick = () => form();
     app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => form(projects.find(p => p.id === +b.dataset.edit)));
   }
 
-  // ---------- people ----------
-  async function viewPeople() {
-    const [{ users }, { teams }] = await Promise.all([api('/users'), api('/teams')]);
-    const byId = Object.fromEntries(users.map(u => [u.id, u]));
-    // "Lead of <team>" next to the role; a team lead who leads no team gets a warning.
-    const roleCell = u => {
-      const led = teams.filter(t => t.leads.some(l => l.id === u.id));
-      if (led.length) return `${ROLE[u.role]}<div class="muted" style="font-size:.8125rem">Lead of ${led.map(t => `<a href="#/teams/${t.id}">${esc(t.name)}</a>`).join(', ')}</div>`;
-      if (u.role === 'lead' && u.active) return `${ROLE[u.role]}<div class="warn-text" style="margin:2px 0 0;font-size:.8125rem">⚠ Not leading a team yet – set it on the <a href="#/teams">Teams page</a></div>`;
-      return ROLE[u.role];
-    };
-    app.innerHTML = `
-      <div class="page-head"><div><h1>People</h1><p>Add people and choose their team. A team lead added to a team becomes one of its leads.</p></div>
-        <button class="btn" id="newUser">Add a person</button></div>
-      <div class="card table-wrap"><table>
-        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Team</th><th>Status</th><th></th></tr></thead>
-        <tbody>${users.map(u => `<tr>
-          <td><a href="#/tasks?assignee=${u.id}">${esc(u.name)}</a></td><td>${esc(u.email)}</td><td>${roleCell(u)}</td>
-          <td>${u.team_name ? esc(u.team_name) : '<span class="muted">—</span>'}</td>
-          <td>${u.active ? 'Active' : '<span class="muted">Deactivated</span>'}</td>
-          <td>${u.role === 'admin' && me.role !== 'admin' ? '' : `<button class="btn ghost small" data-edit="${u.id}">Edit</button>`}</td></tr>`).join('')}</tbody></table></div>`;
+  // ---------- people (managers/admins: Teams page → "All people", and Edit on a team's member rows) ----------
+  // "Lead of <team>" next to the role; a team lead who leads no team gets a warning.
+  function roleCell(u, teams) {
+    const led = teams.filter(t => t.leads.some(l => l.id === u.id));
+    if (led.length) return `${ROLE[u.role]}<div class="muted" style="font-size:.8125rem">Lead of ${led.map(t => `<a href="#/teams/${t.id}">${esc(t.name)}</a>`).join(', ')}</div>`;
+    if (u.role === 'lead' && u.active) return `${ROLE[u.role]}<div class="warn-text" style="margin:2px 0 0;font-size:.8125rem">⚠ Not leading a team yet – set it on the <a href="#/teams">Teams page</a></div>`;
+    return ROLE[u.role];
+  }
+  // Add or edit a person (name, email, role, team, password, active). The server keeps the admin-only rules.
+  function personForm(u, teams) {
     const roles = me.role === 'admin' ? ROLE : { manager: 'Manager', lead: 'Team lead', employee: 'Employee' };
-    const form = u => openModal(`
+    openModal(`
       <h2 style="font-size:1.25rem">${u ? 'Edit ' + esc(u.name) : 'Add a person'}</h2>
       <div class="grid2">
         <label class="f"><span>Full name</span><input name="name" required value="${esc(u?.name)}"></label>
@@ -562,18 +676,56 @@
         const lead = r.became_lead ? `${r.became_lead.name} is now a lead of ${r.became_lead.team_name}.` : '';
         toast(u ? lead || 'Changes saved' : `${body.name} added. ${lead} Share their email and temporary password with them.`); router();
       });
-    $('#newUser').onclick = () => form();
-    app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => form(byId[b.dataset.edit]));
+  }
+  const canEditPerson = u => !(u.role === 'admin' && me.role !== 'admin');
+  // The view switch at the top of the Teams page (managers/admins only).
+  const teamsViewSwitch = people => isBoss() ? `<div class="seg" role="group" aria-label="View">
+      <a href="#/teams" aria-pressed="${!people}">Teams</a><a href="#/teams?view=people" aria-pressed="${people}">All people</a></div>` : '';
+  // "All people" (the former People page): everyone, including people without a team and deactivated accounts.
+  async function viewAllPeople() {
+    const { q, go } = pageQuery('teams');
+    const [{ users }, { teams }] = await Promise.all([api('/users'), api('/teams')]);
+    const byId = Object.fromEntries(users.map(u => [u.id, u]));
+    const team = q.get('team') || '', role = q.get('role') || '', status = q.get('status') || '', text = (q.get('q') || '').toLowerCase();
+    const list = users.filter(u => (!team || (team === 'none' ? !u.team_id : String(u.team_id) === team))
+      && (!role || u.role === role) && (!status || (status === 'active' ? u.active : !u.active))
+      && (!text || u.name.toLowerCase().includes(text) || u.email.toLowerCase().includes(text)));
+    app.innerHTML = `
+      <div class="page-head"><div><h1>All people</h1><p>${list.length} of ${users.length} people. Add people and choose their team. A team lead added to a team becomes one of its leads.</p></div>
+        <div class="inline-actions">${teamsViewSwitch(true)}<button class="btn" id="newUser">Add a person</button></div></div>
+      <div class="filters">
+        <input type="search" id="pSearch" class="search" placeholder="Search name or email" aria-label="Search people" value="${esc(q.get('q') || '')}">
+        <select id="pTeam" aria-label="Filter by team"><option value="">All teams</option><option value="none"${team === 'none' ? ' selected' : ''}>No team</option>
+          ${teams.map(t => `<option value="${t.id}"${String(t.id) === team ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
+        <select id="pRole" aria-label="Filter by role"><option value="">All roles</option>${options(ROLE, role)}</select>
+        <select id="pStatus" aria-label="Filter by status"><option value="">Active and deactivated</option>
+          <option value="active"${status === 'active' ? ' selected' : ''}>Active</option><option value="inactive"${status === 'inactive' ? ' selected' : ''}>Deactivated</option></select>
+      </div>
+      ${list.length ? `<div class="card table-wrap"><table>
+        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Team</th><th>Status</th><th></th></tr></thead>
+        <tbody>${list.map(u => `<tr>
+          <td><a href="#/tasks?assignee=${u.id}&team=all">${esc(u.name)}</a></td><td>${esc(u.email)}</td><td>${roleCell(u, teams)}</td>
+          <td>${u.team_name ? `<a href="#/teams/${u.team_id}">${esc(u.team_name)}</a>` : '<span class="muted">No team</span>'}</td>
+          <td>${u.active ? 'Active' : '<span class="muted">Deactivated</span>'}</td>
+          <td>${canEditPerson(u) ? `<button class="btn ghost small" data-edit="${u.id}">Edit</button>` : ''}</td></tr>`).join('')}</tbody></table></div>`
+        : '<div class="card empty">Nobody matches these filters.</div>'}`;
+    wireSearch('pSearch', go);
+    $('#pTeam').onchange = e => go({ team: e.target.value });
+    $('#pRole').onchange = e => go({ role: e.target.value });
+    $('#pStatus').onchange = e => go({ status: e.target.value });
+    $('#newUser').onclick = () => personForm(null, teams);
+    app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => personForm(byId[b.dataset.edit], teams));
   }
 
   // ---------- teams (everyone: company directory; managers and admins manage them) ----------
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
   async function viewTeams() {
+    if (new URLSearchParams(location.hash.split('?')[1] || '').get('view') === 'people' && isBoss()) return viewAllPeople();
     const { teams } = await api('/teams');
     teams.sort((a, b) => b.mine - a.mine); // your own team first (the server sorts by name)
     app.innerHTML = `
       <div class="page-head"><div><h1>Teams</h1><p>Every team and who is in it. A team’s leads assign its work and its incoming document requests.</p></div>
-        ${isBoss() ? `<button class="btn" id="newTeam">Add a team</button>` : ''}</div>
+        ${isBoss() ? `<div class="inline-actions">${teamsViewSwitch(false)}<button class="btn" id="newTeam">Add a team</button></div>` : ''}</div>
       ${teams.length ? `<div class="team-grid">${teams.map(t => `<a class="card team-card${t.mine ? ' mine' : ''}" href="#/teams/${t.id}">
         <div class="row-top"><h2>${esc(t.name)}</h2>${t.mine ? '<span class="pill accent">Your team</span>' : ''}</div>
         <p class="${t.leads.length ? '' : isBoss() ? 'warn-text' : 'muted'}">${t.leads.length ? (t.leads.length === 1 ? 'Lead: ' : 'Leads: ') + esc(t.leads.map(l => l.name).join(', ')) : isBoss() ? '⚠ No lead' : 'No lead yet'}</p>
@@ -623,6 +775,7 @@
             ${counts ? `<td class="n"><a href="#/tasks?assignee=${m.id}&status=open">${m.open_tasks}</a></td>` : ''}
             ${d.can_assign || d.can_manage ? `<td><div class="inline-actions">
               ${d.can_assign && m.active ? `<button class="btn ghost small" data-assign="${m.id}">Assign a task</button>` : ''}
+              ${d.can_manage && canEditPerson(m) ? `<button class="btn ghost small" data-editp="${m.id}">Edit</button>` : ''}
               ${d.can_manage && !(m.role === 'admin' && me.role !== 'admin') ? `<button class="btn ghost small" data-remove="${m.id}">Remove</button>` : ''}</div></td>` : ''}
           </tr>`).join('')}</tbody></table>` : `<p class="muted">No members yet.${d.can_manage ? ' Use “Add member”.' : ''}</p>`}
       </section>`;
@@ -636,6 +789,7 @@
       try { await api(`/teams/${t.id}/connections`, { method: 'PUT', body: { team_ids: ids } }); toast('Connected teams saved'); }
       catch (e) { toast(e.message); router(); }
     };
+    app.querySelectorAll('[data-editp]').forEach(b => b.onclick = () => personForm(users.find(u => u.id === Number(b.dataset.editp)), teams));
     const leadToast = r => toast(r && r.became_lead ? `${r.became_lead.name} is now a lead of ${r.became_lead.team_name}` : 'Added to the team');
     app.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
       const m = d.members.find(x => x.id === Number(b.dataset.remove));
@@ -677,29 +831,42 @@
   }
 
   // ---------- document requests ----------
+  // Requests: team tabs; on a team, "Incoming" (sent to the team) and "Sent" (made by its members); "All" is grouped by
+  // the team each request was sent to. Status filter and search as well; everything in the URL.
   async function viewRequests() {
-    const q = new URLSearchParams(location.hash.split('?')[1] || '');
+    const { q, go } = pageQuery('requests');
+    const { teams } = await api('/teams');
+    const tabs = teamTabsFor(teams), cur = currentTeamTab(q, teams, tabs);
+    const sent = q.get('dir') === 'out';
     const params = new URLSearchParams();
-    for (const k of ['team', 'status']) if (q.get(k)) params.set(k, q.get(k));
-    const [{ requests }, { teams }] = await Promise.all([api('/requests?' + params), api('/teams')]);
-    const setQ = (k, v) => { if (v) q.set(k, v); else q.delete(k); location.hash = '#/requests' + (q.toString() ? '?' + q : ''); };
+    for (const k of ['status', 'q']) if (q.get(k)) params.set(k, q.get(k));
+    if (cur !== 'all') params.set(sent ? 'from_team' : 'team', cur);
+    const { requests } = await api('/requests?' + params);
+    const table = list => `<div class="card table-wrap"><table>
+        <thead><tr><th>Title</th><th>Requested by</th><th>${sent ? 'Sent to' : 'For team'}</th><th>Needed by</th><th>Status</th><th>Taken by</th></tr></thead>
+        <tbody>${list.map(r => `<tr><td><a href="#/requests/${r.id}">${esc(r.title)}</a></td>
+          <td>${esc(r.requested_by_name)}${cur === 'all' || sent || !r.requester_team_name || String(r.requester_team_id) === cur ? '' : ` <span class="muted">· ${esc(r.requester_team_name)}</span>`}</td>
+          <td>${r.team_name ? esc(r.team_name) : r.status === 'needs_team' ? '<span class="muted">Not decided yet</span>' : '<span class="muted">—</span>'}</td><td>${fmtDate(r.needed_by)}</td><td>${reqPill(r)}</td>
+          <td>${r.assignee_name ? esc(r.assignee_name) : '<span class="muted">—</span>'}</td></tr>`).join('')}</tbody></table></div>`;
+    const open = list => list.filter(r => ['needs_team', 'open'].includes(r.status)).length;
+    const body = !requests.length ? `<div class="card empty">${q.get('status') || q.get('q') ? 'No requests match these filters.' : cur === 'all' ? 'No document requests yet.' : sent ? 'This team hasn’t sent any requests.' : 'No requests for this team.'}</div>`
+      : cur === 'all' && tabs.length ? byTeam(requests, r => r.target_team_id, r => r.team_name, tabs, 'Not decided yet').map(g =>
+          groupHtml('requests:' + g.id, g.name, `(${g.rows.length}) · ${open(g.rows)} waiting for someone`, table(g.rows))).join('')
+      : table(requests);
     app.innerHTML = `
       <div class="page-head"><div><h1>Document requests</h1><p>Ask another team for a document. A member of that team takes it on, and you’re told when it’s ready.</p></div>
         <button class="btn" id="newReq">New request</button></div>
+      ${tabsHtml(tabs, cur)}
+      ${cur !== 'all' ? `<div class="seg sub-tabs" role="group" aria-label="Direction"><button type="button" data-dir="" aria-pressed="${!sent}">Incoming</button><button type="button" data-dir="out" aria-pressed="${sent}">Sent</button></div>` : ''}
       <div class="filters">
-        <select id="fTeam" aria-label="Filter by team"><option value="">All teams</option>
-          ${teams.map(t => `<option value="${t.id}"${String(t.id) === q.get('team') ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
+        <input type="search" id="rSearch" class="search" placeholder="Search title or details" aria-label="Search requests" value="${esc(q.get('q') || '')}">
         <select id="fStatus" aria-label="Filter by status"><option value="">All statuses</option>
           <option value="active"${q.get('status') === 'active' ? ' selected' : ''}>Not finished</option>${options(RSTATUS, q.get('status'))}</select>
       </div>
-      ${requests.length ? `<div class="card table-wrap"><table>
-        <thead><tr><th>Title</th><th>Requested by</th><th>For team</th><th>Needed by</th><th>Status</th><th>Taken by</th></tr></thead>
-        <tbody>${requests.map(r => `<tr><td><a href="#/requests/${r.id}">${esc(r.title)}</a></td><td>${esc(r.requested_by_name)}</td>
-          <td>${r.team_name ? esc(r.team_name) : r.status === 'needs_team' ? '<span class="muted">Not decided yet</span>' : '<span class="muted">—</span>'}</td><td>${fmtDate(r.needed_by)}</td><td>${reqPill(r)}</td>
-          <td>${r.assignee_name ? esc(r.assignee_name) : '<span class="muted">—</span>'}</td></tr>`).join('')}</tbody></table></div>`
-        : `<div class="card empty">${q.toString() ? 'No requests match these filters.' : 'No document requests yet.'}</div>`}`;
-    $('#fTeam').onchange = e => setQ('team', e.target.value);
-    $('#fStatus').onchange = e => setQ('status', e.target.value);
+      ${body}`;
+    wireTabs(go); wireGroups(); wireSearch('rSearch', go);
+    app.querySelectorAll('[data-dir]').forEach(b => b.onclick = () => go({ dir: b.dataset.dir }));
+    $('#fStatus').onchange = e => go({ status: e.target.value });
     $('#newReq').onclick = () => requestForm();
   }
   // New request: to a team (own team and connected teams; managers/admins: any) or straight to a person in those teams.
@@ -858,11 +1025,14 @@
 
   // ---------- history ----------
   async function viewHistory() {
-    const q = new URLSearchParams(location.hash.split('?')[1] || '');
+    const { q, go } = pageQuery('history');
+    const { teams } = await api('/teams');
+    const tabs = teamTabsFor(teams), cur = currentTeamTab(q, teams, tabs);
     const params = new URLSearchParams();
-    for (const k of ['person', 'team', 'status', 'from', 'to']) if (q.get(k)) params.set(k, q.get(k));
-    const [{ rows }, { users }, { teams }] = await Promise.all([api('/history?' + params), api('/users'), api('/teams')]);
-    const setQ = (k, v) => { if (v) q.set(k, v); else q.delete(k); location.hash = '#/history' + (q.toString() ? '?' + q : ''); };
+    for (const k of ['person', 'status', 'from', 'to']) if (q.get(k)) params.set(k, q.get(k));
+    if (cur !== 'all') params.set('team', cur); // the team tab (the CSV follows it too)
+    const [{ rows }, { users }] = await Promise.all([api('/history?' + params), api('/users')]);
+    const setQ = (k, v) => go({ [k]: v });
     const ALL = Object.assign({}, STATUS, { needs_team: 'Needs a team (request)', open: 'Open (request)', delivered: 'Delivered (request)', closed: 'Closed (request)', cancelled: 'Cancelled (request)', deleted: 'Deleted' });
     const d = v => v ? fmtDate(v) : '<span class="muted">—</span>';
     // Archived (deleted) items: "Deleted by <name> on <date>"; managers/admins can restore them or delete them permanently.
@@ -874,11 +1044,10 @@
     app.innerHTML = `
       <div class="page-head"><div><h1>History</h1><p>${rows.length} item${rows.length === 1 ? '' : 's'}. ${isBoss() ? 'All tasks and requests.' : me.role === 'lead' ? 'Your teams’ tasks and requests, and anything you assigned.' : 'Your own tasks and the requests you made.'}</p></div>
         <a class="btn" id="csvBtn" href="/api/history?${new URLSearchParams([...params, ['format', 'csv']])}" download>Export to Excel</a></div>
+      ${tabsHtml(tabs, cur)}
       <div class="filters">
         ${users.length > 1 ? `<select id="hPerson" aria-label="Filter by person"><option value="">Everyone</option>
           ${users.map(u => `<option value="${u.id}"${String(u.id) === q.get('person') ? ' selected' : ''}>${esc(u.name)}</option>`).join('')}</select>` : ''}
-        <select id="hTeam" aria-label="Filter by team"><option value="">All teams</option>
-          ${teams.map(t => `<option value="${t.id}"${String(t.id) === q.get('team') ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
         <select id="hStatus" aria-label="Filter by status"><option value="">All statuses</option>${options(ALL, q.get('status'))}</select>
         <label class="inline-date">From <input type="date" id="hFrom" value="${esc(q.get('from') || '')}"></label>
         <label class="inline-date">To <input type="date" id="hTo" value="${esc(q.get('to') || '')}"></label>
@@ -893,7 +1062,7 @@
           <td>${esc(r.approved_by_name || '—')}</td><td class="reasons">${esc(r.send_back_reasons || '')}</td></tr>`).join('')}</tbody></table></div>`
         : `<div class="card empty">Nothing matches these filters.</div>`}`;
     if ($('#hPerson')) $('#hPerson').onchange = e => setQ('person', e.target.value);
-    $('#hTeam').onchange = e => setQ('team', e.target.value);
+    wireTabs(go);
     $('#hStatus').onchange = e => setQ('status', e.target.value);
     $('#hFrom').onchange = e => setQ('from', e.target.value);
     $('#hTo').onchange = e => setQ('to', e.target.value);

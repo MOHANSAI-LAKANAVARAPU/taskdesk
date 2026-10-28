@@ -368,20 +368,41 @@ app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
 });
 
 // ---------- projects ----------
+// Projects: everyone sees every project; the counts only include tasks the user can see. With a team tab (`team=<id>`)
+// only that team's projects, counted over that team's tasks; `team=none`: projects without a team.
+const projectTeams = id => db.prepare('SELECT tm.id, tm.name FROM project_teams pt JOIN teams tm ON tm.id = pt.team_id WHERE pt.project_id = ? ORDER BY tm.name').all(id);
 app.get('/api/projects', auth, (req, res) => {
-  const s = taskScope(req.user);
+  const s = taskScope(req.user), team = req.query.team;
+  const byTeam = /^\d+$/.test(String(team || '')) ? Number(team) : null;
+  const inTeam = byTeam ? ' AND t.assignee_id IN (SELECT id FROM users WHERE team_id = ?)' : '';
+  const where = byTeam ? 'WHERE p.id IN (SELECT project_id FROM project_teams WHERE team_id = ?)'
+    : team === 'none' ? 'WHERE p.id NOT IN (SELECT project_id FROM project_teams)' : '';
+  const tp = byTeam ? [byTeam] : [];
   const rows = db.prepare(`SELECT p.*,
-      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND ${s.sql}) AS total,
-      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'completed' AND ${s.sql}) AS completed
-    FROM projects p ORDER BY p.status = 'closed', p.name`).all(...s.params, ...s.params);
-  res.json({ projects: rows });
+      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND ${s.sql}${inTeam}) AS total,
+      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'completed' AND ${s.sql}${inTeam}) AS completed
+    FROM projects p ${where} ORDER BY p.status = 'closed', p.name`).all(...s.params, ...tp, ...s.params, ...tp, ...tp);
+  res.json({ projects: rows.map(p => ({ ...p, teams: projectTeams(p.id) })) });
 });
+// Managers/admins: replace a project's teams. Returns an error text or null.
+function setProjectTeams(projectId, teamIds) {
+  if (!Array.isArray(teamIds)) return null;
+  const ids = [...new Set(teamIds.map(Number))];
+  if (ids.some(id => !db.prepare('SELECT 1 FROM teams WHERE id = ?').get(id))) return 'Choose valid teams.';
+  db.transaction(() => {
+    db.prepare('DELETE FROM project_teams WHERE project_id = ?').run(projectId);
+    for (const id of ids) db.prepare('INSERT INTO project_teams (project_id, team_id) VALUES (?,?)').run(projectId, id);
+  })();
+  return null;
+}
 
 app.post('/api/projects', auth, requireBoss, (req, res) => {
   const name = str(req.body.name, 160);
   if (!name) return bad(res, 'Enter a project name.');
+  if (Array.isArray(req.body.team_ids) && req.body.team_ids.some(id => !db.prepare('SELECT 1 FROM teams WHERE id = ?').get(Number(id)))) return bad(res, 'Choose valid teams.');
   const r = db.prepare('INSERT INTO projects (name, description, created_by) VALUES (?,?,?)').run(name, str(req.body.description), req.user.id);
-  res.json({ project: db.prepare('SELECT * FROM projects WHERE id = ?').get(r.lastInsertRowid) });
+  setProjectTeams(r.lastInsertRowid, req.body.team_ids);
+  res.json({ project: { ...db.prepare('SELECT * FROM projects WHERE id = ?').get(r.lastInsertRowid), teams: projectTeams(r.lastInsertRowid) } });
 });
 
 app.patch('/api/projects/:id', auth, requireBoss, (req, res) => {
@@ -392,14 +413,29 @@ app.patch('/api/projects/:id', auth, requireBoss, (req, res) => {
   const status = req.body.status !== undefined ? req.body.status : p.status;
   if (!name) return bad(res, 'Project name cannot be empty.');
   if (!['active', 'on_hold', 'closed'].includes(status)) return bad(res, 'Choose a valid status.');
-  db.prepare('UPDATE projects SET name = ?, description = ?, status = ? WHERE id = ?').run(name, description, status, p.id);
-  res.json({ project: db.prepare('SELECT * FROM projects WHERE id = ?').get(p.id) });
+  const err = Array.isArray(req.body.team_ids) && req.body.team_ids.some(id => !db.prepare('SELECT 1 FROM teams WHERE id = ?').get(Number(id))) ? 'Choose valid teams.' : null;
+  if (err) return bad(res, err);
+  db.transaction(() => {
+    db.prepare('UPDATE projects SET name = ?, description = ?, status = ? WHERE id = ?').run(name, description, status, p.id);
+    setProjectTeams(p.id, req.body.team_ids);
+  })();
+  res.json({ project: { ...db.prepare('SELECT * FROM projects WHERE id = ?').get(p.id), teams: projectTeams(p.id) } });
 });
 
+// Team tabs: `team=<id>` → column = id, `team=none` → column IS NULL, anything else (all, missing) → no filter.
+// These filters only ever narrow a list inside the user's existing scope.
+function teamFilter(value, column, where, params) {
+  if (value === 'none') where.push(`${column} IS NULL`);
+  else if (/^\d+$/.test(String(value || ''))) { where.push(`${column} = ?`); params.push(Number(value)); }
+}
+// Search text for LIKE (with % and _ taken literally).
+const likeText = q => '%' + String(q).replace(/[\\%_]/g, c => '\\' + c) + '%';
+
 // ---------- tasks ----------
-const TASK_SELECT = `SELECT t.*, a.name AS assignee_name, b.name AS assigned_by_name, p.name AS project_name,
+const TASK_SELECT = `SELECT t.*, a.name AS assignee_name, a.team_id, tm.name AS team_name, b.name AS assigned_by_name, p.name AS project_name,
   CASE WHEN t.status != 'completed' AND t.deadline IS NOT NULL AND t.deadline < date('now','localtime') THEN 1 ELSE 0 END AS overdue
-  FROM tasks t JOIN users a ON a.id = t.assignee_id JOIN users b ON b.id = t.assigned_by LEFT JOIN projects p ON p.id = t.project_id`;
+  FROM tasks t JOIN users a ON a.id = t.assignee_id JOIN users b ON b.id = t.assigned_by LEFT JOIN projects p ON p.id = t.project_id
+  LEFT JOIN teams tm ON tm.id = a.team_id`;
 
 app.get('/api/tasks', auth, (req, res) => {
   const s = taskScope(req.user);
@@ -411,9 +447,20 @@ app.get('/api/tasks', auth, (req, res) => {
   if (project) { where.push('t.project_id = ?'); params.push(Number(project)); }
   if (assignee) { where.push('t.assignee_id = ?'); params.push(Number(assignee)); }
   if (mine === 'assigned_by_me') { where.push('t.assigned_by = ?'); params.push(req.user.id); }
-  const rows = db.prepare(`${TASK_SELECT} WHERE ${where.join(' AND ')}
-    ORDER BY t.status = 'completed', t.deadline IS NULL, t.deadline,
-    CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, t.id DESC LIMIT 1000`).all(...params);
+  // Team tabs, search, quick filters and sort (all optional; they only narrow the list above).
+  teamFilter(req.query.team, 'a.team_id', where, params);
+  const q = str(req.query.q, 100);
+  if (q) { where.push(`(t.title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\')`); params.push(likeText(q), likeText(q)); }
+  if (req.query.due === 'overdue') where.push(`t.status != 'completed' AND t.deadline IS NOT NULL AND t.deadline < date('now','localtime')`);
+  else if (req.query.due === 'week') where.push(`t.status != 'completed' AND t.deadline BETWEEN date('now','localtime') AND date('now','localtime','+6 days')`);
+  if (req.query.priority === 'high') where.push(`t.priority IN ('urgent','high')`);
+  else if (PRIORITIES.includes(req.query.priority)) { where.push('t.priority = ?'); params.push(req.query.priority); }
+  if (req.query.review === 'mine') { const rs = reviewScope(req.user); where.push(`(${rs.sql})`); params.push(...rs.params); }
+  const PRIO = `CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END`;
+  const order = req.query.sort === 'priority' ? `t.status = 'completed', ${PRIO}, t.deadline IS NULL, t.deadline, t.id DESC`
+    : req.query.sort === 'newest' ? 't.id DESC'
+    : `t.status = 'completed', t.deadline IS NULL, t.deadline, ${PRIO}, t.id DESC`; // "deadline" (the default)
+  const rows = db.prepare(`${TASK_SELECT} WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT 1000`).all(...params);
   res.json({ tasks: rows });
 });
 
@@ -884,14 +931,18 @@ function requestFlags(u, r) {
 app.get('/api/requests', auth, (req, res) => {
   const scope = requestScope(req.user);
   const where = [scope.sql], params = [...scope.params];
-  if (req.query.team) { where.push('r.target_team_id = ?'); params.push(Number(req.query.team)); }
+  teamFilter(req.query.team, 'r.target_team_id', where, params);        // "Incoming" (and the old team filter)
+  teamFilter(req.query.from_team, 'rb.team_id', where, params);         // "Sent": the requester's team
+  const q = str(req.query.q, 100);
+  if (q) { where.push(`(r.title LIKE ? ESCAPE '\\' OR r.description LIKE ? ESCAPE '\\')`); params.push(likeText(q), likeText(q)); }
   if (req.query.status === 'active') where.push(`r.status IN ('needs_team','open','assigned','delivered')`);
   else if (REQ_STATUSES.includes(req.query.status)) { where.push('r.status = ?'); params.push(req.query.status); }
   const rows = db.prepare(`${REQ_SELECT} WHERE ${where.join(' AND ')}
     ORDER BY CASE r.status WHEN 'needs_team' THEN 0 WHEN 'open' THEN 1 WHEN 'assigned' THEN 2 WHEN 'delivered' THEN 3 ELSE 4 END,
       r.needed_by IS NULL, r.needed_by, r.id DESC LIMIT 1000`).all(...params);
   res.json({ requests: rows.map(r => ({ id: r.id, title: r.title, requested_by: r.requested_by, requested_by_name: r.requested_by_name,
-    target_team_id: r.target_team_id, team_name: r.team_name, needed_by: r.needed_by, status: r.status, assignee_name: r.assignee_name,
+    target_team_id: r.target_team_id, team_name: r.team_name, requester_team_id: r.requester_team_id, requester_team_name: r.requester_team_name,
+    needed_by: r.needed_by, status: r.status, assignee_name: r.assignee_name,
     asked_person_name: r.asked_person_name, created_at: r.created_at })) });
 });
 // The New request form: teams this user may send to, and people they may ask.
@@ -1456,6 +1507,8 @@ function historyRows(u, q) {
   const person = Number(q.person), team = Number(q.team);
   if (person) rows = rows.filter(r => [r.assignee_id, r.assigned_by, r.requested_by].includes(person));
   if (team) rows = rows.filter(r => r.team_id === team);
+  else if (q.team === 'none') rows = rows.filter(r => !r.team_id); // team tab "No team"
+
   if (q.status) rows = rows.filter(r => r.status === q.status);
   const day = d => String(d || '').slice(0, 10);
   if (DATE_RE.test(q.from || '')) rows = rows.filter(r => day(r.created_at) >= q.from);

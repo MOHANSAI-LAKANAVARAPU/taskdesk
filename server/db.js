@@ -260,6 +260,13 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
     );
     CREATE INDEX IF NOT EXISTS idx_team_leads_user ON team_leads(user_id);`);
   if (!hadLeads) db.exec('INSERT OR IGNORE INTO team_leads (team_id, user_id) SELECT id, lead_id FROM teams WHERE lead_id IS NOT NULL');
+  // Projects can belong to one or more teams (set by managers/admins). Nothing is seeded: existing projects have no team.
+  db.exec(`CREATE TABLE IF NOT EXISTS project_teams (
+      project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      PRIMARY KEY (project_id, team_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_project_teams_team ON project_teams(team_id);`);
 })();
 
 // Create the first admin account if there are no users yet.

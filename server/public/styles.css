@@ -305,3 +305,38 @@ table.history td.reasons{white-space:normal;min-width:180px}
   .chat-back{display:block}
   .msg{max-width:94%}
 }
+/* team tabs (Tasks, Requests, Projects, History): one scrollable row of pill buttons */
+.team-tabs{display:flex;gap:6px;overflow-x:auto;margin:0 0 14px;padding-bottom:2px;scrollbar-width:thin}
+.team-tabs button,.seg button,.seg a{font:inherit;font-size:.875rem;font-weight:500;white-space:nowrap;cursor:pointer;border:1px solid var(--line);background:var(--surface);color:var(--muted);border-radius:999px;padding:6px 14px;text-decoration:none}
+.team-tabs button[aria-pressed=true]{background:var(--accent-soft);color:var(--accent-text);border-color:var(--accent);font-weight:600}
+.team-tabs button:hover,.seg button:hover,.seg a:hover{color:var(--ink)}
+/* segmented switch: List | Board, Teams | All people, Incoming | Sent */
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;padding:2px;background:var(--surface);gap:2px}
+.seg button,.seg a{border:none;border-radius:8px;padding:6px 12px;background:transparent}
+.seg [aria-pressed=true]{background:var(--accent-soft);color:var(--accent-text);font-weight:600}
+.sub-tabs{margin:0 0 14px}
+.filters .search{width:auto;min-width:220px;flex:1 1 220px;max-width:340px}
+/* quick filter chips */
+.chips-row{display:flex;gap:8px;flex-wrap:wrap;margin:-6px 0 16px}
+.chip-filter{font:inherit;font-size:.8125rem;cursor:pointer;border:1px dashed var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:4px 12px}
+.chip-filter[aria-pressed=true]{border-style:solid;border-color:var(--accent);background:var(--accent-soft);color:var(--accent-text);font-weight:600}
+/* collapsible groups ("R&D (5) · 3 open · 1 overdue") */
+details.group{margin-bottom:14px}
+details.group > summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:8px;padding:8px 2px;font-weight:600}
+details.group > summary::-webkit-details-marker{display:none}
+details.group > summary::before{content:"▸";color:var(--muted);transition:transform .15s;display:inline-block}
+details.group[open] > summary::before{transform:rotate(90deg)}
+.g-meta{color:var(--muted);font-weight:400;font-size:.875rem}
+.over{color:var(--s-over)}
+.team-chips{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.team-chips .pill{background:var(--soft);color:var(--muted);font-weight:500}
+/* board: one column per status */
+.board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;align-items:start}
+.board-col{background:var(--soft);border-radius:12px;padding:10px;min-width:0}
+.board-col h2{font-size:.875rem;margin:2px 4px 10px;display:flex;justify-content:space-between}
+.b-card{display:flex;flex-direction:column;gap:3px;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;color:var(--ink);text-decoration:none;font-size:.875rem;overflow-wrap:anywhere}
+.b-card:hover{border-color:var(--accent)}
+.b-meta{display:flex;justify-content:space-between;gap:8px;font-size:.8125rem}
+.b-empty{font-size:.8125rem;margin:4px}
+@media (max-width:1000px){.board{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:620px){.board{grid-template-columns:1fr}.filters .search{max-width:none}.filters select{min-width:0;flex:1 1 calc(50% - 5px)}.page-head .inline-actions{flex-wrap:wrap}}
