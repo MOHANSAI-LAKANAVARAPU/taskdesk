@@ -53,12 +53,19 @@ function publicUser(u) {
   return { id: u.id, name: u.name, email: u.email, role: u.role, lead_id: u.lead_id, team_id: u.team_id || null,
     team_name: team ? team.name : null, active: !!u.active };
 }
-// Teams: a lead manages the members of the teams where teams.lead_id = them (users.lead_id is no longer used).
-const LED_MEMBERS = '(SELECT m.id FROM users m JOIN teams tm ON tm.id = m.team_id WHERE tm.lead_id = ?)';
-const LED_REQUEST_TASKS = '(SELECT r.task_id FROM requests r JOIN teams tm ON tm.id = r.target_team_id WHERE tm.lead_id = ? AND r.task_id IS NOT NULL)';
-function isMemberOfLedTeam(u, other) {
-  return !!(other && other.team_id && db.prepare('SELECT 1 FROM teams WHERE id = ? AND lead_id = ?').get(other.team_id, u.id));
+// Teams can have several leads (team_leads), all equal: every check is "any lead of the team". teams.lead_id is only
+// kept equal to the first lead for compatibility (syncLegacyLead); users.lead_id is no longer used.
+const LED_TEAMS = '(SELECT team_id FROM team_leads WHERE user_id = ?)';
+const LED_MEMBERS = `(SELECT m.id FROM users m WHERE m.team_id IN ${LED_TEAMS})`;
+const LED_REQUEST_TASKS = `(SELECT r.task_id FROM requests r WHERE r.target_team_id IN ${LED_TEAMS} AND r.task_id IS NOT NULL)`;
+const isLeadOf = (u, teamId) => !!(teamId && u && db.prepare('SELECT 1 FROM team_leads WHERE team_id = ? AND user_id = ?').get(teamId, u.id || u));
+// The team's leads (active ones), first-added first.
+const leadsOf = teamId => teamId ? db.prepare(`SELECT us.id, us.name FROM team_leads tl JOIN users us ON us.id = tl.user_id
+  WHERE tl.team_id = ? AND us.active = 1 ORDER BY tl.added_at, tl.rowid`).all(teamId) : [];
+function syncLegacyLead(teamId) {
+  db.prepare(`UPDATE teams SET lead_id = (SELECT user_id FROM team_leads WHERE team_id = teams.id ORDER BY added_at, rowid LIMIT 1) WHERE id = ?`).run(teamId);
 }
+function isMemberOfLedTeam(u, other) { return !!(other && other.team_id && isLeadOf(u, other.team_id)); }
 function validTeamLead(id) {
   return !!db.prepare(`SELECT 1 FROM users WHERE id = ? AND active = 1 AND role IN ('lead','manager','admin')`).get(id);
 }
@@ -77,16 +84,20 @@ function canSeeTask(u, task) {
   const s = taskScope(u);
   return !!db.prepare(`SELECT 1 FROM tasks t WHERE t.id = ? AND ${s.sql}`).get(task.id, ...s.params);
 }
-// Edit/delete: managers/admins and the assigner. A self-claimed request task (assigned_by = assignee) can't be edited
-// or deleted by the claimer (they use "Give back"); the request team's lead can instead.
-// A request sent to a person ("Ask a person") is handled like a self-claimed one: the target team's lead (not the
-// requester) edits and approves it, and the person can give it back.
+// Edit/delete: managers/admins and the assigner — and, when the assigner is a lead of the assignee's team, any lead of
+// that team (leads are equal). A self-claimed request task (assigned_by = assignee) can't be edited or deleted by the
+// claimer (they use "Give back"); the leads of the request's team can instead.
+// A request sent to a person ("Ask a person") is handled like a self-claimed one: the target team's leads (not the
+// requester) edit and approve it, and the person can give it back.
 function canEditTask(u, task) {
   if (isBoss(u)) return true;
   const r = linkedRequest(task.id);
-  if (r && (task.assigned_by === task.assignee_id || isPersonTask(task, r))) return r.team_lead_id === u.id;
-  return task.assigned_by === u.id;
+  if (r && (task.assigned_by === task.assignee_id || isPersonTask(task, r))) return isLeadOf(u, r.target_team_id);
+  return task.assigned_by === u.id || (assignerLeads(task) && isLeadOf(u, assigneeTeam(task)));
 }
+const assigneeTeam = task => (db.prepare('SELECT team_id FROM users WHERE id = ?').get(task.assignee_id) || {}).team_id || null;
+// The task was assigned by a lead of the assignee's team (then every lead of that team may approve/edit it).
+function assignerLeads(task) { return task.assigned_by !== task.assignee_id && isLeadOf(task.assigned_by, assigneeTeam(task)); }
 function isPersonTask(task, r) { return !!(r && r.asked_person_id && r.task_id === task.id && r.asked_person_id === task.assignee_id); }
 function isClaimer(u, task) {
   if (task.assignee_id !== u.id) return false;
@@ -95,54 +106,62 @@ function isClaimer(u, task) {
 }
 const GIVE_BACK_HINT = 'You took this from a document request. Use “Give back” to return it to the team.';
 // Approval step: the assignee submits; reviewers approve or send back. Nobody reviews their own work.
-// Reviewers: managers/admins; the person in assigned_by (when that isn't the assignee); and for a self-claimed
-// document request (assigned_by = assignee) the lead of the request's target team. Nobody else.
+// Reviewers: managers/admins; the person in assigned_by (when that isn't the assignee) — and when that person is a lead
+// of the assignee's team, any lead of that team; for a self-claimed document request (assigned_by = assignee) any lead
+// of the request's target team other than the assignee. Nobody else.
 function linkedRequest(taskId) {
-  return db.prepare(`SELECT r.*, tm.lead_id AS team_lead_id FROM requests r LEFT JOIN teams tm ON tm.id = r.target_team_id
-    WHERE r.task_id = ?`).get(taskId);
+  return db.prepare(`SELECT r.*, tm.name AS team_name FROM requests r LEFT JOIN teams tm ON tm.id = r.target_team_id WHERE r.task_id = ?`).get(taskId);
 }
-// A person request is approved by the person's team lead or a manager/admin, never by the requester.
+// A person request is approved by any lead of the person's team or a manager/admin, never by the requester.
 function canReviewTask(u, task) {
   const r = linkedRequest(task.id), person = isPersonTask(task, r);
   if (person && r.requested_by === u.id && u.id !== task.assignee_id) return false;
   if (isBoss(u)) return true; // managers/admins: any submitted task, including their own (recorded as self-approved)
   if (u.id === task.assignee_id) return false;
-  if (task.assigned_by !== task.assignee_id && !person) return task.assigned_by === u.id;
-  return !!(r && r.team_lead_id === u.id);
+  if (task.assigned_by !== task.assignee_id && !person) return task.assigned_by === u.id || (assignerLeads(task) && isLeadOf(u, assigneeTeam(task)));
+  return !!(r && isLeadOf(u, r.target_team_id));
 }
 // A plain task someone assigned to themself: they complete it directly. A self-claimed request task still needs approval.
 function ownPlainTask(task) { return task.assigned_by === task.assignee_id && !linkedRequest(task.id); }
 // SQL fragment (alias t): submitted tasks the user may approve.
 const PERSON_TASKS = '(SELECT pr.task_id FROM requests pr JOIN tasks pt ON pt.id = pr.task_id WHERE pr.asked_person_id = pt.assignee_id)';
 const MY_PERSON_ASKS = '(SELECT pr.task_id FROM requests pr JOIN tasks pt ON pt.id = pr.task_id WHERE pr.asked_person_id = pt.assignee_id AND pr.requested_by = ? AND pt.assignee_id != pr.requested_by)';
+// Assigned by a lead of the assignee's team, and the assignee's team is one this user leads (one param: the user).
+const ASSIGNED_BY_CO_LEAD = `EXISTS (SELECT 1 FROM users am JOIN team_leads al ON al.team_id = am.team_id AND al.user_id = t.assigned_by
+  WHERE am.id = t.assignee_id AND am.team_id IN ${LED_TEAMS})`;
 function reviewScope(u) {
   return isBoss(u) ? { sql: `t.status = 'submitted' AND t.deleted_at IS NULL AND t.id NOT IN ${MY_PERSON_ASKS}`, params: [u.id] }
-    : { sql: `t.status = 'submitted' AND t.deleted_at IS NULL AND t.assignee_id != ? AND ((t.assigned_by = ? AND t.assigned_by != t.assignee_id AND t.id NOT IN ${PERSON_TASKS})
+    : { sql: `t.status = 'submitted' AND t.deleted_at IS NULL AND t.assignee_id != ? AND (((t.assigned_by = ? OR ${ASSIGNED_BY_CO_LEAD})
+          AND t.assigned_by != t.assignee_id AND t.id NOT IN ${PERSON_TASKS})
         OR ((t.assigned_by = t.assignee_id OR t.id IN ${PERSON_TASKS}) AND t.id IN ${LED_REQUEST_TASKS} AND t.id NOT IN ${MY_PERSON_ASKS}))`,
-      params: [u.id, u.id, u.id, u.id] };
+      params: [u.id, u.id, u.id, u.id, u.id] };
 }
-// Who can actually approve a task (same rules as canReviewTask): the assigner if they aren't the assignee, otherwise
-// for a self-claimed request the target team's lead; plus any active manager/admin who isn't the assignee (`any_manager`),
-// and the assignee themself if they are a manager/admin (`self`).
-// For a person request (`request.asked_person_id` = the assignee): the person's team lead and managers/admins, never the requester.
+// Who can actually approve a task (same rules as canReviewTask): the assigner if they aren't the assignee (plus the
+// other leads of the assignee's team when the assigner is one of them), otherwise for a self-claimed request every lead
+// of the target team except the assignee; plus any active manager/admin who isn't the assignee (`any_manager`), and the
+// assignee themself if they are a manager/admin (`self`).
+// For a person request (`request.asked_person_id` = the assignee): the person's team leads and managers/admins, never the requester.
 function approversFor(assigneeId, assignedBy, request) {
   const active = id => db.prepare('SELECT name FROM users WHERE id = ? AND active = 1').get(id);
   const person = !!(request && request.asked_person_id && request.asked_person_id === assigneeId);
   const requester = person ? request.requested_by : 0;
   const names = [];
-  if (assignedBy !== assigneeId && !person) { const a = active(assignedBy); if (a) names.push(a.name); }
-  else if (request && request.team_lead_id && request.team_lead_id !== assigneeId && request.team_lead_id !== requester) {
-    const l = active(request.team_lead_id); if (l) names.push(l.name);
+  if (assignedBy !== assigneeId && !person) {
+    const a = active(assignedBy); if (a) names.push(a.name);
+    const team = assigneeTeam({ assignee_id: assigneeId });
+    if (isLeadOf(assignedBy, team)) for (const l of leadsOf(team)) if (l.id !== assignedBy && l.id !== assigneeId) names.push(l.name);
+  } else if (request) {
+    for (const l of leadsOf(request.target_team_id)) if (l.id !== assigneeId && l.id !== requester) names.push(l.name);
   }
   const any_manager = !!db.prepare(`SELECT 1 FROM users WHERE active = 1 AND role IN ('admin','manager') AND id NOT IN (?, ?)`).get(assigneeId, requester);
   // A manager/admin assignee can always approve their own work, so the "nobody can approve" block never applies to them.
   const self = !!db.prepare(`SELECT 1 FROM users WHERE id = ? AND active = 1 AND role IN ('admin','manager')`).get(assigneeId);
   return { names, any_manager, self, nobody: !names.length && !any_manager && !self };
 }
-// `assigneeId`: who would do the work. A team lead's own request task can only be approved by a manager/admin.
+// `assigneeId`: who would do the work. A lead's own request task is approved by another lead of the team or a manager/admin.
 function nobodyCanApprove(request, assigneeId) {
-  if (request && request.team_lead_id && request.team_lead_id === assigneeId)
-    return `Nobody can approve this yet: work the lead of ${request.team_name} takes is approved by a manager. Ask an admin to add a manager.`;
+  if (request && isLeadOf(assigneeId, request.target_team_id))
+    return `Nobody can approve this yet: work a lead of ${request.team_name} takes is approved by another lead of the team or a manager. Ask a manager to add another lead.`;
   return request && request.team_name ? `Nobody can approve this yet. Ask a manager to set a lead for ${request.team_name}.`
     : 'Nobody can approve this yet. Ask a manager to add another manager or team lead.';
 }
@@ -296,7 +315,7 @@ app.post('/api/users', auth, requireBoss, (req, res) => {
   if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return bad(res, 'A user with this email already exists.');
   const r = db.prepare('INSERT INTO users (name,email,password_hash,role,lead_id,team_id) VALUES (?,?,?,?,?,?)')
     .run(name, email, bcrypt.hashSync(password, 10), role, lead_id, team_id);
-  const became_lead = autoLead(r.lastInsertRowid);
+  const became_lead = autoLead(r.lastInsertRowid, req.user.id);
   syncTeamChats();
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(r.lastInsertRowid)), became_lead });
 });
@@ -337,9 +356,13 @@ app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
   const keys = Object.keys(f);
   if (keys.length) db.prepare(`UPDATE users SET ${keys.map(k => k + ' = ?').join(', ')} WHERE id = ?`).run(...keys.map(k => f[k]), target.id);
   if (f.active === 0 || f.password_hash) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);
-  if (f.role === 'employee' || f.active === 0) db.prepare('UPDATE teams SET lead_id = NULL WHERE lead_id = ?').run(target.id); // can no longer lead a team
-  // Only when the team or the role changed (a manager may have cleared the team's lead on purpose).
-  const became_lead = (f.team_id !== undefined && f.team_id !== target.team_id) || (f.role !== undefined && f.role !== target.role) ? autoLead(target.id) : null;
+  if (f.role === 'employee' || f.active === 0) { // can no longer lead a team
+    const led = db.prepare('SELECT team_id FROM team_leads WHERE user_id = ?').all(target.id);
+    db.prepare('DELETE FROM team_leads WHERE user_id = ?').run(target.id);
+    for (const l of led) syncLegacyLead(l.team_id);
+  }
+  // Only when the team changed or the role became lead: a lead a manager removed on the team page stays removed.
+  const became_lead = (f.team_id !== undefined && f.team_id !== target.team_id) || (f.role === 'lead' && target.role !== 'lead') ? autoLead(target.id, req.user.id) : null;
   syncTeamChats(); // team chats follow team membership, leads and deactivation
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(target.id)), became_lead });
 });
@@ -608,8 +631,10 @@ function reviewRefusal(u, task, verb) {
   if (u.id === task.assignee_id) return `You can’t ${verb} your own work.`;
   const doIt = verb === 'send back' ? 'send it back' : verb + ' it';
   const r = linkedRequest(task.id);
-  if (isPersonTask(task, r) && r.requested_by === u.id) return `You asked for this, so the lead of the person’s team or another manager has to ${doIt}.`;
-  return `Only the person who assigned this task, the request team’s lead or a manager can ${doIt}.`;
+  if (isPersonTask(task, r) && r.requested_by === u.id) return `You asked for this, so another lead of the person’s team or a manager has to ${doIt}.`;
+  if (r && (task.assigned_by === task.assignee_id || isPersonTask(task, r))) return `Only a lead of ${r.team_name || 'the request’s team'} or a manager can ${doIt}.`;
+  if (assignerLeads(task)) return `Only the leads of ${(db.prepare('SELECT name FROM teams WHERE id = ?').get(assigneeTeam(task)) || {}).name || 'the team'} or a manager can ${doIt}.`;
+  return `Only the person who assigned this task or a manager can ${doIt}.`;
 }
 // A reviewer (see canReviewTask) approves: task becomes completed (and a linked request is delivered).
 // A manager/admin approving their own task is logged as "Self-approved by <name>".
@@ -646,18 +671,21 @@ app.post('/api/tasks/:id/send-back', auth, (req, res) => {
 // ---------- teams ----------
 // Teams are a company directory: everyone sees every team and its members. Open task/request counts only for
 // the team's lead and managers/admins.
-const canSeeTeamCounts = (u, t) => isBoss(u) || t.lead_id === u.id;
+const canSeeTeamCounts = (u, t) => isBoss(u) || isLeadOf(u, t.id);
 const OPEN_TEAM_TASKS = `(SELECT COUNT(*) FROM tasks t JOIN users m ON m.id = t.assignee_id WHERE m.team_id = tm.id AND t.status != 'completed' AND t.deleted_at IS NULL)`;
 const OPEN_TEAM_REQUESTS = `(SELECT COUNT(*) FROM requests r WHERE r.target_team_id = tm.id AND r.status = 'open' AND r.deleted_at IS NULL)`;
-const TEAM_SELECT = `SELECT tm.*, l.name AS lead_name, (SELECT COUNT(*) FROM users m WHERE m.team_id = tm.id AND m.active = 1) AS member_count,
-  ${OPEN_TEAM_TASKS} AS open_tasks, ${OPEN_TEAM_REQUESTS} AS open_requests FROM teams tm LEFT JOIN users l ON l.id = tm.lead_id`;
+const TEAM_SELECT = `SELECT tm.*, (SELECT COUNT(*) FROM users m WHERE m.team_id = tm.id AND m.active = 1) AS member_count,
+  ${OPEN_TEAM_TASKS} AS open_tasks, ${OPEN_TEAM_REQUESTS} AS open_requests FROM teams tm`;
 // Connected teams ("works with"): two-way, each pair stored once with the smaller id first.
 function connectedTeams(teamId) {
   return db.prepare(`SELECT tm.id, tm.name FROM team_connections c JOIN teams tm ON tm.id = CASE WHEN c.team_a_id = ? THEN c.team_b_id ELSE c.team_a_id END
     WHERE ? IN (c.team_a_id, c.team_b_id) ORDER BY tm.name`).all(teamId, teamId);
 }
 function teamView(u, t) {
-  const v = { id: t.id, name: t.name, lead_id: t.lead_id, lead_name: t.lead_name, member_count: t.member_count, mine: u.team_id === t.id,
+  const leads = leadsOf(t.id);
+  // lead_id / lead_name: the first lead, kept for older clients.
+  const v = { id: t.id, name: t.name, leads, lead_id: leads.length ? leads[0].id : null, lead_name: leads.length ? leads[0].name : null,
+    member_count: t.member_count, mine: u.team_id === t.id, i_lead: leads.some(l => l.id === u.id),
     can_see_counts: canSeeTeamCounts(u, t), connections: connectedTeams(t.id) };
   if (v.can_see_counts) { v.open_tasks = t.open_tasks; v.open_requests = t.open_requests; }
   return v;
@@ -669,34 +697,51 @@ app.get('/api/teams/:id', auth, (req, res) => {
   const team = teamView(u, t);
   const members = db.prepare(`SELECT m.id, m.name, m.role, m.email, m.active,
       (SELECT COUNT(*) FROM tasks t WHERE t.assignee_id = m.id AND t.status != 'completed' AND t.deleted_at IS NULL) AS open_tasks
-    FROM users m WHERE m.team_id = ? ${isBoss(u) ? '' : 'AND m.active = 1'} ORDER BY m.active DESC, m.id = ? DESC, m.name`).all(t.id, t.lead_id || 0)
-    .map(m => { const x = { ...m, active: !!m.active, is_lead: m.id === t.lead_id }; if (!team.can_see_counts) delete x.open_tasks; return x; });
-  const lead = t.lead_id ? db.prepare('SELECT id, name, role, email, team_id FROM users WHERE id = ?').get(t.lead_id) : null;
-  res.json({ team, lead, members, can_manage: isBoss(u), can_assign: canSeeTeamCounts(u, t) });
+    FROM users m WHERE m.team_id = ? ${isBoss(u) ? '' : 'AND m.active = 1'}
+    ORDER BY m.active DESC, m.id IN (SELECT user_id FROM team_leads WHERE team_id = ?) DESC, m.name`).all(t.id, t.id)
+    .map(m => { const x = { ...m, active: !!m.active, is_lead: team.leads.some(l => l.id === m.id) }; if (!team.can_see_counts) delete x.open_tasks; return x; });
+  const leads = db.prepare(`SELECT us.id, us.name, us.role, us.email, us.team_id FROM team_leads tl JOIN users us ON us.id = tl.user_id
+    WHERE tl.team_id = ? AND us.active = 1 ORDER BY tl.added_at, tl.rowid`).all(t.id).map(l => ({ ...l, member: l.team_id === t.id }));
+  res.json({ team, leads, lead: leads[0] || null, members, can_manage: isBoss(u), can_assign: canSeeTeamCounts(u, t) });
 });
-// A user with role "lead" who joins a team without a lead becomes its lead (setting the role and the team's lead used
-// to be two separate steps that were easy to miss). Returns { team_id, team_name } when it happened.
-function autoLead(userId) {
+// A user with role "lead" who joins a team (or becomes a lead while in one) is added as one of its leads. Callers only
+// run this when the team or the role actually changed, so a lead a manager removed stays removed. Returns
+// { team_id, team_name, name } when it happened.
+function autoLead(userId, by) {
   const m = db.prepare(`SELECT us.name, tm.id AS team_id, tm.name AS team_name FROM users us JOIN teams tm ON tm.id = us.team_id
-    WHERE us.id = ? AND us.active = 1 AND us.role = 'lead' AND tm.lead_id IS NULL`).get(userId);
-  if (!m || !db.prepare('UPDATE teams SET lead_id = ? WHERE id = ? AND lead_id IS NULL').run(userId, m.team_id).changes) return null;
+    WHERE us.id = ? AND us.active = 1 AND us.role = 'lead'`).get(userId);
+  if (!m || !db.prepare('INSERT OR IGNORE INTO team_leads (team_id, user_id, added_by) VALUES (?,?,?)').run(m.team_id, userId, by || null).changes) return null;
+  syncLegacyLead(m.team_id);
   return { team_id: m.team_id, team_name: m.team_name, name: m.name };
+}
+// Managers/admins: replace a team's leads (active team leads, managers or admins). Returns an error text or null.
+function setTeamLeads(teamId, ids, by) {
+  ids = [...new Set(ids.map(Number).filter(Boolean))];
+  if (ids.some(id => !validTeamLead(id))) return 'Team leads must be active team leads, managers or admins.';
+  db.transaction(() => {
+    db.prepare(`DELETE FROM team_leads WHERE team_id = ? AND user_id NOT IN (${ids.map(() => '?').join(',') || 'NULL'})`).run(teamId, ...ids);
+    const add = db.prepare('INSERT OR IGNORE INTO team_leads (team_id, user_id, added_by) VALUES (?,?,?)');
+    for (const id of ids) add.run(teamId, id, by);
+    syncLegacyLead(teamId);
+  })();
+  return null;
 }
 
 function teamFields(req, res, current) {
   const name = req.body.name !== undefined ? str(req.body.name, 120) : current && current.name;
   if (!name) { bad(res, 'Enter a team name.'); return null; }
   if (db.prepare('SELECT 1 FROM teams WHERE name = ? AND id != ?').get(name, current ? current.id : 0)) { bad(res, 'A team with this name already exists.'); return null; }
-  let lead_id = current ? current.lead_id : null;
-  if (req.body.lead_id !== undefined) {
-    lead_id = req.body.lead_id ? Number(req.body.lead_id) : null;
-    if (lead_id && !validTeamLead(lead_id)) { bad(res, 'The team lead must be an active team lead, manager or admin.'); return null; }
-  }
-  return { name, lead_id };
+  // Leads: `lead_ids` (the full list), or the older single `lead_id` (one lead, or none). Undefined = leave them as they are.
+  let lead_ids;
+  if (Array.isArray(req.body.lead_ids)) lead_ids = req.body.lead_ids;
+  else if (req.body.lead_id !== undefined) lead_ids = req.body.lead_id ? [req.body.lead_id] : [];
+  if (lead_ids && lead_ids.some(id => !validTeamLead(Number(id)))) { bad(res, 'Team leads must be active team leads, managers or admins.'); return null; }
+  return { name, lead_ids };
 }
 app.post('/api/teams', auth, requireBoss, (req, res) => {
   const f = teamFields(req, res); if (!f) return;
-  const r = db.prepare('INSERT INTO teams (name, lead_id) VALUES (?, ?)').run(f.name, f.lead_id);
+  const r = db.prepare('INSERT INTO teams (name) VALUES (?)').run(f.name);
+  if (f.lead_ids) setTeamLeads(r.lastInsertRowid, f.lead_ids, req.user.id);
   syncTeamChats();
   res.json({ team: db.prepare('SELECT * FROM teams WHERE id = ?').get(r.lastInsertRowid) });
 });
@@ -704,7 +749,8 @@ app.patch('/api/teams/:id', auth, requireBoss, (req, res) => {
   const team = db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.params.id));
   if (!team) return bad(res, 'Team not found.', 404);
   const f = teamFields(req, res, team); if (!f) return;
-  db.prepare('UPDATE teams SET name = ?, lead_id = ? WHERE id = ?').run(f.name, f.lead_id, team.id);
+  db.prepare('UPDATE teams SET name = ? WHERE id = ?').run(f.name, team.id);
+  if (f.lead_ids) setTeamLeads(team.id, f.lead_ids, req.user.id);
   syncTeamChats();
   res.json({ team: db.prepare('SELECT * FROM teams WHERE id = ?').get(team.id) });
 });
@@ -735,9 +781,18 @@ function memberTarget(req, res) {
 app.put('/api/teams/:id/members/:userId', auth, requireBoss, (req, res) => {
   const t = memberTarget(req, res); if (!t) return;
   db.prepare('UPDATE users SET team_id = ? WHERE id = ?').run(t.team.id, t.user.id);
-  const became_lead = autoLead(t.user.id);
+  const became_lead = t.user.team_id !== t.team.id ? autoLead(t.user.id, req.user.id) : null; // only when they actually moved
   syncTeamChats();
   res.json({ ok: true, became_lead });
+});
+// Managers/admins: the full list of this team's leads (replaces the old list).
+app.put('/api/teams/:id/leads', auth, requireBoss, (req, res) => {
+  const team = db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.params.id));
+  if (!team) return bad(res, 'Team not found.', 404);
+  const err = setTeamLeads(team.id, Array.isArray(req.body.user_ids) ? req.body.user_ids : [], req.user.id);
+  if (err) return bad(res, err);
+  syncTeamChats();
+  res.json({ leads: leadsOf(team.id) });
 });
 // Managers/admins: the full list of teams this team works with (replaces the old list).
 app.put('/api/teams/:id/connections', auth, requireBoss, (req, res) => {
@@ -764,7 +819,7 @@ app.delete('/api/teams/:id/members/:userId', auth, requireBoss, (req, res) => {
 // needs_team: posted without a team ("Not sure, let a manager decide"); a manager sends it to a team, which makes it open.
 const REQ_STATUSES = ['needs_team', 'open', 'assigned', 'delivered', 'closed', 'cancelled'];
 const REQ_SELECT = `SELECT r.*, rb.name AS requested_by_name, rb.team_id AS requester_team_id, rt.name AS requester_team_name,
-  rt.lead_id AS requester_lead_id, tm.name AS team_name, tm.lead_id AS team_lead_id,
+  tm.name AS team_name,
   t.assignee_id, a.name AS assignee_name, t.status AS task_status, ap.name AS asked_person_name, wf.name AS withdrawn_from_name
   FROM requests r JOIN users rb ON rb.id = r.requested_by LEFT JOIN teams rt ON rt.id = rb.team_id LEFT JOIN teams tm ON tm.id = r.target_team_id
   LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN users a ON a.id = t.assignee_id
@@ -772,11 +827,11 @@ const REQ_SELECT = `SELECT r.*, rb.name AS requested_by_name, rb.team_id AS requ
 // Archived (deleted) requests are only reachable from History (getAnyRequest).
 function getRequest(id) { return db.prepare(`${REQ_SELECT} WHERE r.id = ? AND r.deleted_at IS NULL`).get(id); }
 function getAnyRequest(id) { return db.prepare(`${REQ_SELECT} WHERE r.id = ?`).get(id); }
-// Who may see a request (board, page, files, History): managers/admins, the requester, members and the lead of the
-// requester's team, members and the lead of the target team, and the person doing (or who was doing) it.
+// Who may see a request (board, page, files, History): managers/admins, the requester, members and leads of the
+// requester's team, members and leads of the target team, and the person doing (or who was doing) it.
 function canSeeRequest(u, r) {
   return isBoss(u) || r.requested_by === u.id || (!!u.team_id && (u.team_id === r.requester_team_id || u.team_id === r.target_team_id))
-    || r.requester_lead_id === u.id || r.team_lead_id === u.id || r.assignee_id === u.id || r.withdrawn_from_id === u.id;
+    || isLeadOf(u, r.requester_team_id) || isLeadOf(u, r.target_team_id) || r.assignee_id === u.id || r.withdrawn_from_id === u.id;
 }
 const canSeeRequestFiles = canSeeRequest;
 // The same rule as SQL on alias r.
@@ -785,7 +840,7 @@ function requestScope(u, archived = false) {
   if (isBoss(u)) return { sql: '1=1' + live, params: [] };
   const team = u.team_id || 0;
   return { sql: `(r.requested_by = ? OR r.requested_by IN (SELECT id FROM users WHERE team_id = ?) OR r.target_team_id = ?
-      OR r.requested_by IN ${LED_MEMBERS} OR r.target_team_id IN (SELECT id FROM teams WHERE lead_id = ?) OR r.withdrawn_from_id = ?
+      OR r.requested_by IN ${LED_MEMBERS} OR r.target_team_id IN ${LED_TEAMS} OR r.withdrawn_from_id = ?
       OR r.task_id IN (SELECT id FROM tasks WHERE assignee_id = ?))${live}`, params: [u.id, team, team, u.id, u.id, u.id, u.id] };
 }
 // Teams a user may send requests to: their own team and the teams connected to it (managers/admins: any team).
@@ -803,9 +858,9 @@ function askablePeople(u) {
     WHERE us.active = 1 AND us.id != ? AND us.team_id IN (${ids.map(() => '?').join(',')}) ORDER BY us.team_id != ?, tm.name, us.name`)
     .all(u.id, ...ids, u.team_id || 0);
 }
-// Members of the request's team, its lead (even when not a member) and managers/admins can take an open request.
+// Members of the request's team, its leads (even when not members) and managers/admins can take an open request.
 function canTakeRequest(u, r) {
-  return isBoss(u) || (!!u.team_id && u.team_id === r.target_team_id) || (!!r.team_lead_id && r.team_lead_id === u.id);
+  return isBoss(u) || (!!u.team_id && u.team_id === r.target_team_id) || isLeadOf(u, r.target_team_id);
 }
 // The requester takes back a request someone is already doing, until it has been submitted or delivered.
 function canWithdraw(u, r) { return r.status === 'assigned' && r.requested_by === u.id && ['assigned', 'in_progress'].includes(r.task_status); }
@@ -815,7 +870,8 @@ function requestFlags(u, r) {
     can_take,
     take_blocked: can_take && approversFor(u.id, u.id, r).nobody ? nobodyCanApprove(r, u.id) : null,
     can_send_to_team: r.status === 'needs_team' && isBoss(u),
-    can_assign: r.status === 'open' && !!r.target_team_id && (isBoss(u) || r.team_lead_id === u.id),
+    can_assign: r.status === 'open' && !!r.target_team_id && (isBoss(u) || isLeadOf(u, r.target_team_id)),
+    i_lead: isLeadOf(u, r.target_team_id),
     can_cancel: ['open', 'needs_team'].includes(r.status) && (r.requested_by === u.id || isBoss(u)),
     can_withdraw: canWithdraw(u, r),
     can_delete: isBoss(u) && ['needs_team', 'open', 'cancelled', 'closed'].includes(r.status),
@@ -849,14 +905,14 @@ app.get('/api/requests/:id', auth, (req, res) => {
   const files = flags.can_see_files ? db.prepare(`SELECT ${fileCols} FROM files WHERE request_id = ? ORDER BY id`).all(r.id) : [];
   const delivered = flags.can_see_files && r.task_id && ['delivered', 'closed'].includes(r.status)
     ? db.prepare(`SELECT ${fileCols} FROM files WHERE task_id = ? ORDER BY id`).all(r.task_id) : [];
-  // Assign list: the team's members for its lead; every active person (with their team) for managers/admins.
+  // Assign list: the team's members for its leads; every active person (with their team) for managers/admins.
   const members = !flags.can_assign ? [] : isBoss(u)
     ? db.prepare(`SELECT us.id, us.name, us.role, us.team_id, tm.name AS team_name FROM users us LEFT JOIN teams tm ON tm.id = us.team_id
         WHERE us.active = 1 ORDER BY us.team_id IS NOT ?, tm.name IS NULL, tm.name, us.name`).all(r.target_team_id)
     : db.prepare(`SELECT us.id, us.name, us.role, us.team_id, tm.name AS team_name FROM users us LEFT JOIN teams tm ON tm.id = us.team_id
         WHERE us.team_id = ? AND us.active = 1 ORDER BY us.name`).all(r.target_team_id);
   const task = r.task_id ? db.prepare('SELECT * FROM tasks WHERE id = ?').get(r.task_id) : null;
-  const teams = flags.can_send_to_team ? db.prepare('SELECT id, name, lead_id FROM teams ORDER BY name').all() : [];
+  const teams = flags.can_send_to_team ? db.prepare('SELECT id, name, (SELECT COUNT(*) FROM team_leads WHERE team_id = teams.id) AS lead_count FROM teams ORDER BY name').all() : [];
   const events = db.prepare(`SELECT e.message, e.created_at, us.name AS user_name FROM request_events e JOIN users us ON us.id = e.user_id
     WHERE e.request_id = ? ORDER BY e.id`).all(r.id);
   res.json({ request: r, ...flags, files, delivered_files: delivered, members, teams, events, can_open_task: !!(task && canSeeTask(u, task)) });
@@ -869,14 +925,14 @@ app.post('/api/requests', auth, withUploads, (req, res) => {
   if (needed_by === undefined) return bad(res, 'Dates must be in YYYY-MM-DD format.');
   // "Ask a person": created already assigned to that person (a linked task with assigned_by = the requester).
   if (req.body.person_id) {
-    const p = db.prepare(`SELECT us.*, tm.name AS team_name, tm.lead_id AS team_lead_id FROM users us LEFT JOIN teams tm ON tm.id = us.team_id
+    const p = db.prepare(`SELECT us.*, tm.name AS team_name FROM users us LEFT JOIN teams tm ON tm.id = us.team_id
       WHERE us.id = ?`).get(Number(req.body.person_id));
     if (!p || !p.active) return bad(res, 'Choose an active person.');
     if (p.id === u.id) return bad(res, 'You can’t send a request to yourself. Add a task for yourself instead.');
     if (!p.team_id) return bad(res, `${p.name} isn’t in a team yet, so they can’t be asked directly.`);
     if (!allowedTargetTeams(u).some(t => t.id === p.team_id))
       return bad(res, `You can only ask people in your own team or in teams connected to it. ${p.team_name} isn’t one of them.`, 403);
-    const pseudo = { asked_person_id: p.id, requested_by: u.id, team_lead_id: p.team_lead_id, team_name: p.team_name };
+    const pseudo = { asked_person_id: p.id, requested_by: u.id, target_team_id: p.team_id, team_name: p.team_name };
     if (approversFor(p.id, u.id, pseudo).nobody) return bad(res, nobodyCanApprove(pseudo, p.id), 409);
     let id;
     db.transaction(() => {
@@ -921,6 +977,13 @@ app.post('/api/requests/:id/files', auth, canAttachToRequest, withUploads, (req,
   res.json({ ok: true });
 });
 
+// Why a request can no longer be taken or assigned (e.g. two leads clicked at once): "Already assigned to <name> by <lead>."
+function takenMessage(requestId) {
+  const x = db.prepare(`SELECT r.status, a.id AS aid, a.name AS assignee, b.id AS bid, b.name AS by FROM requests r
+    LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN users a ON a.id = t.assignee_id LEFT JOIN users b ON b.id = t.assigned_by WHERE r.id = ?`).get(requestId);
+  if (!x || !x.assignee) return x && x.status !== 'open' ? 'This request is no longer open.' : 'Someone else has already taken this request.';
+  return x.aid === x.bid ? `Already taken by ${x.assignee}.` : `Already assigned to ${x.assignee} by ${x.by}.`;
+}
 // Turn an open request into a task assigned to `assignee` (assigned_by = `by`). Only one claim can win.
 function createRequestTask(r, assignee, by) {
   return db.transaction(() => {
@@ -928,7 +991,7 @@ function createRequestTask(r, assignee, by) {
     const taskId = db.prepare(`INSERT INTO tasks (title, description, assignee_id, assigned_by, deadline) VALUES (?,?,?,?,?)`)
       .run(r.title, desc, assignee.id, by.id, r.needed_by).lastInsertRowid;
     const claimed = db.prepare(`UPDATE requests SET status = 'assigned', task_id = ? WHERE id = ? AND status = 'open'`).run(taskId, r.id);
-    if (!claimed.changes) { const e = new Error('Someone else has already taken this request.'); e.status = 409; throw e; }
+    if (!claimed.changes) { const e = new Error(takenMessage(r.id)); e.status = 409; throw e; }
     db.prepare('INSERT INTO task_updates (task_id,user_id,message,status) VALUES (?,?,?,?)').run(taskId, by.id,
       assignee.id === by.id ? `Took document request #${r.id}` : `Assigned from document request #${r.id} to ${assignee.name}`, 'assigned');
     return taskId;
@@ -942,8 +1005,8 @@ app.post('/api/requests/:id/take', auth, (req, res) => {
   const u = req.user, r = getRequest(Number(req.params.id));
   if (!r) return bad(res, 'Request not found.', 404);
   if (r.status === 'needs_team') return bad(res, 'A manager hasn’t chosen a team for this request yet.', 409);
-  if (r.status !== 'open') return bad(res, 'This request has already been taken.', 409);
-  if (!canTakeRequest(u, r)) return bad(res, 'Only members of the team this request is for, its lead and managers can take it.', 403);
+  if (r.status !== 'open') return bad(res, takenMessage(r.id), 409);
+  if (!canTakeRequest(u, r)) return bad(res, 'Only members of the team this request is for, its leads and managers can take it.', 403);
   if (approversFor(u.id, u.id, r).nobody) return bad(res, nobodyCanApprove(r, u.id), 409);
   sendRequestTask(res, r, u, u);
 });
@@ -951,8 +1014,8 @@ app.post('/api/requests/:id/assign', auth, (req, res) => {
   const u = req.user, r = getRequest(Number(req.params.id));
   if (!r) return bad(res, 'Request not found.', 404);
   if (r.status === 'needs_team') return bad(res, 'Send this request to a team first.', 409);
-  if (!isBoss(u) && r.team_lead_id !== u.id) return bad(res, 'Only managers and the team’s lead can assign this request.', 403);
-  if (r.status !== 'open') return bad(res, 'This request has already been taken.', 409);
+  if (!isBoss(u) && !isLeadOf(u, r.target_team_id)) return bad(res, 'Only managers and the team’s leads can assign this request.', 403);
+  if (r.status !== 'open') return bad(res, takenMessage(r.id), 409);
   const a = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.body.user_id));
   if (!a || !a.active) return bad(res, 'Choose an active person.');
   // Managers: anyone. The lead: the team's members, or themself (same as "Take this task").
@@ -1132,15 +1195,15 @@ function addChatMembers(convId, ids) {
   return ids.filter(id => ins.run(convId, id, last).changes);
 }
 
-// Team chats: one per team; members = the team's active members plus its lead. Called after every change to teams or people.
+// Team chats: one per team; members = the team's active members plus all its leads. Called after every change to teams or people.
 function syncTeamChats() {
   const changed = [];
   db.transaction(() => {
-    for (const t of db.prepare('SELECT id, name, lead_id FROM teams').all()) {
+    for (const t of db.prepare('SELECT id, name FROM teams').all()) {
       let c = db.prepare(`SELECT * FROM conversations WHERE type = 'team' AND team_id = ?`).get(t.id);
       if (!c) c = db.prepare(`INSERT INTO conversations (type, name, team_id) VALUES ('team', ?, ?) RETURNING *`).get(t.name, t.id);
       else if (c.name !== t.name) { db.prepare('UPDATE conversations SET name = ? WHERE id = ?').run(t.name, c.id); changed.push(...memberIds(c.id)); }
-      const want = db.prepare('SELECT id FROM users WHERE active = 1 AND (team_id = ? OR id = ?)').all(t.id, t.lead_id || 0).map(r => r.id);
+      const want = db.prepare('SELECT id FROM users WHERE active = 1 AND (team_id = ? OR id IN (SELECT user_id FROM team_leads WHERE team_id = ?))').all(t.id, t.id).map(r => r.id);
       const have = memberIds(c.id);
       const gone = have.filter(id => !want.includes(id));
       for (const id of gone) db.prepare('DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?').run(c.id, id);
@@ -1465,14 +1528,14 @@ app.get('/api/my-summary', auth, (req, res) => {
     FROM tasks t JOIN users a ON a.id = t.assignee_id WHERE ${rs.sql} AND t.assignee_id != ? ORDER BY t.submitted_at LIMIT 100`).all(...rs.params, u.id);
   // Open document requests for my team (or teams I lead), and my own requests that have been delivered.
   // `i_lead`: the user leads that team (the desktop app then says "assign it to someone").
-  const team_requests = db.prepare(`SELECT r.id, r.title, tm.name AS team_name, tm.lead_id = ? AS i_lead FROM requests r JOIN teams tm ON tm.id = r.target_team_id
-    WHERE r.status = 'open' AND r.deleted_at IS NULL AND r.requested_by != ? AND (r.target_team_id = ? OR tm.lead_id = ?) ORDER BY r.id DESC LIMIT 100`)
+  const team_requests = db.prepare(`SELECT r.id, r.title, tm.name AS team_name, tm.id IN ${LED_TEAMS} AS i_lead FROM requests r JOIN teams tm ON tm.id = r.target_team_id
+    WHERE r.status = 'open' AND r.deleted_at IS NULL AND r.requested_by != ? AND (r.target_team_id = ? OR tm.id IN ${LED_TEAMS}) ORDER BY r.id DESC LIMIT 100`)
     .all(u.id, u.id, u.team_id || 0, u.id).map(r => ({ ...r, i_lead: !!r.i_lead }));
   // Open requests for teams the user leads (part of the badge), and the ones flagged "still unassigned" for the
   // team's lead and for managers/admins.
-  const assign_requests = db.prepare(`${LEAD_OPEN_REQUESTS} AND tm.lead_id = ? ORDER BY r.id DESC LIMIT 100`).all(u.id)
+  const assign_requests = db.prepare(`${LEAD_OPEN_REQUESTS} AND tm.id IN ${LED_TEAMS} ORDER BY r.id DESC LIMIT 100`).all(u.id)
     .map(r => ({ id: r.id, title: r.title, team_name: r.team_name }));
-  const unassigned_reminders = db.prepare(`${LEAD_OPEN_REQUESTS} AND r.reminded_at IS NOT NULL ${isBoss(u) ? '' : 'AND tm.lead_id = ?'}
+  const unassigned_reminders = db.prepare(`${LEAD_OPEN_REQUESTS} AND r.reminded_at IS NOT NULL ${isBoss(u) ? '' : `AND tm.id IN ${LED_TEAMS}`}
     ORDER BY r.id DESC LIMIT 100`).all(...(isBoss(u) ? [] : [u.id])).map(r => ({ id: r.id, title: r.title, team_name: r.team_name }));
   const ready_requests = db.prepare(`SELECT id, title FROM requests WHERE requested_by = ? AND status = 'delivered' AND deleted_at IS NULL ORDER BY id DESC LIMIT 100`).all(u.id);
   // Managers/admins: requests posted without a team, waiting for someone to choose one.
@@ -1482,12 +1545,12 @@ app.get('/api/my-summary', auth, (req, res) => {
   const team_asks = db.prepare(`SELECT r.id, r.title, rb.name AS requested_by_name, rt.name AS requester_team_name, ap.name AS person_name
     FROM requests r JOIN teams tm ON tm.id = r.target_team_id JOIN users rb ON rb.id = r.requested_by LEFT JOIN teams rt ON rt.id = rb.team_id
     JOIN users ap ON ap.id = r.asked_person_id
-    WHERE r.status = 'assigned' AND r.deleted_at IS NULL AND tm.lead_id = ? AND r.requested_by != ? AND r.asked_person_id != ? ORDER BY r.id DESC LIMIT 100`).all(u.id, u.id, u.id);
+    WHERE r.status = 'assigned' AND r.deleted_at IS NULL AND tm.id IN ${LED_TEAMS} AND r.requested_by != ? AND r.asked_person_id != ? ORDER BY r.id DESC LIMIT 100`).all(u.id, u.id, u.id);
   // Requests withdrawn in the last 3 days from this person, or from a member of a team the user leads.
   const withdrawn = db.prepare(`SELECT r.id, r.title, rb.name AS requested_by_name FROM requests r JOIN users rb ON rb.id = r.requested_by
     LEFT JOIN teams tm ON tm.id = r.target_team_id
     WHERE r.status = 'cancelled' AND r.deleted_at IS NULL AND r.withdrawn_from_id IS NOT NULL AND r.closed_at >= ? AND r.requested_by != ?
-      AND (r.withdrawn_from_id = ? OR tm.lead_id = ?) ORDER BY r.id DESC LIMIT 100`)
+      AND (r.withdrawn_from_id = ? OR tm.id IN ${LED_TEAMS}) ORDER BY r.id DESC LIMIT 100`)
     .all(new Date(Date.now() - 3 * 864e5).toISOString(), u.id, u.id, u.id);
   res.json({ user: publicUser(u), open: counts.open || 0, overdue: counts.overdue || 0, tasks, recently_approved, approvals, team_requests,
     ready_requests, needs_team_requests, assign_requests, unassigned_reminders, team_asks, withdrawn, chat_unread: chatUnreadTotal(u.id) });
@@ -1531,7 +1594,7 @@ app.get('/api/dashboard', auth, (req, res) => {
         FROM requests r LEFT JOIN teams tm ON tm.id = r.target_team_id JOIN users rb ON rb.id = r.requested_by
         WHERE r.deleted_at IS NULL AND (r.status = 'needs_team' OR (r.status = 'open' AND r.target_team_id IS NOT NULL))
         ORDER BY r.status = 'open', r.needed_by IS NULL, r.needed_by, r.id LIMIT 50`).all()
-    : u.role === 'lead' ? db.prepare(`${LEAD_OPEN_REQUESTS} AND tm.lead_id = ? ORDER BY r.needed_by IS NULL, r.needed_by, r.id LIMIT 50`).all(u.id) : [];
+    : db.prepare(`${LEAD_OPEN_REQUESTS} AND tm.id IN ${LED_TEAMS} ORDER BY r.needed_by IS NULL, r.needed_by, r.id LIMIT 50`).all(u.id);
 
   res.json({ totals, projects, people, due_soon, awaiting_me, to_assign });
 });

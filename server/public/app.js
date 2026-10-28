@@ -525,13 +525,13 @@
     const byId = Object.fromEntries(users.map(u => [u.id, u]));
     // "Lead of <team>" next to the role; a team lead who leads no team gets a warning.
     const roleCell = u => {
-      const led = teams.filter(t => t.lead_id === u.id);
+      const led = teams.filter(t => t.leads.some(l => l.id === u.id));
       if (led.length) return `${ROLE[u.role]}<div class="muted" style="font-size:.8125rem">Lead of ${led.map(t => `<a href="#/teams/${t.id}">${esc(t.name)}</a>`).join(', ')}</div>`;
       if (u.role === 'lead' && u.active) return `${ROLE[u.role]}<div class="warn-text" style="margin:2px 0 0;font-size:.8125rem">⚠ Not leading a team yet – set it on the <a href="#/teams">Teams page</a></div>`;
       return ROLE[u.role];
     };
     app.innerHTML = `
-      <div class="page-head"><div><h1>People</h1><p>Add people and choose their team. A team lead added to a team without a lead becomes its lead.</p></div>
+      <div class="page-head"><div><h1>People</h1><p>Add people and choose their team. A team lead added to a team becomes one of its leads.</p></div>
         <button class="btn" id="newUser">Add a person</button></div>
       <div class="card table-wrap"><table>
         <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Team</th><th>Status</th><th></th></tr></thead>
@@ -552,14 +552,14 @@
       </div>
       <label class="f"><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="8" autocomplete="new-password" ${u ? '' : 'required'}></label>
       ${u && u.id !== me.id ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
-      <p class="muted" style="font-size:.8125rem;margin-top:-4px">A team’s lead can assign tasks to the people in that team.</p>
+      <p class="muted" style="font-size:.8125rem;margin-top:-4px">A team’s leads can assign tasks to the people in that team.</p>
       ${modalActions(u ? 'Save changes' : 'Add person')}`,
       async fd => {
         const body = Object.fromEntries(fd);
         if (u && u.id !== me.id) body.active = fd.get('active') === 'on';
         if (u && !body.password) delete body.password;
         const r = await api(u ? '/users/' + u.id : '/users', { method: u ? 'PATCH' : 'POST', body });
-        const lead = r.became_lead ? `${r.became_lead.name} is now the lead of ${r.became_lead.team_name}.` : '';
+        const lead = r.became_lead ? `${r.became_lead.name} is now a lead of ${r.became_lead.team_name}.` : '';
         toast(u ? lead || 'Changes saved' : `${body.name} added. ${lead} Share their email and temporary password with them.`); router();
       });
     $('#newUser').onclick = () => form();
@@ -572,11 +572,11 @@
     const { teams } = await api('/teams');
     teams.sort((a, b) => b.mine - a.mine); // your own team first (the server sorts by name)
     app.innerHTML = `
-      <div class="page-head"><div><h1>Teams</h1><p>Every team and who is in it. A team’s lead assigns its work and its incoming document requests.</p></div>
+      <div class="page-head"><div><h1>Teams</h1><p>Every team and who is in it. A team’s leads assign its work and its incoming document requests.</p></div>
         ${isBoss() ? `<button class="btn" id="newTeam">Add a team</button>` : ''}</div>
       ${teams.length ? `<div class="team-grid">${teams.map(t => `<a class="card team-card${t.mine ? ' mine' : ''}" href="#/teams/${t.id}">
         <div class="row-top"><h2>${esc(t.name)}</h2>${t.mine ? '<span class="pill accent">Your team</span>' : ''}</div>
-        <p class="${t.lead_name ? '' : isBoss() ? 'warn-text' : 'muted'}">${t.lead_name ? 'Lead: ' + esc(t.lead_name) : isBoss() ? '⚠ No lead' : 'No lead yet'}</p>
+        <p class="${t.leads.length ? '' : isBoss() ? 'warn-text' : 'muted'}">${t.leads.length ? (t.leads.length === 1 ? 'Lead: ' : 'Leads: ') + esc(t.leads.map(l => l.name).join(', ')) : isBoss() ? '⚠ No lead' : 'No lead yet'}</p>
         <p class="muted">${plural(t.member_count, 'active member')}</p>
         ${t.connections.length ? `<p class="muted">Works with: ${esc(t.connections.map(c => c.name).join(', '))}</p>` : ''}
         ${t.can_see_counts ? `<p class="team-counts"><span><b>${t.open_tasks}</b> open task${t.open_tasks === 1 ? '' : 's'}</span><span><b>${t.open_requests}</b> open request${t.open_requests === 1 ? '' : 's'}</span></p>` : ''}
@@ -587,7 +587,7 @@
   function teamNameForm(t) {
     openModal(`<h2 style="font-size:1.25rem">${t ? 'Rename ' + esc(t.name) : 'Add a team'}</h2>
       <label class="f"><span>Team name</span><input name="name" required maxlength="120" value="${esc(t?.name)}"></label>
-      ${t ? '' : '<p class="muted" style="font-size:.8125rem;margin-top:-4px">Then open the team to add members and set its lead.</p>'}
+      ${t ? '' : '<p class="muted" style="font-size:.8125rem;margin-top:-4px">Then open the team to add members and choose its leads.</p>'}
       ${modalActions(t ? 'Save' : 'Add team')}`, async fd => {
       const name = String(fd.get('name')).trim();
       if (!name) throw new Error('Enter a team name.');
@@ -603,11 +603,12 @@
     app.innerHTML = `
       <p style="margin:0 0 10px"><a href="#/teams">← All teams</a></p>
       <div class="page-head"><div><h1>${esc(t.name)}</h1><p>${t.mine ? 'Your team · ' : ''}${plural(t.member_count, 'active member')}${counts ? ` · ${plural(t.open_tasks, 'open task')} · ${plural(t.open_requests, 'open request')}` : ''}</p></div>
-        ${d.can_manage ? `<div class="inline-actions"><button class="btn" id="addMember">Add member</button><button class="btn ghost" id="setLead">Set lead</button>
+        ${d.can_manage ? `<div class="inline-actions"><button class="btn" id="addMember">Add member</button><button class="btn ghost" id="setLead">Leads</button>
           <button class="btn ghost" id="renameTeam">Rename</button><button class="btn danger" id="delTeam">Delete</button></div>` : ''}</div>
-      <section class="card" style="margin-bottom:20px"><h2>Lead</h2>
-        ${d.lead ? `<p style="margin:0"><b>${esc(d.lead.name)}</b> <span class="muted">${ROLE[d.lead.role]} · ${esc(d.lead.email)}${d.lead.team_id === t.id ? '' : ' · not a member of this team'}</span></p>`
-          : `<p class="${d.can_manage ? 'warn-text' : 'muted'}" style="margin:0">${d.can_manage ? '⚠ This team has no lead. Its document requests can only be assigned and approved by a manager. Use “Set lead”.' : 'This team has no lead yet.'}</p>`}
+      <section class="card" style="margin-bottom:20px"><h2>${d.leads.length > 1 ? 'Leads' : 'Lead'}</h2>
+        ${d.leads.length ? `<ul class="rows">${d.leads.map(l => `<li><b>${esc(l.name)}</b> <span class="muted">${ROLE[l.role]} · ${esc(l.email)}${l.member ? '' : ' · not a member of this team'}</span></li>`).join('')}</ul>
+          ${d.leads.length > 1 ? '<p class="muted" style="margin:8px 0 0;font-size:.8125rem">All leads are equal: any of them can assign this team’s work and requests and approve it.</p>' : ''}`
+          : `<p class="${d.can_manage ? 'warn-text' : 'muted'}" style="margin:0">${d.can_manage ? '⚠ This team has no lead. Its document requests can only be assigned and approved by a manager. Use “Leads”.' : 'This team has no lead yet.'}</p>`}
       </section>
       <section class="card" style="margin-bottom:20px"><h2>Connected teams</h2>
         <p class="muted" style="margin-top:0">Members of connected teams can send document requests to each other.${d.can_manage ? ' Managers set this; it works both ways.' : ''}</p>
@@ -635,10 +636,10 @@
       try { await api(`/teams/${t.id}/connections`, { method: 'PUT', body: { team_ids: ids } }); toast('Connected teams saved'); }
       catch (e) { toast(e.message); router(); }
     };
-    const leadToast = r => toast(r && r.became_lead ? `${r.became_lead.name} is now the lead of ${r.became_lead.team_name}` : 'Added to the team');
+    const leadToast = r => toast(r && r.became_lead ? `${r.became_lead.name} is now a lead of ${r.became_lead.team_name}` : 'Added to the team');
     app.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
       const m = d.members.find(x => x.id === Number(b.dataset.remove));
-      if (!confirm(`Remove ${m.name} from ${t.name}?${m.is_lead ? ' They stay the team’s lead until you set another lead.' : ''}`)) return;
+      if (!confirm(`Remove ${m.name} from ${t.name}?${m.is_lead ? ' They stay one of its leads until you change the leads.' : ''}`)) return;
       try { await api(`/teams/${t.id}/members/${m.id}`, { method: 'DELETE' }); toast('Removed from the team'); router(); } catch (e) { toast(e.message); }
     });
     $('#renameTeam').onclick = () => teamNameForm(t);
@@ -650,7 +651,7 @@
       const people = users.filter(u => u.active && u.team_id !== t.id && !(u.role === 'admin' && me.role !== 'admin'))
         .map(u => ({ ...u, team_name: u.team_name ? 'now in ' + u.team_name : 'no team' }));
       openModal(`<h2 style="font-size:1.25rem">Add a member to ${esc(t.name)}</h2>
-        ${pickerHtml('Person', 'Someone already in another team moves to this one. A team lead added to a team without a lead becomes its lead.')}
+        ${pickerHtml('Person', 'Someone already in another team moves to this one. A team lead added to the team becomes one of its leads.')}
         ${modalActions('Add member')}`, async () => {
         const [uid] = picker.values();
         if (!uid) throw new Error('Choose a person.');
@@ -658,18 +659,20 @@
       });
       const picker = personPicker(modalForm.querySelector('.picker'), people, { multiple: false });
     };
-    // Lead choices: active team leads, managers and admins; say if they already lead another team.
+    // Leads (several, all equal): active team leads, managers and admins; say if they already lead another team.
     $('#setLead').onclick = () => {
-      const leads = users.filter(u => u.active && u.role !== 'employee');
-      const leading = id => teams.filter(x => x.lead_id === id && x.id !== t.id).map(x => x.name);
-      openModal(`<h2 style="font-size:1.25rem">Set the lead of ${esc(t.name)}</h2>
-        <label class="f"><span>Team lead</span><select name="lead_id"><option value="">No lead</option>
-          ${leads.map(l => { const o = leading(l.id); return `<option value="${l.id}"${l.id === t.lead_id ? ' selected' : ''}>${esc(l.name)} (${ROLE[l.role]}${l.team_name ? ', ' + esc(l.team_name) : ''})${o.length ? ' – already leads ' + esc(o.join(', ')) : ''}</option>`; }).join('')}</select></label>
-        <p class="muted" style="font-size:.8125rem;margin-top:-4px">Only active team leads, managers and admins can lead a team. Change someone’s role on the People page.</p>
-        ${modalActions('Save')}`, async fd => {
-        await api('/teams/' + t.id, { method: 'PATCH', body: { lead_id: fd.get('lead_id') || null } });
-        toast('Team lead saved'); router();
+      const leading = id => teams.filter(x => x.id !== t.id && x.leads.some(l => l.id === id)).map(x => x.name);
+      const people = users.filter(u => u.active && u.role !== 'employee').map(u => {
+        const o = leading(u.id);
+        return { ...u, team_name: [u.team_name, o.length ? 'already leads ' + o.join(', ') : ''].filter(Boolean).join(' · ') };
       });
+      openModal(`<h2 style="font-size:1.25rem">Leads of ${esc(t.name)}</h2>
+        ${pickerHtml('Leads', 'All leads are equal. Only active team leads, managers and admins can lead a team; change someone’s role on the People page.')}
+        ${modalActions('Save leads')}`, async () => {
+        const r = await api(`/teams/${t.id}/leads`, { method: 'PUT', body: { user_ids: picker.values() } });
+        toast(r.leads.length ? 'Leads saved' : 'This team has no lead now'); router();
+      });
+      const picker = personPicker(modalForm.querySelector('.picker'), people, { selected: people.filter(p => d.leads.some(l => l.id === p.id)) });
     };
   }
 
@@ -734,12 +737,12 @@
   }
 
   // "Assign to" for an open request (request page and the dashboard's "Requests to assign"): one person, type to search.
-  // The team's lead sees its active members; managers/admins see everyone, the request's team first (server order).
+  // The team's leads see its active members; managers/admins see everyone, the request's team first (server order).
   // The current user comes first as "<name> (me)" when they may take it; choosing it is the same as "Take this task".
   const assignable = d => {
     const team = m => m.team_id === d.request.target_team_id ? `${m.team_name} (this request’s team)` : m.team_name || 'No team';
     const others = d.members.filter(m => m.id !== me.id).map(m => ({ ...m, team_name: team(m) }));
-    const mine = me.team_id !== d.request.target_team_id && d.request.team_lead_id === me.id ? `Lead of ${d.request.team_name}` : team(me);
+    const mine = me.team_id !== d.request.target_team_id && d.i_lead ? `Lead of ${d.request.team_name}` : team(me);
     return d.can_take && !d.take_blocked ? [{ ...me, name: me.name + ' (me)', team_name: mine }, ...others] : others;
   };
   const noOthers = d => `No other members in ${esc(d.request.team_name)} yet – add them on the <a href="#/teams/${d.request.target_team_id}">Teams page</a>.`;
@@ -815,7 +818,7 @@
         </div>
         ${d.can_send_to_team ? `<section class="card"><h2>Send to team</h2>
           <p class="muted" style="margin-top:0">The requester wasn’t sure which team should do this. Choose one; its members will be notified.</p>
-          <ul class="rows">${d.teams.map(t => `<li class="row-top"><span>${esc(t.name)}${t.lead_id ? '' : ' <span class="muted">· no lead</span>'}</span>
+          <ul class="rows">${d.teams.map(t => `<li class="row-top"><span>${esc(t.name)}${t.lead_count ? '' : ' <span class="muted">· no lead</span>'}</span>
             <button class="btn ghost small" data-sendteam="${t.id}">Send</button></li>`).join('')}</ul></section>` : ''}
         ${d.can_assign ? `<section class="card"><h2>Assign to</h2><form id="assignForm">${assignPickerHtml(d)}</form></section>` : ''}
       </div>`;
@@ -1248,7 +1251,7 @@
     const c = chat.conv, manage = c.can_manage;
     const people = manage ? (await api('/chat/people')).people.filter(p => !chat.members.some(m => m.id === p.id)) : [];
     openModal(`<h2 style="font-size:1.25rem">People in ${esc(c.name)}</h2>
-      ${c.type === 'team' ? '<p class="muted">Team chats follow team membership (and include the team’s lead).</p>' : ''}
+      ${c.type === 'team' ? '<p class="muted">Team chats follow team membership (and include the team’s leads).</p>' : ''}
       <ul class="rows chat-people">${chat.members.map(m => `<li><span><b>${esc(m.name)}</b>${m.id === me.id ? ' (you)' : ''}${m.id === c.created_by && c.type === 'group' ? ' <span class="pill accent">Made the group</span>' : ''}${m.active ? '' : ' <span class="muted">(deactivated)</span>'}
         <small class="muted">${esc(m.team_name || '')}</small></span>
         ${manage && m.id !== me.id ? `<button type="button" class="btn danger small" data-rmm="${m.id}">Remove</button>` : ''}</li>`).join('')}</ul>

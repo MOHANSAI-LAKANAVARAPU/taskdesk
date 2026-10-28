@@ -248,6 +248,18 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   if (!db.prepare('PRAGMA table_info(files)').all().some(c => c.name === 'message_id'))
     db.exec('ALTER TABLE files ADD COLUMN message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE');
   db.exec('CREATE INDEX IF NOT EXISTS idx_files_message ON files(message_id)');
+  // Several leads per team, all equal. teams.lead_id stays (kept equal to the first lead by server.js) but no check uses it.
+  // When the table is first created, every existing teams.lead_id is copied into it once.
+  const hadLeads = !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'team_leads'`).get();
+  db.exec(`CREATE TABLE IF NOT EXISTS team_leads (
+      team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      added_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      added_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (team_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_leads_user ON team_leads(user_id);`);
+  if (!hadLeads) db.exec('INSERT OR IGNORE INTO team_leads (team_id, user_id) SELECT id, lead_id FROM teams WHERE lead_id IS NOT NULL');
 })();
 
 // Create the first admin account if there are no users yet.
