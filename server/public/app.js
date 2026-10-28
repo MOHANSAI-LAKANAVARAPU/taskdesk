@@ -7,8 +7,11 @@
   // ---------- utilities ----------
   const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const isBoss = () => me && (me.role === 'admin' || me.role === 'manager');
+  const isTM = () => me && me.role === 'team_manager'; // manages only the teams in me.managed_teams
   const canAssign = () => me && me.role !== 'employee';
-  const ROLE = { admin: 'Admin', manager: 'Manager', lead: 'Team lead', employee: 'Employee' };
+  const ROLE = { admin: 'Admin', manager: 'Manager (all teams)', team_manager: 'Team manager', lead: 'Team lead', employee: 'Employee' };
+  // Teams where the user has a lead's powers: teams they lead or (team managers) manage.
+  const runsTeam = t => t.leads.some(l => l.id === me.id) || (t.managers || []).some(m => m.id === me.id);
   const STATUS = { assigned: 'Not started', in_progress: 'In progress', submitted: 'Waiting for approval', completed: 'Completed' };
   const PRIORITY = { low: 'Low', medium: 'Medium', high: 'High', urgent: 'Urgent' };
   const PSTATUS = { active: 'Active', on_hold: 'On hold', closed: 'Closed' };
@@ -239,7 +242,7 @@
   async function viewDashboard() {
     const d = await api('/dashboard');
     const t = d.totals;
-    const greeting = me.role === 'employee' ? 'Your tasks at a glance' : isBoss() ? 'All projects and people' : 'Your team’s work';
+    const greeting = me.role === 'employee' ? 'Your tasks at a glance' : isBoss() ? 'All projects and people' : isTM() ? 'Your teams’ work' : 'Your team’s work';
     const stat = (n, l, c, href) => `<a class="stat" href="${href}" style="--c:${c}"><b>${n}</b><span>${l}</span></a>`;
     const legend = `<div class="legend"><span><i style="background:var(--s-done)"></i>Completed</span><span><i style="background:var(--s-prog)"></i>In progress</span><span><i style="background:var(--s-over)"></i>Overdue</span><span><i style="background:var(--soft)"></i>Not started</span></div>`;
 
@@ -301,23 +304,24 @@
 
   // ---------- task list ----------
   // ---------- team tabs (Tasks, Requests, Projects, History) ----------
-  // "All", then the teams the user works with: managers/admins every team + "No team"; leads the teams they lead and
-  // their own team; employees their own team (no bar without a team). The tab only narrows what the server already
-  // allows (the lists filter with ?team= inside the user's normal scope). The choice is kept in the URL.
+  // "All", then the teams the user works with: managers/admins every team + "No team"; leads and team managers the
+  // teams they lead or manage and their own team; employees their own team (no bar without a team). The tab only
+  // narrows what the server already allows (the lists filter with ?team= inside the user's normal scope). The choice
+  // is kept in the URL.
   function teamTabsFor(teams) {
     const tab = t => ({ id: String(t.id), name: t.name });
     if (isBoss()) return [{ id: 'all', name: 'All' }, ...teams.map(tab), { id: 'none', name: 'No team' }];
-    const led = teams.filter(t => t.leads.some(l => l.id === me.id));
+    const led = teams.filter(runsTeam);
     const own = teams.find(t => t.id === me.team_id);
     const mine = own && !led.includes(own) ? [...led, own] : led;
     return mine.length ? [{ id: 'all', name: 'All' }, ...mine.map(tab)] : [];
   }
-  // Without ?team=: managers "All", leads their first led team, employees their team.
+  // Without ?team=: managers "All", leads and team managers their first led/managed team, employees their team.
   function currentTeamTab(q, teams, tabs) {
     const v = q.get('team');
     if (tabs.some(t => t.id === v)) return v;
     if (!tabs.length || isBoss()) return 'all';
-    const led = teams.find(t => t.leads.some(l => l.id === me.id));
+    const led = teams.find(runsTeam);
     return String(led ? led.id : me.team_id);
   }
   const tabsHtml = (tabs, cur) => tabs.length ? `<nav class="team-tabs" aria-label="Teams">${tabs.map(t =>
@@ -526,7 +530,11 @@
 
   async function taskForm(task, { preset } = {}) { // preset: a person id to pick in a new task (Teams page "Assign a task")
     const [{ projects }, { users }] = await Promise.all([api('/projects'), api('/users')]);
-    const assignable = users.filter(u => u.active); // the server only lists people this user may assign to
+    // The server lists people this user works with; it also refuses (canAssignTo) team managers for leads and, for team
+    // managers, anyone outside the teams they manage.
+    const managed = id => (me.managed_teams || []).some(x => x.id === id);
+    const assignable = users.filter(u => u.active && (isBoss() || u.id === me.id
+      || (isTM() ? managed(u.team_id) : u.role !== 'team_manager')));
     if (!assignable.length) { toast(isBoss() ? 'Add people first, then assign tasks.' : 'No one is in the teams you lead yet. Ask a manager to add team members.'); return; }
     const t = task || { priority: 'medium' };
     openModal(`
@@ -759,8 +767,13 @@
   }
 
   // ---------- people (managers/admins: Teams page → "All people", and Edit on a team's member rows) ----------
-  // "Lead of <team>" next to the role; a team lead who leads no team gets a warning.
+  // "Lead of <team>" / "Manages <teams>" next to the role; a team lead who leads no team (or a team manager who
+  // manages none) gets a warning.
   function roleCell(u, teams) {
+    const link = list => list.map(t => `<a href="#/teams/${t.id}">${esc(t.name)}</a>`).join(', ');
+    if (u.role === 'team_manager') return u.managed_teams && u.managed_teams.length
+      ? `${ROLE[u.role]}<div class="muted" style="font-size:.8125rem">Manages ${link(u.managed_teams)}</div>`
+      : `${ROLE[u.role]}${u.active ? '<div class="warn-text" style="margin:2px 0 0;font-size:.8125rem">⚠ Doesn’t manage a team yet – choose teams in Edit</div>' : ''}`;
     const led = teams.filter(t => t.leads.some(l => l.id === u.id));
     if (led.length) return `${ROLE[u.role]}<div class="muted" style="font-size:.8125rem">Lead of ${led.map(t => `<a href="#/teams/${t.id}">${esc(t.name)}</a>`).join(', ')}</div>`;
     if (u.role === 'lead' && u.active) return `${ROLE[u.role]}<div class="warn-text" style="margin:2px 0 0;font-size:.8125rem">⚠ Not leading a team yet – set it on the <a href="#/teams">Teams page</a></div>`;
@@ -770,7 +783,8 @@
   // New people get a welcome email with a "Set your password" link when email is set up; a typed password is the fallback.
   async function personForm(u, teams) {
     const emailOn = (await api('/me/email-prefs').catch(() => ({}))).email_enabled;
-    const roles = me.role === 'admin' ? ROLE : { manager: 'Manager', lead: 'Team lead', employee: 'Employee' };
+    const { admin, ...notAdmin } = ROLE;
+    const roles = me.role === 'admin' ? ROLE : notAdmin;
     openModal(`
       <h2 style="font-size:1.25rem">${u ? 'Edit ' + esc(u.name) : 'Add a person'}</h2>
       <div class="grid2">
@@ -780,6 +794,7 @@
         <label class="f"><span>Team</span><select name="team_id"><option value="">No team</option>
           ${teams.map(t => `<option value="${t.id}"${u && t.id === u.team_id ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select></label>
       </div>
+      <div id="tmTeams"${u?.role === 'team_manager' ? '' : ' hidden'}>${pickerHtml('Manages teams', 'A team manager has a lead’s powers in these teams only, and can add and remove their members and set their leads. Their own team can be one of them, but doesn’t have to be.').replace('Type a name…', 'Type a team…')}</div>
       ${!u && emailOn ? `<label class="check-row"><input type="checkbox" name="send_welcome" id="sendWelcome" checked> Send a welcome email with a “Set your password” link (valid 48 hours)</label>` : ''}
       <label class="f" id="pwField"${!u && emailOn ? ' hidden' : ''}><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="8" autocomplete="new-password" ${u || emailOn ? '' : 'required'}></label>
       ${u && emailOn && u.active && !u.removed && canEditPerson(u) ? `<p style="margin:-6px 0 12px;font-size:.875rem"><button type="button" class="btn ghost small" id="resendWelcome">Resend welcome email</button> <span class="muted">A new “Set your password” link to ${esc(u.email)}; earlier links stop working.</span></p>` : ''}
@@ -792,10 +807,18 @@
         if (u && u.id !== me.id) body.active = fd.get('active') === 'on';
         if (u && !body.password) delete body.password;
         if (!u && emailOn) { body.send_welcome = fd.get('send_welcome') === 'on'; if (body.send_welcome) delete body.password; }
+        if (body.role === 'team_manager') {
+          body.managed_team_ids = tmPicker.values();
+          if (!body.managed_team_ids.length) throw new Error('Choose at least one team this team manager manages.');
+        }
         const r = await api(u ? '/users/' + u.id : '/users', { method: u ? 'PATCH' : 'POST', body });
         const lead = r.became_lead ? `${r.became_lead.name} is now a lead of ${r.became_lead.team_name}.` : '';
         toast(u ? lead || 'Changes saved' : [`${body.name} added.`, lead, r.welcome_sent ? `Welcome email sent to ${body.email}.` : 'Share their email and temporary password with them.'].filter(Boolean).join(' ')); router();
       });
+    const teamPicks = teams.map(t => ({ id: t.id, name: t.name }));
+    const tmPicker = personPicker(modalForm.querySelector('#tmTeams .picker'), teamPicks,
+      { selected: teamPicks.filter(t => (u?.managed_teams || []).some(x => x.id === t.id)) });
+    modalForm.querySelector('select[name=role]').onchange = e => { $('#tmTeams').hidden = e.target.value !== 'team_manager'; };
     const sw = $('#sendWelcome');
     if (sw) sw.onchange = () => { $('#pwField').hidden = sw.checked; $('#pwField input').required = !sw.checked; };
     const rw = $('#resendWelcome');
@@ -831,29 +854,31 @@
     try { await api(`/users/${u.id}/restore`, { method: 'POST' }); toast('Restored. Add them to a team again if needed.'); router(); } catch (e) { toast(e.message); }
   }
   const canEditPerson = u => !(u.role === 'admin' && me.role !== 'admin');
-  // The view switch at the top of the Teams page (managers/admins only).
-  const teamsViewSwitch = people => isBoss() ? `<div class="seg" role="group" aria-label="View">
+  // The view switch at the top of the Teams page (managers/admins; team managers see the people of their teams).
+  const teamsViewSwitch = people => isBoss() || isTM() ? `<div class="seg" role="group" aria-label="View">
       <a href="#/teams" aria-pressed="${!people}">Teams</a><a href="#/teams?view=people" aria-pressed="${people}">All people</a></div>` : '';
   // "All people" (the former People page): everyone, including people without a team and deactivated accounts.
+  // Team managers: the people of the teams they manage (the server limits the list); they can't add or edit people.
   async function viewAllPeople() {
     const { q, go } = pageQuery('teams');
     const team = q.get('team') || '', role = q.get('role') || '', status = q.get('status') || '', text = (q.get('q') || '').toLowerCase();
     // Removed people only appear with the "Removed" status filter.
-    const [{ users }, { teams }] = await Promise.all([api('/users' + (status === 'removed' ? '?removed=1' : '')), api('/teams')]);
+    const [{ users }, all] = await Promise.all([api('/users' + (status === 'removed' && isBoss() ? '?removed=1' : '')), api('/teams')]);
+    const teams = isBoss() ? all.teams : all.teams.filter(runsTeam);
     const byId = Object.fromEntries(users.map(u => [u.id, u]));
     const list = users.filter(u => (!team || (team === 'none' ? !u.team_id : String(u.team_id) === team))
       && (!role || u.role === role) && (status === 'removed' ? u.removed : !u.removed && (!status || (status === 'active' ? u.active : !u.active)))
       && (!text || u.name.toLowerCase().includes(text) || u.email.toLowerCase().includes(text)));
     app.innerHTML = `
-      <div class="page-head"><div><h1>All people</h1><p>${list.length} of ${users.length} people. Add people and choose their team. A team lead added to a team becomes one of its leads.</p></div>
-        <div class="inline-actions">${teamsViewSwitch(true)}<button class="btn" id="newUser">Add a person</button></div></div>
+      <div class="page-head"><div><h1>${isBoss() ? 'All people' : 'People in your teams'}</h1><p>${list.length} of ${users.length} people. ${isBoss() ? 'Add people and choose their team. A team lead added to a team becomes one of its leads.' : 'The people in the teams you manage. Add or remove members and set leads on each team’s page.'}</p></div>
+        <div class="inline-actions">${teamsViewSwitch(true)}${isBoss() ? '<button class="btn" id="newUser">Add a person</button>' : ''}</div></div>
       <div class="filters">
         <input type="search" id="pSearch" class="search" placeholder="Search name or email" aria-label="Search people" value="${esc(q.get('q') || '')}">
-        <select id="pTeam" aria-label="Filter by team"><option value="">All teams</option><option value="none"${team === 'none' ? ' selected' : ''}>No team</option>
+        <select id="pTeam" aria-label="Filter by team"><option value="">All teams</option>${isBoss() ? `<option value="none"${team === 'none' ? ' selected' : ''}>No team</option>` : ''}
           ${teams.map(t => `<option value="${t.id}"${String(t.id) === team ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
         <select id="pRole" aria-label="Filter by role"><option value="">All roles</option>${options(ROLE, role)}</select>
         <select id="pStatus" aria-label="Filter by status"><option value="">Active and deactivated</option>
-          <option value="active"${status === 'active' ? ' selected' : ''}>Active</option><option value="inactive"${status === 'inactive' ? ' selected' : ''}>Deactivated</option><option value="removed"${status === 'removed' ? ' selected' : ''}>Removed</option></select>
+          <option value="active"${status === 'active' ? ' selected' : ''}>Active</option><option value="inactive"${status === 'inactive' ? ' selected' : ''}>Deactivated</option>${isBoss() ? `<option value="removed"${status === 'removed' ? ' selected' : ''}>Removed</option>` : ''}</select>
       </div>
       ${list.length ? `<div class="card table-wrap"><table>
         <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Team</th><th>Status</th><th></th></tr></thead>
@@ -862,13 +887,13 @@
           <td>${u.team_name ? `<a href="#/teams/${u.team_id}">${esc(u.team_name)}</a>` : '<span class="muted">No team</span>'}</td>
           <td>${u.removed ? '<span class="muted">Removed</span>' : u.active ? 'Active' : '<span class="muted">Deactivated</span>'}</td>
           <td><div class="inline-actions">${u.removed ? (me.role === 'admin' ? `<button class="btn ghost small" data-restore="${u.id}">Restore</button>` : '')
-            : `${canEditPerson(u) ? `<button class="btn ghost small" data-edit="${u.id}">Edit</button>` : ''}${canRemovePerson(u) ? `<button class="btn danger small" data-removep="${u.id}">Remove person</button>` : ''}`}</div></td></tr>`).join('')}</tbody></table></div>`
+            : `${isBoss() && canEditPerson(u) ? `<button class="btn ghost small" data-edit="${u.id}">Edit</button>` : ''}${canRemovePerson(u) ? `<button class="btn danger small" data-removep="${u.id}">Remove person</button>` : ''}`}</div></td></tr>`).join('')}</tbody></table></div>`
         : '<div class="card empty">Nobody matches these filters.</div>'}`;
     wireSearch('pSearch', go);
     $('#pTeam').onchange = e => go({ team: e.target.value });
     $('#pRole').onchange = e => go({ role: e.target.value });
     $('#pStatus').onchange = e => go({ status: e.target.value });
-    $('#newUser').onclick = () => personForm(null, teams);
+    if ($('#newUser')) $('#newUser').onclick = () => personForm(null, teams);
     app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => personForm(byId[b.dataset.edit], teams));
     app.querySelectorAll('[data-removep]').forEach(b => b.onclick = () => removePerson(byId[b.dataset.removep]));
     app.querySelectorAll('[data-restore]').forEach(b => b.onclick = () => restorePerson(byId[b.dataset.restore]));
@@ -877,15 +902,16 @@
   // ---------- teams (everyone: company directory; managers and admins manage them) ----------
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
   async function viewTeams() {
-    if (new URLSearchParams(location.hash.split('?')[1] || '').get('view') === 'people' && isBoss()) return viewAllPeople();
+    if (new URLSearchParams(location.hash.split('?')[1] || '').get('view') === 'people' && (isBoss() || isTM())) return viewAllPeople();
     const { teams } = await api('/teams');
     teams.sort((a, b) => b.mine - a.mine); // your own team first (the server sorts by name)
     app.innerHTML = `
       <div class="page-head"><div><h1>Teams</h1><p>Every team and who is in it. A team’s leads assign its work and its incoming document requests.</p></div>
-        ${isBoss() ? `<div class="inline-actions">${teamsViewSwitch(false)}<button class="btn" id="newTeam">Add a team</button></div>` : ''}</div>
+        ${isBoss() ? `<div class="inline-actions">${teamsViewSwitch(false)}<button class="btn" id="newTeam">Add a team</button></div>` : teamsViewSwitch(false)}</div>
       ${teams.length ? `<div class="team-grid">${teams.map(t => `<a class="card team-card${t.mine ? ' mine' : ''}" href="#/teams/${t.id}">
-        <div class="row-top"><h2>${esc(t.name)}</h2>${t.mine ? '<span class="pill accent">Your team</span>' : ''}</div>
+        <div class="row-top"><h2>${esc(t.name)}</h2>${t.mine ? '<span class="pill accent">Your team</span>' : t.i_manage ? '<span class="pill accent">You manage</span>' : ''}</div>
         <p class="${t.leads.length ? '' : isBoss() ? 'warn-text' : 'muted'}">${t.leads.length ? (t.leads.length === 1 ? 'Lead: ' : 'Leads: ') + esc(t.leads.map(l => l.name).join(', ')) : isBoss() ? '⚠ No lead' : 'No lead yet'}</p>
+        ${t.managers.length ? `<p class="muted">Team ${t.managers.length === 1 ? 'manager' : 'managers'}: ${esc(t.managers.map(m => m.name).join(', '))}</p>` : ''}
         <p class="muted">${plural(t.member_count, 'active member')}</p>
         ${t.connections.length ? `<p class="muted">Works with: ${esc(t.connections.map(c => c.name).join(', '))}</p>` : ''}
         ${t.can_see_counts ? `<p class="team-counts"><span><b>${t.open_tasks}</b> open task${t.open_tasks === 1 ? '' : 's'}</span><span><b>${t.open_requests}</b> open request${t.open_requests === 1 ? '' : 's'}</span></p>` : ''}
@@ -905,39 +931,102 @@
     });
   }
 
+  // can_manage: managers/admins (everything). can_members: also the team's team managers (members and leads).
   async function viewTeam(id) {
-    const [d, { users }, { teams }] = await Promise.all([api('/teams/' + id), isBoss() ? api('/users') : { users: [] }, isBoss() ? api('/teams') : { teams: [] }]);
+    const d = await api('/teams/' + id);
+    const [{ users }, { teams }, { users: noTeam }] = await Promise.all([d.can_members ? api('/users') : { users: [] }, d.can_members ? api('/teams') : { teams: [] },
+      d.can_members && !d.can_manage ? api('/users?pool=no_team') : { users: [] }]);
     const t = d.team;
     const counts = d.team.can_see_counts;
+    const personRow = l => `<li><b>${esc(l.name)}</b> <span class="muted">${ROLE[l.role]} · ${esc(l.email)}${l.member ? '' : ' · not a member of this team'}</span></li>`;
     app.innerHTML = `
       <p style="margin:0 0 10px"><a href="#/teams">← All teams</a></p>
-      <div class="page-head"><div><h1>${esc(t.name)}</h1><p>${t.mine ? 'Your team · ' : ''}${plural(t.member_count, 'active member')}${counts ? ` · ${plural(t.open_tasks, 'open task')} · ${plural(t.open_requests, 'open request')}` : ''}</p></div>
-        ${d.can_manage ? `<div class="inline-actions"><button class="btn" id="addMember">Add member</button><button class="btn ghost" id="setLead">Leads</button>
-          <button class="btn ghost" id="renameTeam">Rename</button><button class="btn danger" id="delTeam">Delete</button></div>` : ''}</div>
+      <div class="page-head"><div><h1>${esc(t.name)}</h1><p>${t.mine ? 'Your team · ' : t.i_manage ? 'You manage this team · ' : ''}${plural(t.member_count, 'active member')}${counts ? ` · ${plural(t.open_tasks, 'open task')} · ${plural(t.open_requests, 'open request')}` : ''}</p></div>
+        ${d.can_members ? `<div class="inline-actions"><button class="btn" id="addMember">Add member</button><button class="btn ghost" id="setLead">Leads</button>
+          ${d.can_manage ? '<button class="btn ghost" id="renameTeam">Rename</button><button class="btn danger" id="delTeam">Delete</button>' : ''}</div>` : ''}</div>
       <section class="card" style="margin-bottom:20px"><h2>${d.leads.length > 1 ? 'Leads' : 'Lead'}</h2>
-        ${d.leads.length ? `<ul class="rows">${d.leads.map(l => `<li><b>${esc(l.name)}</b> <span class="muted">${ROLE[l.role]} · ${esc(l.email)}${l.member ? '' : ' · not a member of this team'}</span></li>`).join('')}</ul>
+        ${d.leads.length ? `<ul class="rows">${d.leads.map(personRow).join('')}</ul>
           ${d.leads.length > 1 ? '<p class="muted" style="margin:8px 0 0;font-size:.8125rem">All leads are equal: any of them can assign this team’s work and requests and approve it.</p>' : ''}`
-          : `<p class="${d.can_manage ? 'warn-text' : 'muted'}" style="margin:0">${d.can_manage ? '⚠ This team has no lead. Its document requests can only be assigned and approved by a manager. Use “Leads”.' : 'This team has no lead yet.'}</p>`}
+          : `<p class="${d.can_members ? 'warn-text' : 'muted'}" style="margin:0">${d.can_members ? '⚠ This team has no lead. Its document requests can only be assigned and approved by a manager or team manager. Use “Leads”.' : 'This team has no lead yet.'}</p>`}
       </section>
+      ${d.managers.length || d.can_manage ? `<section class="card" style="margin-bottom:20px"><div class="row-top"><h2>${d.managers.length > 1 ? 'Team managers' : 'Team manager'}</h2>
+          ${d.can_manage ? '<button class="btn ghost small" id="setManagers">Managers</button>' : ''}</div>
+        ${d.managers.length ? `<ul class="rows">${d.managers.map(personRow).join('')}</ul>` : '<p class="muted" style="margin:0">No team manager. Managers (all teams) and admins manage it.</p>'}
+        <p class="muted" style="margin:8px 0 0;font-size:.8125rem">A team manager has a lead’s powers here, adds and removes members and sets the leads. Their own work is approved by another team manager of the team or a manager.</p>
+      </section>` : ''}
       <section class="card" style="margin-bottom:20px"><h2>Connected teams</h2>
         <p class="muted" style="margin-top:0">Members of connected teams can send document requests to each other.${d.can_manage ? ' Managers set this; it works both ways.' : ''}</p>
         ${d.can_manage ? '<ul class="checks" id="connChecks"><li class="muted">Loading…</li></ul>'
           : t.connections.length ? `<p style="margin:0">${t.connections.map(c => `<a href="#/teams/${c.id}">${esc(c.name)}</a>`).join(', ')}</p>` : '<p class="muted" style="margin:0">None yet.</p>'}
       </section>
       <section class="card table-wrap"><h2>Members</h2>
-        ${d.members.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Email</th>${counts ? '<th class="n">Open tasks</th>' : ''}${d.can_assign || d.can_manage ? '<th></th>' : ''}</tr></thead>
+        ${d.members.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Email</th>${counts ? '<th class="n">Open tasks</th>' : ''}${d.can_assign || d.can_members ? '<th></th>' : ''}</tr></thead>
           <tbody>${d.members.map(m => `<tr>
-            <td>${esc(m.name)}${m.is_lead ? ' <span class="pill accent">Lead</span>' : ''}${m.active ? '' : ' <span class="muted">· deactivated</span>'}</td>
+            <td>${esc(m.name)}${m.is_lead ? ' <span class="pill accent">Lead</span>' : ''}${m.is_manager ? ' <span class="pill accent">Team manager</span>' : ''}${m.active ? '' : ' <span class="muted">· deactivated</span>'}</td>
             <td>${ROLE[m.role]}</td><td>${esc(m.email)}</td>
             ${counts ? `<td class="n"><a href="#/tasks?assignee=${m.id}&status=open">${m.open_tasks}</a></td>` : ''}
-            ${d.can_assign || d.can_manage ? `<td><div class="inline-actions">
-              ${d.can_assign && m.active ? `<button class="btn ghost small" data-assign="${m.id}">Assign a task</button>` : ''}
+            ${d.can_assign || d.can_members ? `<td><div class="inline-actions">
+              ${d.can_assign && m.active && (m.role !== 'team_manager' || isBoss() || t.i_manage) ? `<button class="btn ghost small" data-assign="${m.id}">Assign a task</button>` : ''}
               ${d.can_manage && canEditPerson(m) ? `<button class="btn ghost small" data-editp="${m.id}">Edit</button>` : ''}
-              ${d.can_manage && !(m.role === 'admin' && me.role !== 'admin') ? `<button class="btn ghost small" data-remove="${m.id}">Remove</button>` : ''}</div></td>` : ''}
-          </tr>`).join('')}</tbody></table>` : `<p class="muted">No members yet.${d.can_manage ? ' Use “Add member”.' : ''}</p>`}
+              ${canRemoveMember(d, m) ? `<button class="btn ghost small" data-remove="${m.id}">Remove</button>` : ''}</div></td>` : ''}
+          </tr>`).join('')}</tbody></table>` : `<p class="muted">No members yet.${d.can_members ? ' Use “Add member”.' : ''}</p>`}
       </section>`;
     app.querySelectorAll('[data-assign]').forEach(b => b.onclick = () => taskForm(null, { preset: Number(b.dataset.assign) }));
+    if (!d.can_members) return;
+    const leadToast = r => toast(r && r.became_lead ? `${r.became_lead.name} is now a lead of ${r.became_lead.team_name}` : 'Added to the team');
+    app.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
+      const m = d.members.find(x => x.id === Number(b.dataset.remove));
+      if (!confirm(`Remove ${m.name} from ${t.name}?${m.is_lead ? ' They stay one of its leads until you change the leads.' : ''}`)) return;
+      try { await api(`/teams/${t.id}/members/${m.id}`, { method: 'DELETE' }); toast('Removed from the team'); router(); } catch (e) { toast(e.message); }
+    });
+    $('#addMember').onclick = () => {
+      // Managers/admins: anyone active. Team managers: leads and employees of the other teams they manage, or with no team.
+      const pool = d.can_manage ? users.filter(u => u.active && u.team_id !== t.id && !(u.role === 'admin' && me.role !== 'admin'))
+        : users.filter(u => u.active && u.team_id && u.team_id !== t.id && ['lead', 'employee'].includes(u.role)
+          && (me.managed_teams || []).some(x => x.id === u.team_id)).concat(noTeam);
+      const people = pool.map(u => ({ ...u, team_name: u.team_name ? 'now in ' + u.team_name : 'no team' }));
+      openModal(`<h2 style="font-size:1.25rem">Add a member to ${esc(t.name)}</h2>
+        ${pickerHtml('Person', d.can_manage ? 'Someone already in another team moves to this one. A team lead added to the team becomes one of its leads.'
+          : 'People without a team, or from the other teams you manage (they move to this one). A team lead added to the team becomes one of its leads.')}
+        ${modalActions('Add member')}`, async () => {
+        const [uid] = picker.values();
+        if (!uid) throw new Error('Choose a person.');
+        leadToast(await api(`/teams/${t.id}/members/${uid}`, { method: 'PUT' })); router();
+      });
+      const picker = personPicker(modalForm.querySelector('.picker'), people, { multiple: false });
+    };
+    // Leads (several, all equal): active team leads, managers and admins; say if they already lead another team.
+    // Team managers choose team leads from their teams; leads already set stay listed so they aren't dropped by accident.
+    $('#setLead').onclick = () => {
+      const leading = id => teams.filter(x => x.id !== t.id && x.leads.some(l => l.id === id)).map(x => x.name);
+      const choosable = users.filter(u => u.active && (d.can_manage ? !['employee', 'team_manager'].includes(u.role) : u.role === 'lead'));
+      const people = choosable.concat(d.leads.filter(l => !choosable.some(u => u.id === l.id))).map(u => {
+        const o = leading(u.id);
+        return { ...u, team_name: [u.team_name, o.length ? 'already leads ' + o.join(', ') : ''].filter(Boolean).join(' · ') };
+      });
+      openModal(`<h2 style="font-size:1.25rem">Leads of ${esc(t.name)}</h2>
+        ${pickerHtml('Leads', d.can_manage ? 'All leads are equal. Only active team leads, managers and admins can lead a team; change someone’s role on the People page.'
+          : 'All leads are equal. Choose team leads from the teams you manage; a manager changes people’s roles.')}
+        ${modalActions('Save leads')}`, async () => {
+        const r = await api(`/teams/${t.id}/leads`, { method: 'PUT', body: { user_ids: picker.values() } });
+        toast(r.leads.length ? 'Leads saved' : 'This team has no lead now'); router();
+      });
+      const picker = personPicker(modalForm.querySelector('.picker'), people, { selected: people.filter(p => d.leads.some(l => l.id === p.id)) });
+    };
     if (!d.can_manage) return;
+    // Team managers of this team (managers/admins): active people with the role "Team manager".
+    $('#setManagers').onclick = () => {
+      const people = users.filter(u => u.active && u.role === 'team_manager')
+        .map(u => ({ ...u, team_name: [u.team_name, u.managed_teams.length ? 'manages ' + u.managed_teams.map(x => x.name).join(', ') : ''].filter(Boolean).join(' · ') }));
+      openModal(`<h2 style="font-size:1.25rem">Team managers of ${esc(t.name)}</h2>
+        ${pickerHtml('Team managers', people.length ? 'Only people with the role “Team manager” are listed. Give someone that role in the person form first.'
+          : 'Nobody has the role “Team manager” yet. Give someone that role in the person form (Teams → All people → Edit).')}
+        ${modalActions('Save team managers')}`, async () => {
+        const r = await api(`/teams/${t.id}/managers`, { method: 'PUT', body: { user_ids: picker.values() } });
+        toast(r.managers.length ? 'Team managers saved' : 'This team has no team manager now'); router();
+      });
+      const picker = personPicker(modalForm.querySelector('.picker'), people, { selected: people.filter(p => d.managers.some(l => l.id === p.id)) });
+    };
     const others = teams.filter(x => x.id !== t.id), linked = new Set(t.connections.map(c => c.id));
     $('#connChecks').innerHTML = others.length ? others.map(x => `<li><label><input type="checkbox" value="${x.id}"${linked.has(x.id) ? ' checked' : ''}> ${esc(x.name)}</label></li>`).join('')
       : '<li class="muted">There are no other teams yet.</li>';
@@ -947,45 +1036,14 @@
       catch (e) { toast(e.message); router(); }
     };
     app.querySelectorAll('[data-editp]').forEach(b => b.onclick = () => personForm(users.find(u => u.id === Number(b.dataset.editp)), teams));
-    const leadToast = r => toast(r && r.became_lead ? `${r.became_lead.name} is now a lead of ${r.became_lead.team_name}` : 'Added to the team');
-    app.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
-      const m = d.members.find(x => x.id === Number(b.dataset.remove));
-      if (!confirm(`Remove ${m.name} from ${t.name}?${m.is_lead ? ' They stay one of its leads until you change the leads.' : ''}`)) return;
-      try { await api(`/teams/${t.id}/members/${m.id}`, { method: 'DELETE' }); toast('Removed from the team'); router(); } catch (e) { toast(e.message); }
-    });
     $('#renameTeam').onclick = () => teamNameForm(t);
     $('#delTeam').onclick = async () => {
       if (!confirm(`Delete the team “${t.name}”? Its members will have no team.`)) return;
       try { await api('/teams/' + t.id, { method: 'DELETE' }); toast('Team deleted'); location.hash = '#/teams'; } catch (e) { toast(e.message); }
     };
-    $('#addMember').onclick = () => {
-      const people = users.filter(u => u.active && u.team_id !== t.id && !(u.role === 'admin' && me.role !== 'admin'))
-        .map(u => ({ ...u, team_name: u.team_name ? 'now in ' + u.team_name : 'no team' }));
-      openModal(`<h2 style="font-size:1.25rem">Add a member to ${esc(t.name)}</h2>
-        ${pickerHtml('Person', 'Someone already in another team moves to this one. A team lead added to the team becomes one of its leads.')}
-        ${modalActions('Add member')}`, async () => {
-        const [uid] = picker.values();
-        if (!uid) throw new Error('Choose a person.');
-        leadToast(await api(`/teams/${t.id}/members/${uid}`, { method: 'PUT' })); router();
-      });
-      const picker = personPicker(modalForm.querySelector('.picker'), people, { multiple: false });
-    };
-    // Leads (several, all equal): active team leads, managers and admins; say if they already lead another team.
-    $('#setLead').onclick = () => {
-      const leading = id => teams.filter(x => x.id !== t.id && x.leads.some(l => l.id === id)).map(x => x.name);
-      const people = users.filter(u => u.active && u.role !== 'employee').map(u => {
-        const o = leading(u.id);
-        return { ...u, team_name: [u.team_name, o.length ? 'already leads ' + o.join(', ') : ''].filter(Boolean).join(' · ') };
-      });
-      openModal(`<h2 style="font-size:1.25rem">Leads of ${esc(t.name)}</h2>
-        ${pickerHtml('Leads', 'All leads are equal. Only active team leads, managers and admins can lead a team; change someone’s role on the People page.')}
-        ${modalActions('Save leads')}`, async () => {
-        const r = await api(`/teams/${t.id}/leads`, { method: 'PUT', body: { user_ids: picker.values() } });
-        toast(r.leads.length ? 'Leads saved' : 'This team has no lead now'); router();
-      });
-      const picker = personPicker(modalForm.querySelector('.picker'), people, { selected: people.filter(p => d.leads.some(l => l.id === p.id)) });
-    };
   }
+  // Managers/admins remove anyone (admins only by admins); team managers only leads and employees.
+  const canRemoveMember = (d, m) => d.can_manage ? !(m.role === 'admin' && me.role !== 'admin') : d.can_members && ['lead', 'employee'].includes(m.role);
 
   // ---------- document requests ----------
   // Requests: team tabs; on a team, "Incoming" (sent to the team) and "Sent" (made by its members); "All" is grouped by
@@ -1072,7 +1130,7 @@
   const assignable = d => {
     const team = m => m.team_id === d.request.target_team_id ? `${m.team_name} (this request’s team)` : m.team_name || 'No team';
     const others = d.members.filter(m => m.id !== me.id).map(m => ({ ...m, team_name: team(m) }));
-    const mine = me.team_id !== d.request.target_team_id && d.i_lead ? `Lead of ${d.request.team_name}` : team(me);
+    const mine = me.team_id !== d.request.target_team_id && d.i_lead ? `${isTM() ? 'Team manager' : 'Lead'} of ${d.request.team_name}` : team(me);
     return d.can_take && !d.take_blocked ? [{ ...me, name: me.name + ' (me)', team_name: mine }, ...others] : others;
   };
   const noOthers = d => `No other members in ${esc(d.request.team_name)} yet – add them on the <a href="#/teams/${d.request.target_team_id}">Teams page</a>.`;
@@ -1198,14 +1256,15 @@
     const setQ = (k, v) => go({ [k]: v });
     const ALL = Object.assign({}, STATUS, { needs_team: 'Needs a team (request)', open: 'Open (request)', delivered: 'Delivered (request)', closed: 'Closed (request)', cancelled: 'Cancelled (request)', deleted: 'Deleted' });
     const d = v => v ? fmtDate(v) : '<span class="muted">—</span>';
-    // Archived (deleted) items: "Deleted by <name> on <date>"; managers/admins can restore them or delete them permanently.
+    // Archived (deleted) items: "Deleted by <name> on <date>"; managers/admins (team managers: their teams' items) can
+    // restore them or delete them permanently.
     const pill = r => r.status === 'deleted' ? `<span class="pill rq-cancelled">Deleted</span>
         <small class="muted deleted-note">Deleted by ${esc(r.deleted_by_name || 'unknown')} on ${fmtDate(r.deleted_at)}</small>
-        ${isBoss() ? `<span class="inline-actions"><button class="btn ghost small" data-restore="${r.type}/${r.id}">Restore</button>
+        ${r.can_restore ? `<span class="inline-actions"><button class="btn ghost small" data-restore="${r.type}/${r.id}">Restore</button>
           <button class="btn danger small" data-purge="${r.type}/${r.id}">Delete permanently</button></span>` : ''}`
       : r.type === 'request' ? reqPill(r) : `<span class="pill st-${esc(r.status)}">${STATUS[r.status] || esc(r.status)}</span>`;
     app.innerHTML = `
-      <div class="page-head"><div><h1>History</h1><p>${rows.length} item${rows.length === 1 ? '' : 's'}. ${isBoss() ? 'All tasks and requests.' : me.role === 'lead' ? 'Your teams’ tasks and requests, and anything you assigned.' : 'Your own tasks and the requests you made.'}</p></div>
+      <div class="page-head"><div><h1>History</h1><p>${rows.length} item${rows.length === 1 ? '' : 's'}. ${isBoss() ? 'All tasks and requests.' : me.role === 'lead' || isTM() ? 'Your teams’ tasks and requests, and anything you assigned.' : 'Your own tasks and the requests you made.'}</p></div>
         <a class="btn" id="csvBtn" href="/api/history?${new URLSearchParams([...params, ['format', 'csv']])}" download>Export to Excel</a></div>
       ${tabsHtml(tabs, cur)}
       <div class="filters">

@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS users (
   name TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('admin','manager','lead','employee')),
+  role TEXT NOT NULL,
   lead_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -287,7 +287,55 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
     CREATE INDEX IF NOT EXISTS idx_password_tokens_user ON password_tokens(user_id);`);
   for (const c of ['email_assigned', 'email_approval', 'email_ready', 'email_unassigned'])
     if (!userCols.includes(c)) db.exec(`ALTER TABLE users ADD COLUMN ${c} INTEGER NOT NULL DEFAULT 0`);
+  // Team managers: a person with role "team_manager" manages one or more teams (set by managers/admins).
+  db.exec(`CREATE TABLE IF NOT EXISTS team_managers (
+      team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      added_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      added_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (team_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_managers_user ON team_managers(user_id);`);
 })();
+
+// ---- Roles: users.role has no CHECK constraint any more (server.js validates it on every write) ----
+// The old table only allowed four roles, and SQLite can't alter a CHECK, so it is rebuilt once like the tasks table:
+// snapshot first, every column copied inside one transaction, row count and foreign keys verified before committing.
+(function migrateUsersRoleCheck() {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
+  if (!row || !/CHECK\s*\(\s*role IN/i.test(row.sql)) return;
+  console.log('Upgrading users table (role check moves to the server)...');
+  const snapshot = path.join(dataDir, 'taskdesk-before-team-manager-migration.db');
+  if (!fs.existsSync(snapshot)) db.exec(`VACUUM INTO '${snapshot.replace(/'/g, "''")}'`);
+  const sql = row.sql.replace(/\s*CHECK\s*\(\s*role IN\s*\([^)]*\)\s*\)/i, '').replace(/^CREATE TABLE\s+"?users"?/i, 'CREATE TABLE users_new');
+  if (/CHECK\s*\(\s*role/i.test(sql) || !/^CREATE TABLE users_new/.test(sql)) throw new Error('Unexpected users table definition; nothing was changed.');
+  const list = db.prepare('PRAGMA table_info(users)').all().map(c => c.name).join(', ');
+  db.pragma('foreign_keys = OFF'); // must be off while the table is swapped; checked again before commit
+  try {
+    db.transaction(() => {
+      const before = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+      const seq = db.prepare(`SELECT seq FROM sqlite_sequence WHERE name = 'users'`).get(); // ids of deleted people are never reused
+      db.exec(`${sql}; INSERT INTO users_new (${list}) SELECT ${list} FROM users;`);
+      const copied = db.prepare('SELECT COUNT(*) AS n FROM users_new').get().n;
+      if (copied !== before) throw new Error(`Row count mismatch (${before} before, ${copied} after); nothing was changed.`);
+      db.exec(`DROP TABLE users;
+        ALTER TABLE users_new RENAME TO users;
+        CREATE INDEX IF NOT EXISTS idx_users_team ON users(team_id);`);
+      if (seq) db.prepare(`UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'users'`).run(seq.seq);
+      const after = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+      if (after !== before) throw new Error('Row count changed during upgrade; rolled back.');
+      if (db.pragma('foreign_key_check').length) throw new Error('Foreign key check failed; rolled back.');
+      console.log(`users table upgraded: ${after} rows kept.`);
+    })();
+  } finally {
+    db.pragma('foreign_keys = ON');
+  }
+})();
+
+// Teams a person leads or manages (one row per team and person). A TEMP view: it lives only in this connection,
+// nothing is stored in the database file.
+db.exec(`CREATE TEMP VIEW IF NOT EXISTS team_powers AS
+  SELECT team_id, user_id FROM main.team_leads UNION SELECT team_id, user_id FROM main.team_managers`);
 
 // Create the first admin account if there are no users yet.
 const count = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
