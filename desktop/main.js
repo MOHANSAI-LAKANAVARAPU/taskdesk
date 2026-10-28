@@ -39,7 +39,7 @@ else { app.on('second-instance', () => { createWidget(); openDashboard(); }); }
 
 // ---------- config ----------
 let cfgPath;
-let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null, knownNeedsTeamIds: null, knownReminderIds: null, knownAskIds: null, knownWithdrawnIds: null };
+let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, widgetPositions: {}, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null, knownNeedsTeamIds: null, knownReminderIds: null, knownAskIds: null, knownWithdrawnIds: null };
 function loadConfig() {
   cfgPath = path.join(app.getPath('userData'), 'config.json');
   try { cfg = Object.assign(cfg, JSON.parse(fs.readFileSync(cfgPath, 'utf8'))); } catch (e) { /* first run */ }
@@ -102,6 +102,21 @@ function openSetup() {
 }
 
 // ---------- floating icon ----------
+// The mascot is on every workspace / virtual desktop and above every window. Only the mascot: the dashboard is a
+// normal window.
+// - Linux (X11): "all workspaces" is the window manager's _NET_WM_STATE_STICKY / _NET_WM_DESKTOP = 0xFFFFFFFF. Electron
+//   only gets that when setVisibleOnAllWorkspaces runs after the window is shown (before, GNOME drops it on map), so
+//   keepWidgetUp() runs after every show, move, display change and every 2 s. type 'dock' keeps it out of the taskbar
+//   and Alt+Tab, above "always on top" windows, and stops GNOME from handing it the focus when another window closes
+//   (it did with 'normal', 'toolbar' and 'notification'). Not `focusable: false`: on X11 Electron makes that an
+//   override-redirect window the window manager doesn't manage at all (no sticky, no "above" state).
+// - Windows: setVisibleOnAllWorkspaces does nothing there and Windows has no public API to pin a window to every
+//   virtual desktop. The mascot is a topmost ('screen-saver', the highest level) skip-taskbar tool window, re-asserted
+//   every 2 s.
+const WIDGET_TOP_LEVEL = 'screen-saver';
+const ON_ALL_WORKSPACES = { visibleOnFullScreen: true };
+// Positions are remembered per monitor setup (e.g. laptop alone vs laptop + HDMI), keyed by the monitors' bounds.
+const displaySetup = () => screen.getAllDisplays().map(d => `${d.bounds.x},${d.bounds.y},${d.bounds.width}x${d.bounds.height}`).sort().join('|');
 function defaultWidgetPos() {
   const wa = screen.getPrimaryDisplay().workArea;
   return { x: wa.x + wa.width - WIDGET_SIZE - 24, y: wa.y + wa.height - WIDGET_SIZE - 24 };
@@ -112,23 +127,66 @@ function onSomeScreen(p) {
     return p.x >= a.x - 20 && p.y >= a.y - 20 && p.x + WIDGET_SIZE <= a.x + a.width + 20 && p.y + WIDGET_SIZE <= a.y + a.height + 20;
   });
 }
+// Where the mascot belongs now: the place saved for this monitor setup, else where it is (if that monitor is still
+// there), else the primary monitor's bottom-right corner.
+function widgetPlace(current) {
+  const saved = (cfg.widgetPositions || {})[displaySetup()];
+  if (onSomeScreen(saved)) return saved;
+  if (onSomeScreen(current)) return current;
+  if (!current && onSomeScreen(cfg.widgetPos)) return cfg.widgetPos; // saved by an older version
+  return defaultWidgetPos();
+}
+function saveWidgetPos() {
+  if (!widgetWin || widgetWin.isDestroyed()) return;
+  const [x, y] = widgetWin.getPosition();
+  cfg.widgetPos = { x, y };
+  cfg.widgetPositions = Object.assign({}, cfg.widgetPositions, { [displaySetup()]: { x, y } });
+  saveConfig();
+}
+// Re-assert "on top" and "all workspaces" (cheap; no flicker, never focuses). Not while quitting or updating.
+function keepWidgetUp(raise) {
+  const w = widgetWin;
+  if (!w || w.isDestroyed() || quitting || !w.isVisible()) return;
+  w.setAlwaysOnTop(true, WIDGET_TOP_LEVEL);
+  if (process.platform !== 'win32') w.setVisibleOnAllWorkspaces(true, ON_ALL_WORKSPACES);
+  if (raise && process.platform === 'linux') w.moveTop(); // X11 raise, no focus change (Windows: topmost is enough)
+}
+// Startup log: what the window manager actually did (Linux: xprop when it's installed).
+function logWidgetState(why) {
+  const w = widgetWin;
+  if (!w || w.isDestroyed()) return;
+  const electron = `alwaysOnTop=${w.isAlwaysOnTop()} allWorkspaces=${w.isVisibleOnAllWorkspaces()}`;
+  if (process.platform !== 'linux') return console.log(`[widget] ${why}: ${electron}`);
+  const xid = '0x' + w.getNativeWindowHandle().readUInt32LE(0).toString(16);
+  require('child_process').execFile('xprop', ['-id', xid, '_NET_WM_STATE', '_NET_WM_DESKTOP', '_NET_WM_WINDOW_TYPE'], (err, out) => {
+    const x = err ? `xprop not available (${err.code || err.message})` : out.trim().replace(/\s*\n\s*/g, '; ');
+    const sticky = !err && /_NET_WM_STATE_STICKY/.test(out) && /_NET_WM_DESKTOP\(CARDINAL\) = 4294967295/.test(out);
+    console.log(`[widget] ${why}: ${electron}; window ${xid}: ${x}${err ? '' : sticky ? ' → on all workspaces' : ' → NOT on all workspaces'}`);
+  });
+}
+let widgetTimer = null;
 function createWidget() {
-  if (widgetWin && !widgetWin.isDestroyed()) { widgetWin.showInactive(); return; }
-  const pos = onSomeScreen(cfg.widgetPos) ? cfg.widgetPos : defaultWidgetPos();
+  if (widgetWin && !widgetWin.isDestroyed()) { widgetWin.showInactive(); keepWidgetUp(true); return; }
+  const pos = widgetPlace(null);
   widgetWin = new BrowserWindow({
     x: pos.x, y: pos.y, width: WIDGET_SIZE, height: WIDGET_SIZE, useContentSize: true, frame: false, transparent: true, resizable: false,
     movable: true, minimizable: false, maximizable: false, fullscreenable: false, skipTaskbar: true, hasShadow: false,
-    alwaysOnTop: true, show: false, title: 'TaskDesk',
+    alwaysOnTop: true, show: false, title: 'TaskDesk', ...(process.platform === 'linux' ? { type: 'dock' } : {}),
     webPreferences: { contextIsolation: true, sandbox: true, zoomFactor: 1, preload: path.join(__dirname, 'preload.js') }
   });
-  widgetWin.setAlwaysOnTop(true, 'floating');
+  widgetWin.setAlwaysOnTop(true, WIDGET_TOP_LEVEL);
   // Page zoom (Ctrl+wheel) would push the badge out of the window; keep it at 100%.
   widgetWin.webContents.on('did-finish-load', () => { widgetWin.webContents.setZoomFactor(1); widgetWin.webContents.setVisualZoomLevelLimits(1, 1).catch(() => {}); });
   widgetWin.webContents.on('zoom-changed', () => widgetWin.webContents.setZoomFactor(1));
-  widgetWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: false });
   widgetWin.loadFile(path.join(__dirname, 'widget.html'));
   // 'ready-to-show' can fail to fire for transparent windows on some Linux setups, so also show on load and after a timeout.
   const w = widgetWin;
+  w.on('show', () => { keepWidgetUp(); setTimeout(keepWidgetUp, 500); }); // after the window manager has mapped it
+  w.once('show', () => setTimeout(() => logWidgetState('shown'), 1500));
+  w.on('moved', () => keepWidgetUp());
+  w.on('blur', () => keepWidgetUp(true));
+  clearInterval(widgetTimer);
+  widgetTimer = setInterval(() => keepWidgetUp(true), 2000);
   const reveal = why => { if (!w.isDestroyed() && !w.isVisible()) { console.log('Floating icon shown (' + why + ')'); w.showInactive(); } sendSummary(); };
   w.once('ready-to-show', () => reveal('ready-to-show'));
   w.webContents.once('did-finish-load', () => reveal('did-finish-load'));
@@ -139,7 +197,7 @@ function createWidget() {
   widgetWin.on('close', e => { if (!quitting) e.preventDefault(); });
   widgetWin.on('session-end', () => { quitting = true; }); // Windows shutdown/logoff: never block it
   widgetWin.on('hide', () => { if (!quitting && widgetWin && !widgetWin.isDestroyed()) widgetWin.showInactive(); });
-  widgetWin.on('closed', () => { widgetWin = null; console.log('Floating icon window closed; quitting=' + quitting); if (!quitting) createWidget(); });
+  widgetWin.on('closed', () => { widgetWin = null; clearInterval(widgetTimer); console.log('Floating icon window closed; quitting=' + quitting); if (!quitting) createWidget(); });
   widgetWin.webContents.on('render-process-gone', (e, d) => {
     console.error('Floating icon renderer gone:', d && d.reason);
     if (quitting || !widgetWin || widgetWin.isDestroyed()) return;
@@ -154,9 +212,21 @@ ipcMain.on('widget-drag-move', (e, { dx, dy }) => {
   if (widgetWin && dragStart) widgetWin.setBounds({ x: Math.round(dragStart.x + dx), y: Math.round(dragStart.y + dy), width: WIDGET_SIZE, height: WIDGET_SIZE });
 });
 ipcMain.on('widget-drag-end', () => {
-  if (widgetWin) { const [x, y] = widgetWin.getPosition(); cfg.widgetPos = { x, y }; saveConfig(); }
+  if (widgetWin) { saveWidgetPos(); keepWidgetUp(); }
   dragStart = null;
 });
+// Monitor plugged in, unplugged or changed: back to the place saved for this setup, or the primary monitor if the
+// mascot's monitor is gone. The window manager may have moved it already, so wait a moment.
+function onDisplaysChanged(why) {
+  setTimeout(() => {
+    if (!widgetWin || widgetWin.isDestroyed()) return;
+    const [x, y] = widgetWin.getPosition(), p = widgetPlace({ x, y });
+    if (p.x !== x || p.y !== y) widgetWin.setBounds({ x: p.x, y: p.y, width: WIDGET_SIZE, height: WIDGET_SIZE });
+    console.log(`[widget] displays ${why} (${displaySetup()}): mascot at ${p.x},${p.y}`);
+    keepWidgetUp(true);
+    logWidgetState('after display change');
+  }, 800);
+}
 ipcMain.on('widget-click', () => openDashboard());
 ipcMain.on('widget-ready', () => sendSummary());
 // Log where the badge actually is (only when it changes), e.g. to diagnose a badge that's missing on one laptop.
@@ -563,6 +633,7 @@ app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
   // Real shutdown / restart / logout: let everything close.
   powerMonitor.on('shutdown', () => { quitting = true; });
+  for (const ev of ['display-added', 'display-removed', 'display-metrics-changed']) screen.on(ev, () => onDisplaysChanged(ev.replace('display-', '')));
   if (!cfg.server) return openSetup();
   // At login: only show the floating icon. Opened by hand: show the dashboard too.
   startApp(!launchedAtLogin);

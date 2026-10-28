@@ -1,7 +1,7 @@
 {
   "name": "taskdesk-desktop",
   "productName": "TaskDesk",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "TaskDesk desktop app: shows your assigned tasks and opens the TaskDesk dashboard",
   "main": "main.js",
   "author": {
