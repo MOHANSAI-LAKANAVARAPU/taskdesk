@@ -23,11 +23,18 @@ body{background:var(--bg);color:var(--ink);font-size:15px;line-height:1.5;paddin
 a{color:var(--accent-text)}
 h1{font-size:1.75rem;line-height:1.15;margin:0;letter-spacing:-0.015em}
 h2{font-size:1.0625rem;margin:0 0 12px}
-.wrap{max-width:1160px;margin:0 auto;padding:24px 20px 60px;outline:none}
+:root{
+  /* Page width: min(95vw, 1800px) on large windows (from ~1600px). The side gutter shrinks smoothly to 0 at 1100px,
+     so phones and windows up to 1100px use the full width exactly as before (no jump at a breakpoint). The top bar
+     uses the same width. */
+  --page-gutter:clamp(0px, (100vw - 1100px) * .075, 2.5vw);
+  --page-w:min(1800px, calc(100% - 2 * var(--page-gutter)));
+}
+.wrap{width:var(--page-w);margin:0 auto;padding:24px 20px 60px;outline:none}
 
 /* top bar */
 .topbar{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--line);padding-top:env(safe-area-inset-top,0px)}
-.topbar-inner{max-width:1160px;margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:20px}
+.topbar-inner{width:var(--page-w);margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:20px}
 .brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:1.0625rem;color:var(--ink);text-decoration:none}
 .brand-mark{width:24px;height:24px;background:url(/hifocus-tray.svg) center/contain no-repeat}
 /* Hi-Focus logo (light/dark versions via <picture>), a thin divider, then "TaskDesk". On narrow phones only the
@@ -136,7 +143,7 @@ td a:hover{text-decoration:underline}
 .meta-grid div{background:var(--soft);border-radius:9px;padding:10px 12px}
 .meta-grid dt{font-size:.75rem;color:var(--muted)}
 .meta-grid dd{margin:2px 0 0;font-weight:600}
-.desc{white-space:pre-wrap;margin:0}
+.desc{white-space:pre-wrap;margin:0;max-width:85ch} /* readable line length on wide windows */
 .timeline{list-style:none;margin:0;padding:0}
 .timeline li{position:relative;padding:0 0 16px 22px}
 .timeline li::before{content:"";position:absolute;left:5px;top:7px;width:8px;height:8px;border-radius:50%;background:var(--accent)}
@@ -144,7 +151,7 @@ td a:hover{text-decoration:underline}
 .timeline li:last-child::after{display:none}
 .timeline .who{font-weight:600}
 .timeline .when{color:var(--muted);font-size:.8125rem;margin-left:6px}
-.timeline p{margin:3px 0 0;white-space:pre-wrap}
+.timeline p{margin:3px 0 0;white-space:pre-wrap;max-width:85ch}
 .progress-input{display:flex;gap:10px;align-items:center}
 .progress-input input[type=range]{flex:1;accent-color:var(--accent);padding:0;border:none}
 .progress-input output{width:3em;text-align:right;font-variant-numeric:tabular-nums}
@@ -209,9 +216,8 @@ table.history td.reasons{white-space:normal;min-width:180px}
 .picker > small{display:block;margin-top:4px;font-size:.75rem}
 /* Teams page: one block per team (3 columns wide, 2 on tablets, 1 on phones) */
 .pill.accent{background:var(--accent-soft);color:var(--accent-text)}
-.team-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
-@media (max-width:1000px){.team-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:620px){.team-grid{grid-template-columns:1fr}}
+/* Team blocks and team cards: as many ~300px+ cards as fit (4-5 per row on wide windows, 1 on phones). */
+.team-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:16px}
 .team-card{display:block;color:inherit;text-decoration:none;transition:border-color .15s,box-shadow .15s}
 .team-card:hover,.team-card:focus-visible{border-color:var(--accent);box-shadow:0 4px 14px rgba(0,0,0,.08)}
 .team-card.mine{border-color:var(--accent)}
@@ -232,7 +238,7 @@ table.history td.reasons{white-space:normal;min-width:180px}
 .nav-count[hidden]{display:none}
 .nav-count{margin-left:6px;background:var(--accent);color:var(--accent-ink);padding:0 7px;font-size:.6875rem;vertical-align:1px}
 .wrap:has(> .chat){padding-bottom:16px}
-.chat{display:grid;grid-template-columns:320px minmax(0,1fr);gap:16px;height:calc(100dvh - var(--topbar-h,60px) - 40px);min-height:420px}
+.chat{display:grid;grid-template-columns:clamp(320px,20vw,400px) minmax(0,1fr);gap:16px;height:calc(100dvh - var(--topbar-h,60px) - 40px);min-height:420px}
 .chat-side,.chat-main{background:var(--surface);border:1px solid var(--line);border-radius:12px;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 .chat-side-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:14px 14px 10px}
 .chat-side-head h1{font-size:1.375rem}
@@ -260,7 +266,7 @@ table.history td.reasons{white-space:normal;min-width:180px}
 .chat-more{text-align:center;font-size:.8125rem;margin:0 0 8px}
 .day-sep{display:flex;align-items:center;gap:10px;margin:14px 0 8px;color:var(--muted);font-size:.75rem;font-weight:600}
 .day-sep::before,.day-sep::after{content:"";flex:1;height:1px;background:var(--line)}
-.msg{margin-top:10px;max-width:min(680px,88%)}
+.msg{margin-top:10px;max-width:min(85ch,88%)} /* readable line length */
 .msg.grouped{margin-top:3px}
 .msg.mine{margin-left:auto;text-align:right}
 .msg-line{display:flex;align-items:center;gap:4px}
@@ -386,3 +392,9 @@ details.group[open] > summary::before{transform:rotate(90deg)}
 .sys-line{text-align:center;color:var(--muted);font-size:.75rem;margin:8px 0}
 .chat-people li{gap:8px;flex-wrap:wrap}
 .chat-people .pill.adm{background:var(--soft);color:var(--muted)}
+/* Dashboard sections: 3 columns on wide windows (>= 1500px), 2 on medium, 1 on small; each ~440px or wider.
+   The Employees table needs ~640px: it gets a wider first column on wide windows and the full row on medium ones
+   (on small windows it scrolls inside its card). */
+.dash-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:20px;align-items:start}
+@media (min-width:1500px){.dash-grid:has(> .emp-card){grid-template-columns:minmax(640px,1.2fr) minmax(0,1fr) minmax(0,1fr)}}
+@media (max-width:1499px){.dash-grid > .emp-card{grid-column:1 / -1}}

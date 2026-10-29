@@ -24,6 +24,15 @@ Task assignment and tracking web app for managers, team leads and employees. Dep
 - **Data:** SQLite file at `data/taskdesk.db` (or `$DATA_DIR`). Uploaded files in `data/uploads/` (random names; back this folder up together with the database).
 - **Automatic backups:** [scripts/backup.sh](scripts/backup.sh) runs from the user's crontab at 13:00 and 18:00. It takes an online SQLite backup through the running container (`better-sqlite3` `db.backup`, so the server keeps running) plus `data/uploads/` into `~/TaskDesk-backups/YYYY-MM-DD/` (outside the project; a second run the same day replaces that day). It verifies the copy read-only (integrity, foreign keys, row counts, every `files.stored_name` present), keeps the newest 14 days and logs to `~/TaskDesk-backups/backup.log`. A day the laptop is off at both times has no backup. Restore steps (no sudo; the current data is moved aside, never deleted): [scripts/restore.md](scripts/restore.md).
 
+### Page width and grids
+- The page (`.wrap`) and the top bar (`.topbar-inner`) share `--page-w` = `min(1800px, 100% − 2 × gutter)`. The gutter is `clamp(0px, (100vw − 1100px) × .075, 2.5vw)`, so it is 0 up to 1100px wide (exactly the old full-width layout on phones and small windows) and grows smoothly to 2.5vw (95vw content) by about 1600px. Content is 1800px from about 1900px wide.
+- Grids use `auto-fill` / `auto-fit` with `minmax(min(100%, N), 1fr)`, no fixed pixel layouts:
+  - team blocks (`.team-grid`, ~300px cards: 1 on phones, 3 at 1024px, 4 at 1366–1600px, 5 at 1920px+);
+  - dashboard sections (`.dash-grid`, ~440px: 1, 2, then 3 columns from 1500px). The Employees table needs ~640px, so it gets a `minmax(640px, 1.2fr)` first column from 1500px and the full row below that (`:has(> .emp-card)`);
+  - the board's four columns stretch.
+- Wide tables stay in `.table-wrap` and scroll inside it on narrow windows (History needs ~1700px).
+- Long text keeps a readable line length: `.desc` and timeline notes `max-width: 85ch`, chat messages `min(85ch, 88%)`. The chat sidebar is `clamp(320px, 20vw, 400px)`.
+
 ### Branding
 - Hi-Focus logo files are in `public/branding/` (served at `/branding/…`): `hifocus-banner.png` (logo on dark background) across the top of the sign-in card (max 180px high, `object-fit: cover`); in the top bar `hifocus-logo.svg` (light mode) / `hifocus-logo-white.svg` (dark mode) via `<picture>`, 28px high, then a thin divider and "TaskDesk". Below 1100px wide (and on phones) the logo box is clipped to the shield only, so the menu keeps its room; long user names in the top bar are cut short with "…" (full name on hover). The favicon stays the mascot (`/hifocus-tray.svg`).
 - Desktop app: `desktop/branding/hifocus-banner.png` is inlined as a data URI at the top of `setup.html` and `offline.html` (their CSP allows `img-src data:`), so it shows without the server. The setup window is 480×500. If the banner changes, re-inline it in both files.

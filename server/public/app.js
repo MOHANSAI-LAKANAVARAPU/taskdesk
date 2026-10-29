@@ -293,17 +293,15 @@
         ${stat(t.not_started, 'Not started', 'var(--s-not)', '#/tasks?status=assigned')}
         ${stat(t.overdue, 'Overdue', 'var(--s-over)', '#/tasks?status=overdue')}
       </div>
-      <div class="cols">
-        <div class="stack">
-          ${me.role !== 'employee' ? `<section class="card"><h2>Employees</h2>${legend}${people}</section>` : ''}
-          <section class="card"><h2>Projects</h2>${me.role === 'employee' ? legend : ''}${projects}</section>
-        </div>
+      <div class="dash-grid">
+        ${me.role !== 'employee' ? `<section class="card emp-card"><h2>Employees</h2>${legend}${people}</section>` : ''}
         <div class="stack">
           ${toAssign}
           ${approvals}
           <section class="card"><h2>Due in the next 7 days</h2>${due}</section>
           <section class="card"><h2>This week</h2><p style="margin:0"><b style="font-size:1.5rem">${t.completed_week}</b> <span class="muted">tasks completed in the last 7 days</span></p></section>
         </div>
+        <section class="card"><h2>Projects</h2>${me.role === 'employee' ? legend : ''}${projects}</section>
       </div>`;
     const nb = $('#newTask'); if (nb) nb.onclick = () => taskForm();
     app.querySelectorAll('[data-assignreq]').forEach(b => b.onclick = () => assignRequestModal(Number(b.dataset.assignreq)).catch(e => toast(e.message)));
