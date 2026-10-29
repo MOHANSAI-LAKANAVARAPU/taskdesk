@@ -30,7 +30,7 @@ Task assignment and tracking web app for managers, team leads and employees. Dep
 
 ### Environment variables
 
-`PORT` (3000), `DATA_DIR` (./data), `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_NAME` (first start only; defaults `admin@example.com` / `ChangeMe123!`), `COOKIE_SECURE` (`true` behind HTTPS), `TZ` (decides "overdue"), `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` / `APP_URL` (email; see "Email"), `MAX_UPLOAD_MB` (largest file per upload, default 50; see "Files"). All secrets live only in the untracked `server/.env` (git-ignored, also in `.dockerignore`); never print, log or commit `SMTP_PASS`. Test-only (never in docker-compose.yml): `EMAIL_DRY_RUN=1` records emails instead of sending, `EMAIL_OUTBOX=<file>` appends a copy (to, subject, text) of each email to that file.
+`PORT` (3000), `DATA_DIR` (./data), `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_NAME` (first start only; defaults `admin@example.com` / `ChangeMe123!`), `COOKIE_SECURE` (`true` behind HTTPS), `TZ` (decides "overdue"), `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` / `APP_URL` (email; see "Email"), `MAX_UPLOAD_MB` (largest file per upload, default 50; see "Files"), `OWNER_EMAIL` (the owner account, an active admin; see "Owner and protected accounts"). All secrets live only in the untracked `server/.env` (git-ignored, also in `.dockerignore`); never print, log or commit `SMTP_PASS`. Test-only (never in docker-compose.yml): `EMAIL_DRY_RUN=1` records emails instead of sending, `EMAIL_OUTBOX=<file>` appends a copy (to, subject, text) of each email to that file.
 
 ## Roles and permissions (enforced in server.js)
 
@@ -66,13 +66,46 @@ Roles: `admin`, `manager` (shown as "Manager (all teams)": the company manager),
 
 **Team connections (1.0.12).** `team_connections` links two teams that work together (two-way, one row per pair, smaller id first). Managers/admins tick them on the team page ("Connected teams" checkboxes → `PUT /api/teams/:id/connections {team_ids}`, which replaces the team's whole list); everyone sees the list on the team page and "Works with: …" on the team blocks. Nothing is seeded: until a manager connects teams, employees can request only from their own team (or "Not sure").
 
-**Remove person (admins only, never their own account).** In Teams → All people and in the person Edit form. `GET /api/users/:id/removal` counts the person's records (`personRecords`: tasks as assignee, tasks they assigned, approvals, requests, task updates + request activity, files, chat messages, and other references — deleted-by, asked/withdrawn requests, projects/chats/team links/lead roles they created) plus the teams they lead; the dialog shows them. `DELETE /api/users/:id`:
+**Remove person (admins only, never their own account, never the owner or a protected account).** In Teams → All people and in the person Edit form. `GET /api/users/:id/removal` counts the person's records (`personRecords`: tasks as assignee, tasks they assigned, approvals, requests, task updates + request activity, files, chat messages, and other references — deleted-by, asked/withdrawn requests, projects/chats/team links/lead roles they created) plus the teams they lead; the dialog shows them. `DELETE /api/users/:id`:
 - **No records** → the user row is deleted (sessions, chat memberships and mutes, lead roles go with it by cascade).
 - **Records** → the row stays for History: `removed_at`/`removed_by` set, `active = 0`, sessions ended, `team_id` cleared, lead roles removed (`syncLegacyLead`), removed from group and team chats (direct chats stay readable for the other person), `original_email` = their email and `email` = `removed-<id>@removed.local` (so the address can be used for a new account), and `name` gets " (removed)" — so every place that shows the name (History, CSV, tasks, requests, chat) shows "<name> (removed)".
 - Removed people are left out of `GET /api/users` (so All people, pickers, filters) unless managers/admins ask for `?removed=1` (All people → status "Removed"); they have no team and are inactive, so they're also out of team members, leads, New chat, assignment and ask-a-person lists. They can't be edited or added to a team (409/404) until restored.
 - `POST /api/users/:id/restore` (admins): only if `original_email` isn't used by another account (409 otherwise); reactivates the account, puts the email and name back, and does **not** give back teams or lead roles.
 
 Other rules: a user cannot deactivate themself; only admins can create admins or modify admin accounts. Deadlines/start dates are `YYYY-MM-DD`.
+
+**Owner and protected accounts** (backup `../backups/taskdesk-before-owner-2026-10-29.*`):
+
+The owner:
+- **Who.** The owner is set on the server only: `OWNER_EMAIL` in `server/.env` (Mohan Sai). It is resolved once at startup to `ownerId`, and only if it matches an **active, non-removed admin** (any letter case). Otherwise the server logs `[owner] WARNING: … nobody is treated as owner` and the normal admin rules apply, so nobody is ever locked out.
+- **Who can change it.** Nobody but the owner can change the owner's account in any way, admins included. Every attempt gets 403 "This is the owner account. Only the owner can change it." (`ownerRefused`) and is recorded on the owner.
+- **Guarded endpoints.**
+  - `ownerFirst(...)` runs before `requireBoss`/`requireAdmin`, so even a lead or employee gets the owner message on: `PATCH /api/users/:id` (any field), `POST /api/users/:id/welcome`, `GET /api/users/:id/removal`, `DELETE /api/users/:id`, `POST /api/users/:id/restore`.
+  - On `PUT`/`DELETE /api/teams/:id/members/:userId` (`memberTarget`) the check comes after the team-power check.
+  - `PUT /api/teams/:id/leads`: when the owner would be added or dropped as a lead.
+  - `PUT /api/teams/:id/managers`: when the owner is in the change.
+  - `DELETE /api/teams/:id`: when the owner is a member, because deleting the team would change the owner's team.
+  - Sessions and password links are only touched by those endpoints (password, deactivate, remove, welcome), so they are covered.
+  - "Forgot password?" stays open; the link only goes to the owner's own inbox.
+- **On their own account,** the owner may change name, team, lead and password (`PATCH` and the team page, including their own lead role).
+  - Changing their role, deactivating or removing themself → 403 "You're the owner, so your account can't be removed, deactivated or given a lower role. Ownership moves only with scripts/transfer-owner.sh on the server."
+  - Changing their email → 403, because it must stay equal to `OWNER_EMAIL`.
+  - Turning off their own protection → 403.
+- **Transfer.** Ownership moves only with [scripts/transfer-owner.sh](scripts/transfer-owner.sh) `<email of an active admin>`, which needs access to this computer. There is no API or UI. The script checks the person (read-only, through the container), keeps `.env.bak-<time>`, changes only the `OWNER_EMAIL` line, recreates the container and appends to `server/owner-transfers.log` (git-ignored, like `.env.bak-*`). Test overrides: `ENV_FILE`, `CHECK_DB`, `RESTART_CMD`, `LOG_FILE`. Recovery steps: [scripts/restore.md](scripts/restore.md), "If the owner leaves or is locked out".
+- **Recording a change of owner.** At startup the server compares the owner with `app_settings.owner_user_id`. If it changed (first setup, a transfer, or `OWNER_EMAIL` no longer matching), it records an `owner_transfer` event on the people concerned and stores the new id.
+
+Protected accounts:
+- **Which accounts.** `users.protected = 1`, and **the owner, always** (`isProtected`). Deepith Jain was protected once, by the migration that added the column.
+- **What is blocked.** A protected account can't be removed (`/removal`, `DELETE`), deactivated (`active: false`), or given a lower role (`ROLE_RANK`: admin 5 > manager 4 > team_manager 3 > lead 2 > employee 1), by anyone. The message is "This account is protected. Only the owner can turn off protection.", and the refusal is recorded.
+- **What still works.** Admins can still change its name, email, team and leads, reset its password, resend the welcome email, and raise its role.
+- **Turning it on or off.** Only the owner can, with `protected` in `PATCH`; anyone else gets 403 and the attempt is recorded. The owner's own protection can't be turned off. Each change is recorded as `protection_on` / `protection_off`.
+
+The page:
+- **Badges.** `publicUser` and team members carry `is_owner` and `protected`. The page shows "👑 Owner" (owner) or "🔒 Protected" next to the role: in All people, team member lists and the Account page.
+- **Hidden controls.** For everyone but the owner, the owner's row has no Edit and no Remove / Remove person, and the owner isn't offered in "Add member". Protected people have no Active switch and no Remove person. Their role list only offers the same or higher roles, with a note.
+- **The owner's own form** has the role locked and the email read-only, with a note saying why.
+- **The owner sees a "🔒 Protected account" checkbox** on other people's forms. Unticking it asks "Turn off protection for <name>?"; if they cancel, nothing is saved.
+- **Account history.** Managers/admins see "Account history" in the person form (`GET /api/users/:id/events`).
 
 **No performance scores.** The dashboard shows only counts: tasks assigned (total), completed, in progress, not started, overdue — overall, per project and per employee — plus tasks due in 7 days and completed in the last 7 days. Do not add ratings/scores/rankings.
 
@@ -178,6 +211,9 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 
 - **users**: id, name, email (unique, NOCASE), password_hash, role (admin|manager|team_manager|lead|employee; validated in server.js — the old CHECK constraint was removed by a one-time rebuild, `migrateUsersRoleCheck` in db.js: snapshot `data/taskdesk-before-team-manager-migration.db`, all columns and the AUTOINCREMENT counter kept, row count and foreign keys verified; backup `../backups/taskdesk-before-team-managers-2026-10-28.*`), lead_id → users, active (1/0), created_at, removed_at, removed_by → users (SET NULL), original_email ("Remove person"; added with `ALTER TABLE`, backup `../backups/taskdesk-before-remove-person-2026-10-28.*`)
 - **users.email_assigned / email_approval / email_ready / email_unassigned / email_notes** (0/1, default 0): the notification emails the person turned on (added with `ALTER TABLE`, backups `../backups/taskdesk-before-email-2026-10-28.*` and, for `email_notes`, `../backups/taskdesk-before-note-notifications-2026-10-29.*`).
+- **users.protected** (0/1, default 0): protected account (see "Owner and protected accounts"); added with `ALTER TABLE`, which set it once for deepith@hifocuscctv.com.
+- **account_events**: id, user_id → users (cascade), actor_id → users (SET NULL; empty for server events), action (`owner_transfer`, `owner_refused`, `protected_refused`, `protection_on`, `protection_off`), detail ("<who> tried to …", "Owner changed from A to B …"), created_at. A person's account activity, index on user_id. Read with `GET /api/users/:id/events`.
+- **app_settings**: key (PK), value. `owner_user_id` = the owner at the last start (empty = nobody), used to notice and record a change of owner.
 - **password_tokens**: id, user_id → users (cascade), token_hash (SHA-256, unique), purpose (welcome|reset), created_by → users (SET NULL), created_at, expires_at, used_at. "Set your password" links; the token itself is never stored.
 - **sessions**: token (PK), user_id → users (cascade), expires_at
 - **projects**: id, name, description, status (active|on_hold|closed), created_by → users, created_at
@@ -214,7 +250,8 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | POST `/api/users/:id/welcome` | boss (admin accounts: admin) | Resend the welcome email (new 48-hour link) |
 | GET `/api/users` | signed in (scoped by role) | List users (without removed people; `?removed=1` for managers/admins includes them, with `removed: true`; `?pool=no_team` for team managers: active leads/employees without a team). Team managers carry `managed_teams` [{id, name}] (also in `/api/me`) |
 | POST `/api/users` | boss | Add person (returns `became_lead`); no `password` (or `send_welcome: true`) → welcome email with a "Set your password" link (`welcome_sent`); role `team_manager` needs `managed_team_ids` |
-| PATCH `/api/users/:id` | boss | Edit name/email/role/lead_id/active/password (not a removed person); `managed_team_ids` replaces a team manager's teams (required when the role becomes `team_manager`) |
+| PATCH `/api/users/:id` | boss (never the owner's account unless you are the owner) | Edit name/email/role/lead_id/active/password (not a removed person); `managed_team_ids` replaces a team manager's teams (required when the role becomes `team_manager`); `protected` (owner only). Protected accounts: no deactivating or lower role |
+| GET `/api/users/:id/events` | boss, or the person themself | Account history: last 100 `account_events` with `actor_name` |
 | GET `/api/users/:id/removal`, DELETE `/api/users/:id`, POST `/api/users/:id/restore` | admin (not themself) | Remove person: preview the records / remove (delete or keep-as-removed) / restore |
 | GET `/api/projects` | signed in | Projects (with `teams`) and total/completed counts over visible tasks; `team=<id>` = that team's projects counted over that team's tasks, `team=none` = projects without a team |
 | POST `/api/projects` | boss | Create project (optional `team_ids`) |

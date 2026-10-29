@@ -56,7 +56,7 @@ function publicUser(u) {
   const team = u.team_id ? db.prepare('SELECT name FROM teams WHERE id = ?').get(u.team_id) : null;
   return { id: u.id, name: u.name, email: u.email, role: u.role, lead_id: u.lead_id, team_id: u.team_id || null,
     team_name: team ? team.name : null, active: !!u.active, removed: !!u.removed_at,
-    managed_teams: isTM(u) ? managedTeams(u.id) : [] };
+    managed_teams: isTM(u) ? managedTeams(u.id) : [], is_owner: isOwner(u), protected: isProtected(u) };
 }
 // Teams can have several leads (team_leads), all equal: every check is "any lead of the team". teams.lead_id is only
 // kept equal to the first lead for compatibility (syncLegacyLead); users.lead_id is no longer used.
@@ -499,6 +499,57 @@ function emailRequestReady(taskId, actor) {
     [`"${r.title}" has been delivered. Open it to get the files and mark it as received.`], 'Open the request', `requests/${r.id}`, actor && actor.id);
 }
 
+// ---------- owner and protected accounts ----------
+// The owner (OWNER_EMAIL in .env) must be an active admin; nobody else can change the owner's account in any way.
+// Resolved once at startup: if OWNER_EMAIL matches no active admin, nobody is the owner and the normal admin rules
+// apply, so nobody is ever locked out. Ownership moves only with scripts/transfer-owner.sh (no API or UI).
+// Protected accounts (users.protected, and always the owner) can't be removed, deactivated or given a lower role.
+const OWNER_MSG = 'This is the owner account. Only the owner can change it.';
+const PROTECTED_MSG = 'This account is protected. Only the owner can turn off protection.';
+const OWNER_SELF_MSG = 'You’re the owner, so your account can’t be removed, deactivated or given a lower role. Ownership moves only with scripts/transfer-owner.sh on the server.';
+const ROLE_RANK = { employee: 1, lead: 2, team_manager: 3, manager: 4, admin: 5 };
+// The person's account activity (who, what, when): protection changes, refused changes, owner transfers.
+function logAccount(userId, actorId, action, detail) {
+  db.prepare('INSERT INTO account_events (user_id, actor_id, action, detail) VALUES (?,?,?,?)').run(userId, actorId || null, action, detail || '');
+}
+const ownerId = (() => {
+  const email = String(process.env.OWNER_EMAIL || '').trim();
+  const o = email ? db.prepare(`SELECT id, name FROM users WHERE email = ? COLLATE NOCASE AND role = 'admin' AND active = 1 AND removed_at IS NULL`).get(email) : null;
+  if (o) console.log(`[owner] ${o.name} (id ${o.id}) is the owner`);
+  else console.warn(`[owner] WARNING: ${email ? `OWNER_EMAIL "${email}" doesn't match an active admin` : 'OWNER_EMAIL is not set'}; nobody is treated as owner (normal admin rules apply).`);
+  // Record a change of owner (first setup, a transfer, or the owner no longer matching) on the people concerned.
+  const prev = Number((db.prepare(`SELECT value FROM app_settings WHERE key = 'owner_user_id'`).get() || {}).value) || null;
+  const now = o ? o.id : null;
+  if (prev !== now) db.transaction(() => {
+    const name = id => (db.prepare('SELECT name FROM users WHERE id = ?').get(id) || {}).name || `user #${id}`;
+    const how = '(OWNER_EMAIL in server/.env)';
+    const text = prev && now ? `Owner changed from ${name(prev)} to ${name(now)} ${how}` : now ? `Owner set to ${name(now)} ${how}` : `${name(prev)} is no longer the owner: OWNER_EMAIL matches no active admin`;
+    for (const id of [prev, now]) if (id && db.prepare('SELECT 1 FROM users WHERE id = ?').get(id)) logAccount(id, null, 'owner_transfer', text);
+    db.prepare(`INSERT INTO app_settings (key, value) VALUES ('owner_user_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(now === null ? '' : String(now));
+    console.log(`[owner] ${text}`);
+  })();
+  return now;
+})();
+const isOwner = u => !!u && ownerId !== null && u.id === ownerId;
+const isProtected = u => !!u && (!!u.protected || isOwner(u));
+// Someone other than the owner tries to change the owner's account: refuse (403) and record it. Returns true if refused.
+function ownerRefused(req, res, target, what) {
+  if (!isOwner(target) || isOwner(req.user)) return false;
+  logAccount(target.id, req.user.id, 'owner_refused', `${req.user.name} tried to ${what}`);
+  bad(res, OWNER_MSG, 403);
+  return true;
+}
+// Route guard placed before requireAdmin/requireBoss, so the owner refusal (and its record) comes first on every endpoint.
+const ownerFirst = what => (req, res, next) => {
+  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
+  return target && ownerRefused(req, res, target, typeof what === 'function' ? what(req) : what) ? undefined : next();
+};
+function protectedRefused(req, res, target, what) {
+  logAccount(target.id, req.user.id, 'protected_refused', `${req.user.name} tried to ${what}`);
+  bad(res, PROTECTED_MSG, 403);
+  return true;
+}
+
 // ---------- users ----------
 app.get('/api/users', auth, (req, res) => {
   const u = req.user;
@@ -561,9 +612,10 @@ function setManagedTeams(userId, ids, by) {
 }
 
 // Resend the welcome email: a new "Set your password" link (48 h); earlier links stop working. Same rule as editing the person.
-app.post('/api/users/:id/welcome', auth, requireBoss, (req, res) => {
+app.post('/api/users/:id/welcome', auth, ownerFirst('resend the welcome email (a new password link)'), requireBoss, (req, res) => {
   const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
   if (!target) return bad(res, 'User not found.', 404);
+  if (ownerRefused(req, res, target, 'resend the welcome email (a new password link)')) return;
   if (target.removed_at) return bad(res, 'This person was removed. An admin can restore them first.', 409);
   if (target.role === 'admin' && req.user.role !== 'admin') return bad(res, 'Only an admin can change an admin account.', 403);
   if (!target.active) return bad(res, 'This account is deactivated. Activate it first.', 409);
@@ -572,12 +624,36 @@ app.post('/api/users/:id/welcome', auth, requireBoss, (req, res) => {
   res.json({ ok: true, email: target.email });
 });
 
-app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
+// Field names for refusal records.
+const PERSON_FIELDS = { name: 'name', email: 'email', role: 'role', team_id: 'team', lead_id: 'lead', managed_team_ids: 'managed teams',
+  active: 'active status', password: 'password', protected: 'protection' };
+const patchWhat = req => 'change ' + (Object.keys(PERSON_FIELDS).filter(k => req.body[k] !== undefined && (k !== 'password' || req.body[k])).map(k => PERSON_FIELDS[k]).join(', ') || 'the account');
+app.patch('/api/users/:id', auth, ownerFirst(patchWhat), requireBoss, (req, res) => {
   const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
   if (!target) return bad(res, 'User not found.', 404);
   if (target.removed_at) return bad(res, 'This person was removed. An admin can restore them first.', 409);
   if (target.role === 'admin' && req.user.role !== 'admin') return bad(res, 'Only an admin can change an admin account.', 403);
+  // The owner on their own account: name, team and lead (and password) only. The email stays equal to OWNER_EMAIL.
+  if (isOwner(target)) {
+    if ((req.body.role !== undefined && req.body.role !== target.role) || (req.body.active !== undefined && !req.body.active)) return bad(res, OWNER_SELF_MSG, 403);
+    if (req.body.email !== undefined && str(req.body.email, 200).toLowerCase() !== target.email.toLowerCase())
+      return bad(res, 'The owner’s email is set by OWNER_EMAIL in server/.env, so it can’t be changed here. Change both on the server (see scripts/restore.md).', 403);
+    if (req.body.protected !== undefined && !req.body.protected) return bad(res, 'The owner account is always protected.', 403);
+  }
+  // Protected: never deactivated or given a lower role, by anyone.
+  if (isProtected(target) && !isOwner(target)) {
+    if (req.body.active !== undefined && !req.body.active && target.active) return protectedRefused(req, res, target, 'deactivate the account');
+    if (req.body.role !== undefined && ROLES.includes(req.body.role) && ROLE_RANK[req.body.role] < ROLE_RANK[target.role])
+      return protectedRefused(req, res, target, `lower the role to ${req.body.role}`);
+  }
+  // Protection on/off: only the owner.
+  const protChange = req.body.protected !== undefined && !isOwner(target) && !!req.body.protected !== !!target.protected;
+  if (protChange && !isOwner(req.user)) {
+    logAccount(target.id, req.user.id, 'protected_refused', `${req.user.name} tried to turn protection ${req.body.protected ? 'on' : 'off'}`);
+    return bad(res, 'Only the owner can turn protection on or off.', 403);
+  }
   const f = {};
+  if (protChange) f.protected = req.body.protected ? 1 : 0;
   if (req.body.name !== undefined) { f.name = str(req.body.name, 120); if (!f.name) return bad(res, 'Name cannot be empty.'); }
   if (req.body.email !== undefined) {
     f.email = str(req.body.email, 200);
@@ -611,6 +687,7 @@ app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
   }
   const keys = Object.keys(f);
   if (keys.length) db.prepare(`UPDATE users SET ${keys.map(k => k + ' = ?').join(', ')} WHERE id = ?`).run(...keys.map(k => f[k]), target.id);
+  if (f.protected !== undefined) logAccount(target.id, req.user.id, f.protected ? 'protection_on' : 'protection_off', `${req.user.name} turned protection ${f.protected ? 'on' : 'off'}`);
   if (f.active === 0 || f.password_hash) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);
   // Can no longer lead a team (a team manager already has a lead's powers in the teams they manage).
   if (f.role === 'employee' || f.role === 'team_manager' || f.active === 0) {
@@ -625,6 +702,14 @@ app.patch('/api/users/:id', auth, requireBoss, (req, res) => {
   const became_lead = (f.team_id !== undefined && f.team_id !== target.team_id) || (f.role === 'lead' && target.role !== 'lead') ? autoLead(target.id, req.user.id) : null;
   syncTeamChats(); // team chats follow team membership, leads and deactivation
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(target.id)), became_lead });
+});
+
+// A person's account activity: managers/admins and the person themself. Newest first, last 100.
+app.get('/api/users/:id/events', auth, (req, res) => {
+  const id = Number(req.params.id);
+  if (!isBoss(req.user) && req.user.id !== id) return bad(res, 'Not allowed.', 403);
+  res.json({ events: db.prepare(`SELECT e.id, e.action, e.detail, e.created_at, a.name AS actor_name FROM account_events e
+    LEFT JOIN users a ON a.id = e.actor_id WHERE e.user_id = ? ORDER BY e.id DESC LIMIT 100`).all(id) });
 });
 
 // ---------- remove person (admins only) ----------
@@ -653,11 +738,14 @@ function personRecords(id) {
 function removalTarget(req, res) {
   const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
   if (!target) { bad(res, 'User not found.', 404); return null; }
+  if (isOwner(target) && isOwner(req.user)) { bad(res, OWNER_SELF_MSG, 403); return null; }
+  if (ownerRefused(req, res, target, 'remove the account')) return null;
   if (target.id === req.user.id) { bad(res, 'You can’t remove your own account.', 403); return null; }
+  if (isProtected(target) && !target.removed_at) { protectedRefused(req, res, target, 'remove the account'); return null; }
   return target;
 }
 // What removing this person would do (for the confirmation dialog).
-app.get('/api/users/:id/removal', auth, requireAdmin, (req, res) => {
+app.get('/api/users/:id/removal', auth, ownerFirst('remove the account'), requireAdmin, (req, res) => {
   const t = removalTarget(req, res); if (!t) return;
   if (t.removed_at) return bad(res, 'This person has already been removed.', 409);
   const r = personRecords(t.id);
@@ -665,7 +753,7 @@ app.get('/api/users/:id/removal', auth, requireAdmin, (req, res) => {
 });
 // Remove: no records → the row is deleted; otherwise it is kept for History, marked removed, signed out, taken out of
 // teams/leads/group and team chats, and its email is freed for a new account.
-app.delete('/api/users/:id', auth, requireAdmin, (req, res) => {
+app.delete('/api/users/:id', auth, ownerFirst('remove the account'), requireAdmin, (req, res) => {
   const t = removalTarget(req, res); if (!t) return;
   if (t.removed_at) return bad(res, 'This person has already been removed.', 409);
   const r = personRecords(t.id);
@@ -689,9 +777,10 @@ app.delete('/api/users/:id', auth, requireAdmin, (req, res) => {
   res.json({ ok: true, mode: r.total ? 'kept' : 'deleted' });
 });
 // Restore a removed person: their original email must still be free. Teams and lead roles are not given back.
-app.post('/api/users/:id/restore', auth, requireAdmin, (req, res) => {
+app.post('/api/users/:id/restore', auth, ownerFirst('restore the account'), requireAdmin, (req, res) => {
   const t = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
   if (!t || !t.removed_at) return bad(res, 'This person isn’t removed.', 404);
+  if (ownerRefused(req, res, t, 'restore the account')) return;
   if (db.prepare('SELECT 1 FROM users WHERE email = ? AND id != ?').get(t.original_email, t.id))
     return bad(res, `${t.original_email} is now used by another account, so ${t.name.replace(/ \(removed\)$/, '')} can’t be restored.`, 409);
   db.prepare(`UPDATE users SET active = 1, email = original_email, original_email = NULL, removed_at = NULL, removed_by = NULL,
@@ -1150,11 +1239,12 @@ app.get('/api/teams/:id', auth, (req, res) => {
   // can_manage: managers/admins (rename, delete, connections, team managers, edit people).
   // can_members: also the team's team managers (add/remove members, set leads).
   const can_members = isBoss(u) || managesTeam(u, t.id);
-  const members = db.prepare(`SELECT m.id, m.name, m.role, m.email, m.active,
+  const members = db.prepare(`SELECT m.id, m.name, m.role, m.email, m.active, m.protected,
       (SELECT COUNT(*) FROM tasks t WHERE t.assignee_id = m.id AND t.status != 'completed' AND t.deleted_at IS NULL) AS open_tasks
     FROM users m WHERE m.team_id = ? ${can_members ? '' : 'AND m.active = 1'}
     ORDER BY m.active DESC, m.id IN (SELECT user_id FROM team_powers WHERE team_id = ?) DESC, m.name`).all(t.id, t.id)
-    .map(m => { const x = { ...m, active: !!m.active, is_lead: team.leads.some(l => l.id === m.id), is_manager: team.managers.some(l => l.id === m.id) };
+    .map(m => { const x = { ...m, active: !!m.active, is_lead: team.leads.some(l => l.id === m.id), is_manager: team.managers.some(l => l.id === m.id),
+        is_owner: isOwner(m), protected: isProtected(m) };
       if (!team.can_see_counts) delete x.open_tasks; return x; });
   const people = table => db.prepare(`SELECT us.id, us.name, us.role, us.email, us.team_id FROM ${table} tl JOIN users us ON us.id = tl.user_id
     WHERE tl.team_id = ? AND us.active = 1 ORDER BY tl.added_at, tl.rowid`).all(t.id).map(l => ({ ...l, member: l.team_id === t.id }));
@@ -1214,6 +1304,9 @@ app.patch('/api/teams/:id', auth, requireBoss, (req, res) => {
 app.delete('/api/teams/:id', auth, requireBoss, (req, res) => {
   const team = db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.params.id));
   if (!team) return bad(res, 'Team not found.', 404);
+  // Deleting the team would take the owner out of it.
+  const owner = ownerId !== null ? db.prepare('SELECT * FROM users WHERE id = ? AND team_id = ?').get(ownerId, team.id) : null;
+  if (owner && ownerRefused(req, res, owner, `delete their team ${team.name}`)) return;
   const active = db.prepare(`SELECT COUNT(*) AS n FROM requests WHERE target_team_id = ? AND status IN ('open','assigned','delivered')`).get(team.id).n;
   if (active) return bad(res, `This team has ${active} unfinished document request${active === 1 ? '' : 's'}. Finish or cancel them first.`, 409);
   const chat = db.prepare(`SELECT id FROM conversations WHERE type = 'team' AND team_id = ?`).get(team.id);
@@ -1237,6 +1330,7 @@ function memberTarget(req, res) {
   const team = db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.params.id));
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.userId));
   if (!team || !user || user.removed_at) { bad(res, 'Team or person not found.', 404); return null; }
+  if (ownerRefused(req, res, user, req.method === 'DELETE' ? `remove them from team ${team.name}` : `move them to team ${team.name}`)) return null;
   if (user.role === 'admin' && req.user.role !== 'admin') { bad(res, 'Only an admin can change an admin account.', 403); return null; }
   if (!isBoss(req.user)) { // a team manager: only leads and employees, from no team or from the teams they manage
     if (!['lead', 'employee'].includes(user.role)) { bad(res, 'Only a manager can change the team of a manager, team manager or admin.', 403); return null; }
@@ -1257,6 +1351,9 @@ app.put('/api/teams/:id/leads', auth, requireTeamPower, (req, res) => {
   const team = db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.params.id));
   if (!team) return bad(res, 'Team not found.', 404);
   const ids = Array.isArray(req.body.user_ids) ? req.body.user_ids : [];
+  // The owner's lead role in this team can only be given or taken by the owner.
+  if (ownerId !== null && isLeadOf(ownerId, team.id) !== ids.map(Number).includes(ownerId)
+    && ownerRefused(req, res, db.prepare('SELECT * FROM users WHERE id = ?').get(ownerId), `${isLeadOf(ownerId, team.id) ? 'remove them as a lead of' : 'make them a lead of'} team ${team.name}`)) return;
   if (!isBoss(req.user)) {
     const added = ids.map(Number).filter(id => !isLeadOf(id, team.id));
     if (added.some(id => !db.prepare(`SELECT 1 FROM users WHERE id = ? AND role = 'lead' AND team_id IN ${MANAGED_TEAMS}`).get(id, req.user.id)))
@@ -1272,6 +1369,8 @@ app.put('/api/teams/:id/managers', auth, requireBoss, (req, res) => {
   const team = db.prepare('SELECT * FROM teams WHERE id = ?').get(Number(req.params.id));
   if (!team) return bad(res, 'Team not found.', 404);
   const ids = [...new Set((Array.isArray(req.body.user_ids) ? req.body.user_ids : []).map(Number).filter(Boolean))];
+  if (ownerId !== null && ids.includes(ownerId) !== !!db.prepare('SELECT 1 FROM team_managers WHERE team_id = ? AND user_id = ?').get(team.id, ownerId)
+    && ownerRefused(req, res, db.prepare('SELECT * FROM users WHERE id = ?').get(ownerId), `change their team manager role in team ${team.name}`)) return;
   if (ids.some(id => !db.prepare(`SELECT 1 FROM users WHERE id = ? AND active = 1 AND role = 'team_manager'`).get(id)))
     return bad(res, 'Team managers must be active people with the role “Team manager”. Change their role in the person form first.');
   db.transaction(() => {

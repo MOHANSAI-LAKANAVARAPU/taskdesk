@@ -10,6 +10,7 @@
   const isTM = () => me && me.role === 'team_manager'; // manages only the teams in me.managed_teams
   const canAssign = () => me && me.role !== 'employee';
   const ROLE = { admin: 'Admin', manager: 'Manager (all teams)', team_manager: 'Team manager', lead: 'Team lead', employee: 'Employee' };
+  const ROLE_RANK = { employee: 1, lead: 2, team_manager: 3, manager: 4, admin: 5 }; // "lower role" for protected accounts (as the server)
   // Teams where the user has a lead's powers: teams they lead or (team managers) manage.
   const runsTeam = t => t.leads.some(l => l.id === me.id) || (t.managers || []).some(m => m.id === me.id);
   const STATUS = { assigned: 'Not started', in_progress: 'In progress', submitted: 'Waiting for approval', completed: 'Completed' };
@@ -784,28 +785,35 @@
   // ---------- people (managers/admins: Teams page → "All people", and Edit on a team's member rows) ----------
   // "Lead of <team>" / "Manages <teams>" next to the role; a team lead who leads no team (or a team manager who
   // manages none) gets a warning.
+  // "👑 Owner" (always protected too) or "🔒 Protected" next to the role.
+  const accountBadge = u => u.is_owner ? ' <span class="pill owner" title="The owner account: only the owner can change it">👑 Owner</span>'
+    : u.protected ? ' <span class="pill prot" title="Can’t be removed, deactivated or given a lower role">🔒 Protected</span>' : '';
   function roleCell(u, teams) {
     const link = list => list.map(t => `<a href="#/teams/${t.id}">${esc(t.name)}</a>`).join(', ');
+    const role = ROLE[u.role] + accountBadge(u);
     if (u.role === 'team_manager') return u.managed_teams && u.managed_teams.length
-      ? `${ROLE[u.role]}<div class="muted" style="font-size:.8125rem">Manages ${link(u.managed_teams)}</div>`
-      : `${ROLE[u.role]}${u.active ? '<div class="warn-text" style="margin:2px 0 0;font-size:.8125rem">⚠ Doesn’t manage a team yet – choose teams in Edit</div>' : ''}`;
+      ? `${role}<div class="muted" style="font-size:.8125rem">Manages ${link(u.managed_teams)}</div>`
+      : `${role}${u.active ? '<div class="warn-text" style="margin:2px 0 0;font-size:.8125rem">⚠ Doesn’t manage a team yet – choose teams in Edit</div>' : ''}`;
     const led = teams.filter(t => t.leads.some(l => l.id === u.id));
-    if (led.length) return `${ROLE[u.role]}<div class="muted" style="font-size:.8125rem">Lead of ${led.map(t => `<a href="#/teams/${t.id}">${esc(t.name)}</a>`).join(', ')}</div>`;
-    if (u.role === 'lead' && u.active) return `${ROLE[u.role]}<div class="warn-text" style="margin:2px 0 0;font-size:.8125rem">⚠ Not leading a team yet – set it on the <a href="#/teams">Teams page</a></div>`;
-    return ROLE[u.role];
+    if (led.length) return `${role}<div class="muted" style="font-size:.8125rem">Lead of ${led.map(t => `<a href="#/teams/${t.id}">${esc(t.name)}</a>`).join(', ')}</div>`;
+    if (u.role === 'lead' && u.active) return `${role}<div class="warn-text" style="margin:2px 0 0;font-size:.8125rem">⚠ Not leading a team yet – set it on the <a href="#/teams">Teams page</a></div>`;
+    return role;
   }
   // Add or edit a person (name, email, role, team, password, active). The server keeps the admin-only rules.
   // New people get a welcome email with a "Set your password" link when email is set up; a typed password is the fallback.
   async function personForm(u, teams) {
     const emailOn = (await api('/me/email-prefs').catch(() => ({}))).email_enabled;
     const { admin, ...notAdmin } = ROLE;
-    const roles = me.role === 'admin' ? ROLE : notAdmin;
+    let roles = me.role === 'admin' ? ROLE : notAdmin;
+    // The owner on their own row: name, team and lead only. A protected person: no lower role, no deactivating or removing.
+    const ownSelf = !!u && u.is_owner && u.id === me.id, prot = !!u && u.protected && !u.is_owner;
+    if (prot) roles = Object.fromEntries(Object.entries(roles).filter(([k]) => ROLE_RANK[k] >= ROLE_RANK[u.role]));
     openModal(`
       <h2 style="font-size:1.25rem">${u ? 'Edit ' + esc(u.name) : 'Add a person'}</h2>
       <div class="grid2">
         <label class="f"><span>Full name</span><input name="name" required value="${esc(u?.name)}"></label>
-        <label class="f"><span>Email</span><input name="email" type="email" required value="${esc(u?.email)}"></label>
-        <label class="f"><span>Role</span><select name="role">${options(roles, u?.role || 'employee')}</select></label>
+        <label class="f"><span>Email</span><input name="email" type="email" required value="${esc(u?.email)}"${ownSelf ? ' readonly' : ''}></label>
+        <label class="f"><span>Role</span><select name="role"${ownSelf ? ' disabled' : ''}>${options(roles, u?.role || 'employee')}</select></label>
         <label class="f"><span>Team</span><select name="team_id"><option value="">No team</option>
           ${teams.map(t => `<option value="${t.id}"${u && t.id === u.team_id ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</select></label>
       </div>
@@ -813,13 +821,22 @@
       ${!u && emailOn ? `<label class="check-row"><input type="checkbox" name="send_welcome" id="sendWelcome" checked> Send a welcome email with a “Set your password” link (valid 48 hours)</label>` : ''}
       <label class="f" id="pwField"${!u && emailOn ? ' hidden' : ''}><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="8" autocomplete="new-password" ${u || emailOn ? '' : 'required'}></label>
       ${u && emailOn && u.active && !u.removed && canEditPerson(u) ? `<p style="margin:-6px 0 12px;font-size:.875rem"><button type="button" class="btn ghost small" id="resendWelcome">Resend welcome email</button> <span class="muted">A new “Set your password” link to ${esc(u.email)}; earlier links stop working.</span></p>` : ''}
-      ${u && u.id !== me.id ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
+      ${u && u.id !== me.id && !u.protected ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
+      ${ownSelf ? '<p class="note-box">👑 You’re the owner, so your role and email are fixed and your account can’t be deactivated or removed. Ownership moves only with scripts/transfer-owner.sh on the server.</p>' : ''}
+      ${prot ? '<p class="note-box">🔒 Protected: this account can’t be removed, deactivated or given a lower role. Only the owner can turn protection off.</p>' : ''}
+      ${u && me.is_owner && !u.is_owner ? `<label class="check-row"><input type="checkbox" name="protected"${u.protected ? ' checked' : ''}> 🔒 Protected account (can’t be removed, deactivated or given a lower role)</label>` : ''}
+      ${u && isBoss() ? '<details class="acct-hist" id="acctHist"><summary>Account history</summary><p class="muted">Loading…</p></details>' : ''}
       <p class="muted" style="font-size:.8125rem;margin-top:-4px">A team’s leads can assign tasks to the people in that team.</p>
       <div class="modal-actions">${canRemovePerson(u) ? '<button type="button" class="btn danger" id="removePersonBtn" style="margin-right:auto">Remove person</button>' : ''}
         <button class="btn ghost" value="cancel" formnovalidate>Cancel</button><button class="btn" type="submit">${u ? 'Save changes' : 'Add person'}</button></div>`,
       async fd => {
         const body = Object.fromEntries(fd);
-        if (u && u.id !== me.id) body.active = fd.get('active') === 'on';
+        if (u && modalForm.querySelector('[name=active]')) body.active = fd.get('active') === 'on';
+        delete body.protected;
+        if (u && modalForm.querySelector('[name=protected]')) {
+          body.protected = fd.get('protected') === 'on';
+          if (u.protected && !body.protected && !confirm(`Turn off protection for ${u.name}?`)) throw new Error('Not saved: protection is still on.');
+        }
         if (u && !body.password) delete body.password;
         if (!u && emailOn) { body.send_welcome = fd.get('send_welcome') === 'on'; if (body.send_welcome) delete body.password; }
         if (body.role === 'team_manager') {
@@ -844,9 +861,19 @@
       catch (err) { $('#mErr').textContent = err.message; } finally { rw.disabled = false; }
     };
     const rb = $('#removePersonBtn'); if (rb) rb.onclick = () => { modal.close(); removePerson(u); };
+    const hist = $('#acctHist');
+    if (hist) hist.ontoggle = async () => {
+      if (!hist.open || hist.dataset.loaded) return;
+      hist.dataset.loaded = 1;
+      try {
+        const { events } = await api(`/users/${u.id}/events`);
+        hist.querySelector('p').outerHTML = events.length ? `<ul class="acct-events">${events.map(e => `<li><span class="muted">${fmtDateTime(e.created_at)}</span> ${esc(e.detail)}${e.actor_name && !e.detail.startsWith(e.actor_name) ? ` <span class="muted">· ${esc(e.actor_name)}</span>` : ''}</li>`).join('')}</ul>`
+          : '<p class="muted">Nothing recorded yet.</p>';
+      } catch (e) { hist.querySelector('p').textContent = e.message; }
+    };
   }
   // Admins only, never their own account (the server enforces both).
-  const canRemovePerson = u => !!u && me.role === 'admin' && u.id !== me.id && !u.removed;
+  const canRemovePerson = u => !!u && me.role === 'admin' && u.id !== me.id && !u.removed && !u.protected;
   // "Remove person": the server counts their records first. None → the account is deleted; otherwise it is kept for
   // History, marked "(removed)", signed out, taken out of teams, lead roles and group/team chats, and its email freed.
   async function removePerson(u) {
@@ -868,7 +895,8 @@
     if (!confirm(`Restore ${u.name.replace(/ \(removed\)$/, '')}? They can sign in again with their original email and password. Their team and team-lead roles are not given back – set them again on the Teams page.`)) return;
     try { await api(`/users/${u.id}/restore`, { method: 'POST' }); toast('Restored. Add them to a team again if needed.'); router(); } catch (e) { toast(e.message); }
   }
-  const canEditPerson = u => !(u.role === 'admin' && me.role !== 'admin');
+  // Only the owner edits the owner's account.
+  const canEditPerson = u => !(u.role === 'admin' && me.role !== 'admin') && (!u.is_owner || u.id === me.id);
   // The view switch at the top of the Teams page (managers/admins; team managers see the people of their teams).
   const teamsViewSwitch = people => isBoss() || isTM() ? `<div class="seg" role="group" aria-label="View">
       <a href="#/teams" aria-pressed="${!people}">Teams</a><a href="#/teams?view=people" aria-pressed="${people}">All people</a></div>` : '';
@@ -978,7 +1006,7 @@
         ${d.members.length ? `<table><thead><tr><th>Name</th><th>Role</th><th>Email</th>${counts ? '<th class="n">Open tasks</th>' : ''}${d.can_assign || d.can_members ? '<th></th>' : ''}</tr></thead>
           <tbody>${d.members.map(m => `<tr>
             <td>${esc(m.name)}${m.is_lead ? ' <span class="pill accent">Lead</span>' : ''}${m.is_manager ? ' <span class="pill accent">Team manager</span>' : ''}${m.active ? '' : ' <span class="muted">· deactivated</span>'}</td>
-            <td>${ROLE[m.role]}</td><td>${esc(m.email)}</td>
+            <td>${ROLE[m.role]}${accountBadge(m)}</td><td>${esc(m.email)}</td>
             ${counts ? `<td class="n"><a href="#/tasks?assignee=${m.id}&status=open">${m.open_tasks}</a></td>` : ''}
             ${d.can_assign || d.can_members ? `<td><div class="inline-actions">
               ${d.can_assign && m.active && (m.role !== 'team_manager' || isBoss() || t.i_manage) ? `<button class="btn ghost small" data-assign="${m.id}">Assign a task</button>` : ''}
@@ -996,7 +1024,7 @@
     });
     $('#addMember').onclick = () => {
       // Managers/admins: anyone active. Team managers: leads and employees of the other teams they manage, or with no team.
-      const pool = d.can_manage ? users.filter(u => u.active && u.team_id !== t.id && !(u.role === 'admin' && me.role !== 'admin'))
+      const pool = d.can_manage ? users.filter(u => u.active && u.team_id !== t.id && !(u.role === 'admin' && me.role !== 'admin') && (!u.is_owner || u.id === me.id))
         : users.filter(u => u.active && u.team_id && u.team_id !== t.id && ['lead', 'employee'].includes(u.role)
           && (me.managed_teams || []).some(x => x.id === u.team_id)).concat(noTeam);
       const people = pool.map(u => ({ ...u, team_name: u.team_name ? 'now in ' + u.team_name : 'no team' }));
@@ -1058,7 +1086,8 @@
     };
   }
   // Managers/admins remove anyone (admins only by admins); team managers only leads and employees.
-  const canRemoveMember = (d, m) => d.can_manage ? !(m.role === 'admin' && me.role !== 'admin') : d.can_members && ['lead', 'employee'].includes(m.role);
+  const canRemoveMember = (d, m) => (!m.is_owner || m.id === me.id)
+    && (d.can_manage ? !(m.role === 'admin' && me.role !== 'admin') : d.can_members && ['lead', 'employee'].includes(m.role));
 
   // ---------- document requests ----------
   // Requests: team tabs; on a team, "Incoming" (sent to the team) and "Sent" (made by its members); "All" is grouped by
@@ -1323,7 +1352,7 @@
       ['email_notes', 'Someone adds a note or files to my task'],
       ['email_ready', 'My request is ready'], ...(prefs.can_unassigned ? [['email_unassigned', 'A request for my team is still unassigned after 24 hours']] : [])];
     app.innerHTML = `
-      <div class="page-head"><div><h1>Your account</h1><p>${esc(me.name)} · ${esc(me.email)} · ${ROLE[me.role]}</p></div></div>
+      <div class="page-head"><div><h1>Your account</h1><p>${esc(me.name)} · ${esc(me.email)} · ${ROLE[me.role]}${accountBadge(me)}</p></div></div>
       <div class="account-grid">
         <form class="card" id="pwForm">
           <h2>Change password</h2>

@@ -83,6 +83,25 @@ docker compose up -d
 3. Run `docker compose up -d --build`.
 4. If the server's address changes, laptops need the new address. Use the tray menu → "Change server address…".
 
+## If the owner leaves or is locked out
+
+The owner account is set on the server by `OWNER_EMAIL` in `server/.env`. Nobody else can change it, including other admins. There is no way to move ownership in the app or the API. It needs access to this computer.
+
+- **Move ownership to another person.** They must already be an **active admin** in TaskDesk, so make them an admin first if needed. Then run:
+  `~/Downloads/TaskDesk/server/scripts/transfer-owner.sh new.owner@hifocuscctv.com`
+
+  The script:
+  - checks the person is an active admin;
+  - changes only the `OWNER_EMAIL` line in `.env`, keeping a dated copy `.env.bak-<time>`;
+  - restarts the container, which leaves the data untouched;
+  - writes a line to `server/owner-transfers.log`.
+
+  The server also records the change in both people's Account history. If the person isn't an active admin, nothing changes.
+- **The owner forgot their password.** They can use "Forgot password?" on the sign-in page, which sends a link to their own email. Nobody else can reset it.
+- **The owner's email has to change.** Stop the server and change the email in the database and `OWNER_EMAIL` in `.env` together. Or move ownership to another admin first, let them change the email, then move it back.
+- **`OWNER_EMAIL` matches no active admin.** This happens if it's empty, mistyped, or the person was made a non-admin by editing the database. The server logs `[owner] WARNING: …` at startup and treats nobody as owner. The normal admin rules then apply, so nobody is locked out. Fix `.env` and restart with `docker compose up -d --force-recreate`.
+- Never put the `.env` copies or the log into git (`.gitignore` covers them). They contain the email password.
+
 ## Notes
 
 - Never delete `server/data/`. Old `before-restore-*` folders can be removed once you're sure you don't need them.

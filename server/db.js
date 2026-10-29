@@ -313,6 +313,25 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   // empty on status-only updates and on older rows.
   if (!db.prepare('PRAGMA table_info(task_updates)').all().some(c => c.name === 'note_kind'))
     db.exec('ALTER TABLE task_updates ADD COLUMN note_kind TEXT');
+  // Protected accounts: can't be removed, deactivated or given a lower role (only the owner turns it on/off).
+  // Deepith Jain is protected once, when the column is added; a later "off" by the owner is never undone.
+  if (!db.prepare('PRAGMA table_info(users)').all().some(c => c.name === 'protected')) db.transaction(() => {
+    db.exec('ALTER TABLE users ADD COLUMN protected INTEGER NOT NULL DEFAULT 0');
+    const n = db.prepare(`UPDATE users SET protected = 1 WHERE email = 'deepith@hifocuscctv.com'`).run().changes;
+    console.log(`[db] added users.protected; protected ${n} account(s) (deepith@hifocuscctv.com)`);
+  })();
+  // A person's account activity: protection changes, refused changes, owner transfers (who, what, when).
+  // app_settings: small server values, e.g. the last known owner (to notice and record a transfer at startup).
+  db.exec(`CREATE TABLE IF NOT EXISTS account_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL,
+      detail TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_account_events_user ON account_events(user_id);
+    CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT);`);
 })();
 
 // ---- Roles: users.role has no CHECK constraint any more (server.js validates it on every write) ----

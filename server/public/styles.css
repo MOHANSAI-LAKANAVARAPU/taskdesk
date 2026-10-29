@@ -375,3 +375,11 @@ details.group[open] > summary::before{transform:rotate(90deg)}
 .err-note{background:var(--s-over-bg);color:var(--s-over)}
 .login .ok-note{margin:0 0 16px}
 .err-inline{color:var(--s-over);font-weight:600}
+/* Owner and protected accounts */
+.pill.owner{background:var(--s-prog-bg);color:var(--s-prog);margin-left:4px}
+.pill.prot{background:var(--s-sub-bg);color:var(--s-sub);margin-left:4px}
+.note-box{background:var(--soft);border-radius:8px;padding:8px 10px;font-size:.8125rem;margin:0 0 12px}
+.acct-hist{margin:0 0 12px;font-size:.875rem}
+.acct-hist summary{cursor:pointer;color:var(--accent-text);font-weight:600}
+.acct-events{list-style:none;padding:0;margin:8px 0 0;max-height:180px;overflow:auto}
+.acct-events li{padding:4px 0;border-bottom:1px solid var(--line)}

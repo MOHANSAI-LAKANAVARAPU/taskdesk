@@ -16,5 +16,7 @@ server/updates/*
 *.deb
 *.blockmap
 
-# secrets
+# secrets (.env and the dated copies transfer-owner.sh keeps) and the owner transfer log
 .env
+.env.bak-*
+server/owner-transfers.log
