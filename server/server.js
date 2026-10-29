@@ -279,6 +279,20 @@ function saveUploads(req, link) {
       req.user.id, link.task_id || null, link.update_id || null, link.request_id || null, link.message_id || null);
   }
 }
+// Files for several copies of an assignment: each file is stored once (no owning task) and linked to an update on
+// every copy in task_files. links: [{ task_id, update_id }].
+function saveSharedUploads(req, links) {
+  const ins = db.prepare('INSERT INTO files (original_name, stored_name, size, mime, uploaded_by) VALUES (?,?,?,?,?)');
+  const link = db.prepare('INSERT INTO task_files (file_id, task_id, update_id) VALUES (?,?,?)');
+  for (const f of req.files || []) {
+    const id = ins.run(cleanFileName(f.originalname), f.filename, f.size, sniffFile(f.path), req.user.id).lastInsertRowid;
+    for (const l of links) link.run(id, l.task_id, l.update_id);
+  }
+}
+// A task's files: its own, plus shared assignment files linked to it.
+const taskFiles = taskId => db.prepare(`SELECT id, original_name, size, update_id, uploaded_by, created_at FROM files WHERE task_id = ?
+  UNION ALL SELECT f.id, f.original_name, f.size, tf.update_id, f.uploaded_by, f.created_at FROM task_files tf JOIN files f ON f.id = tf.file_id
+  WHERE tf.task_id = ? ORDER BY id`).all(taskId, taskId);
 
 // ---------- auth ----------
 const loginAttempts = new Map();
@@ -801,11 +815,18 @@ app.get('/api/tasks', auth, (req, res) => {
 
 // Create tasks: one separate task per person in assignee_ids (or the single assignee_id, kept for compatibility).
 // Every person is checked with canAssignTo first; if anyone isn't allowed, nothing is created.
-app.post('/api/tasks', auth, (req, res) => {
+// Two or more people: the copies share an assignment_group_id. Attached files (multipart) go on each copy's first
+// update; for a group they are stored once and linked to every copy.
+function canCreateTask(req, res, next) {
+  if (req.user.role === 'employee') return bad(res, 'Only managers and team leads can assign tasks.', 403);
+  next();
+}
+app.post('/api/tasks', auth, canCreateTask, withUploads, (req, res) => {
   const u = req.user;
-  if (u.role === 'employee') return bad(res, 'Only managers and team leads can assign tasks.', 403);
   const title = str(req.body.title, 200);
-  const rawIds = Array.isArray(req.body.assignee_ids) ? req.body.assignee_ids : req.body.assignee_id ? [req.body.assignee_id] : [];
+  let rawIds = req.body.assignee_ids;
+  if (typeof rawIds === 'string') { try { rawIds = JSON.parse(rawIds); } catch (e) { rawIds = []; } } // multipart sends it as JSON text
+  if (!Array.isArray(rawIds)) rawIds = req.body.assignee_id ? [req.body.assignee_id] : [];
   const ids = [...new Set(rawIds.map(Number).filter(n => Number.isInteger(n) && n > 0))].slice(0, 200);
   const priority = req.body.priority || 'medium';
   const deadline = optDate(req.body.deadline), start_date = optDate(req.body.start_date);
@@ -819,12 +840,19 @@ app.post('/api/tasks', auth, (req, res) => {
   if (deadline === undefined || start_date === undefined) return bad(res, 'Dates must be in YYYY-MM-DD format.');
   if (project_id && !db.prepare('SELECT 1 FROM projects WHERE id = ?').get(project_id)) return bad(res, 'Project not found.');
   const description = str(req.body.description);
-  const created = db.transaction(() => people.map(({ user: a }) => {
-    const id = db.prepare(`INSERT INTO tasks (title, description, project_id, assignee_id, assigned_by, priority, start_date, deadline)
-      VALUES (?,?,?,?,?,?,?,?)`).run(title, description, project_id, a.id, u.id, priority, start_date, deadline).lastInsertRowid;
-    db.prepare('INSERT INTO task_updates (task_id,user_id,message,status) VALUES (?,?,?,?)').run(id, u.id, `Assigned to ${a.name}`, 'assigned');
-    return id;
-  }))();
+  const created = db.transaction(() => {
+    const links = people.map(({ user: a }) => {
+      const id = db.prepare(`INSERT INTO tasks (title, description, project_id, assignee_id, assigned_by, priority, start_date, deadline)
+        VALUES (?,?,?,?,?,?,?,?)`).run(title, description, project_id, a.id, u.id, priority, start_date, deadline).lastInsertRowid;
+      const up = db.prepare('INSERT INTO task_updates (task_id,user_id,message,status) VALUES (?,?,?,?)').run(id, u.id, `Assigned to ${a.name}`, 'assigned');
+      return { task_id: id, update_id: up.lastInsertRowid };
+    });
+    if (links.length > 1) {
+      db.prepare(`UPDATE tasks SET assignment_group_id = ? WHERE id IN (${links.map(() => '?').join(',')})`).run(links[0].task_id, ...links.map(l => l.task_id));
+      saveSharedUploads(req, links);
+    } else saveUploads(req, links[0]);
+    return links.map(l => l.task_id);
+  })();
   const tasks = created.map(id => db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(id));
   for (const id of created) emailAssigned(id, u);
   res.json({ task: tasks[0], tasks, count: tasks.length });
@@ -835,12 +863,16 @@ app.get('/api/tasks/:id', auth, (req, res) => {
   if (!task || !canSeeTask(req.user, task)) return bad(res, 'Task not found.', 404);
   const updates = db.prepare(`SELECT up.*, u.name AS user_name FROM task_updates up JOIN users u ON u.id = up.user_id
     WHERE up.task_id = ? ORDER BY up.id`).all(task.id);
-  const files = db.prepare('SELECT id, original_name, size, update_id, uploaded_by, created_at FROM files WHERE task_id = ? ORDER BY id').all(task.id);
+  const files = taskFiles(task.id);
   for (const up of updates) up.files = files.filter(f => f.update_id === up.id);
+  // The other live copies of a multi-person assignment, only those this person can open.
+  const group = task.assignment_group_id ? db.prepare(`SELECT t.id, t.assignee_id, a.name AS assignee_name FROM tasks t JOIN users a ON a.id = t.assignee_id
+    WHERE t.assignment_group_id = ? AND t.id != ? AND t.deleted_at IS NULL ORDER BY t.id`).all(task.assignment_group_id, task.id)
+    .filter(o => canSeeTask(req.user, o)).map(({ id, assignee_name }) => ({ id, assignee_name })) : [];
   const lr = linkedRequestFull(task.id);
   const isAssignee = task.assignee_id === req.user.id;
   const approvers = ownPlainTask(task) ? null : approversFor(task.assignee_id, task.assigned_by, lr);
-  res.json({ task, updates, can_edit: canEditTask(req.user, task), approvers,
+  res.json({ task, updates, can_edit: canEditTask(req.user, task), approvers, group, group_send_count: groupTargets(req.user, task).length,
     can_give_back: isClaimer(req.user, task) && ['assigned', 'in_progress'].includes(task.status) && lr && lr.status === 'assigned',
     approval_blocked: approvers && approvers.nobody && task.status !== 'completed' ? nobodyCanApprove(lr, task.assignee_id) : null,
     can_update: isAssignee || canEditTask(req.user, task),
@@ -925,7 +957,18 @@ app.post('/api/tasks/:id/give-back', auth, (req, res) => {
   res.json({ ok: true, request_id: lr.id });
 });
 
+// The other live copies of the same multi-person assignment that u may also send a note to: only when u manages this
+// copy (canEditTask) and isn't its assignee, and only the copies u may edit as well. An assignee's updates stay on
+// their own copy.
+function groupTargets(u, task) {
+  if (!task.assignment_group_id || task.assignee_id === u.id || !canEditTask(u, task)) return [];
+  return db.prepare('SELECT * FROM tasks WHERE assignment_group_id = ? AND id != ? AND deleted_at IS NULL ORDER BY id')
+    .all(task.assignment_group_id, task.id).filter(o => canEditTask(u, o));
+}
+
 // Progress update / status change by the assignee (or the assigner); may carry attached files.
+// also_group=1: the note and files also go to the other copies of the assignment (groupTargets); a status or
+// progress change stays on this copy.
 function canPostUpdate(req, res, next) {
   const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(req.params.id));
   if (!task || !canSeeTask(req.user, task)) return bad(res, 'Task not found.', 404);
@@ -962,6 +1005,7 @@ app.post('/api/tasks/:id/updates', auth, canPostUpdate, withUploads, (req, res) 
   const newProgress = progress !== null ? progress : (newStatus === 'completed' ? 100 : task.progress);
   const completedAt = newStatus === 'completed' ? (task.completed_at || new Date().toISOString()) : null;
   const approvedBy = newStatus === 'completed' ? (task.status === 'completed' ? task.approved_by : u.id) : null;
+  const others = [true, 1, '1', 'true'].includes(req.body.also_group) && (message || hasFiles) ? groupTargets(u, task) : [];
   db.transaction(() => {
     db.prepare(`UPDATE tasks SET status = ?, progress = ?, completed_at = ?, approved_by = ?, updated_at = datetime('now') WHERE id = ?`)
       .run(newStatus, newProgress, completedAt, approvedBy, task.id);
@@ -970,10 +1014,16 @@ app.post('/api/tasks/:id/updates', auth, canPostUpdate, withUploads, (req, res) 
     const selfApproved = newStatus === 'completed' && task.status !== 'completed' && u.id === task.assignee_id && !ownPlainTask(task) && isBoss(u);
     const up = db.prepare('INSERT INTO task_updates (task_id,user_id,message,progress,status) VALUES (?,?,?,?,?)')
       .run(task.id, u.id, selfApproved ? `Self-approved by ${u.name}` + (message ? ': ' + message : '') : message || autoMsg || (hasFiles && status === undefined && progress === null ? 'Attached files' : 'Progress updated'), progress, newStatus !== task.status ? newStatus : null);
-    saveUploads(req, { task_id: task.id, update_id: up.lastInsertRowid });
     syncRequestWithTask(task.id, newStatus, task.status);
+    if (!others.length) return saveUploads(req, { task_id: task.id, update_id: up.lastInsertRowid });
+    const links = [{ task_id: task.id, update_id: up.lastInsertRowid }];
+    for (const o of others) {
+      db.prepare(`UPDATE tasks SET updated_at = datetime('now') WHERE id = ?`).run(o.id);
+      links.push({ task_id: o.id, update_id: db.prepare('INSERT INTO task_updates (task_id,user_id,message) VALUES (?,?,?)').run(o.id, u.id, message || 'Attached files').lastInsertRowid });
+    }
+    saveSharedUploads(req, links);
   })();
-  res.json({ task: db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(task.id) });
+  res.json({ task: db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(task.id), sent_to: others.length });
 });
 
 // Approval step ---------------------------------------------------------------
@@ -1588,8 +1638,16 @@ app.delete('/api/tasks/:id/permanent', auth, (req, res) => {
   if (!task || !task.deleted_at || !archivedTaskVisible(req.user, task)) return bad(res, 'Only a deleted task can be deleted permanently.', 404);
   if (!canManageArchived(req.user, assigneeTeam(task))) return bad(res, ARCHIVE_REFUSED, 403);
   const stored = db.prepare('SELECT stored_name FROM files WHERE task_id = ?').all(task.id);
-  db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id); // its updates and files go with it
-  removeStoredFiles(stored);
+  const shared = db.prepare('SELECT file_id FROM task_files WHERE task_id = ?').all(task.id).map(l => l.file_id);
+  db.transaction(() => {
+    db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id); // its updates, own files and file links go with it
+    // A shared assignment file is removed only when no other copy (live or archived) still links to it.
+    for (const id of shared) if (!db.prepare('SELECT 1 FROM task_files WHERE file_id = ?').get(id)) {
+      stored.push(db.prepare('SELECT stored_name FROM files WHERE id = ?').get(id));
+      db.prepare('DELETE FROM files WHERE id = ?').run(id);
+    }
+  })();
+  removeStoredFiles(stored.filter(Boolean));
   res.json({ ok: true });
 });
 
@@ -1850,6 +1908,13 @@ app.post('/api/chat/:id/read', auth, (req, res) => {
 });
 
 // ---------- file download (sign-in + same visibility as the task or request) ----------
+function taskFileVisible(u, taskId) {
+  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
+  if (task && canSeeTask(u, task)) return true;
+  // files of a delivered request's task are visible to the people on that request
+  const r = db.prepare(`${REQ_SELECT} WHERE r.task_id = ? AND r.status IN ('delivered','closed')`).get(taskId);
+  return !!r && canSeeRequestFiles(u, r);
+}
 app.get('/api/files/:id', auth, (req, res) => {
   const u = req.user, f = db.prepare('SELECT * FROM files WHERE id = ?').get(Number(req.params.id));
   let ok = false, inline = false;
@@ -1858,15 +1923,12 @@ app.get('/api/files/:id', auth, (req, res) => {
     ok = !!m && !m.deleted_at && !!chatMember(u, m.conversation_id);
     inline = ok && req.query.inline === '1' && IMAGE_MIME.includes(f.mime); // image thumbnails
   } else if (f && f.task_id) {
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(f.task_id);
-    ok = !!task && canSeeTask(u, task);
-    if (!ok) { // files of a delivered request's task are visible to the people on that request
-      const r = db.prepare(`${REQ_SELECT} WHERE r.task_id = ? AND r.status IN ('delivered','closed')`).get(f.task_id);
-      ok = !!r && canSeeRequestFiles(u, r);
-    }
+    ok = taskFileVisible(u, f.task_id);
   } else if (f && f.request_id) {
     const r = getRequest(f.request_id);
     ok = !!r && canSeeRequestFiles(u, r);
+  } else if (f) { // shared assignment files: visible to anyone who can see one of the copies they're linked to
+    ok = db.prepare('SELECT task_id FROM task_files WHERE file_id = ?').all(f.id).some(l => taskFileVisible(u, l.task_id));
   }
   if (!ok || !/^[0-9a-f]{32}$/.test(f.stored_name)) return bad(res, 'File not found.', 404);
   const file = path.join(UPLOAD_DIR, f.stored_name);

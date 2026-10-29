@@ -296,6 +296,19 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
       PRIMARY KEY (team_id, user_id)
     );
     CREATE INDEX IF NOT EXISTS idx_team_managers_user ON team_managers(user_id);`);
+  // Assignment groups: the copies of a task assigned to several people at once share assignment_group_id (the first
+  // copy's id; no foreign key, so deleting that copy leaves the group intact). Older tasks keep it empty.
+  // Files given to a whole group are stored once (files.task_id NULL) and linked to each copy in task_files.
+  if (!db.prepare('PRAGMA table_info(tasks)').all().some(c => c.name === 'assignment_group_id'))
+    db.exec('ALTER TABLE tasks ADD COLUMN assignment_group_id INTEGER');
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks(assignment_group_id);
+    CREATE TABLE IF NOT EXISTS task_files (
+      file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      update_id INTEGER REFERENCES task_updates(id) ON DELETE SET NULL,
+      PRIMARY KEY (file_id, task_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_files_task ON task_files(task_id);`);
 })();
 
 // ---- Roles: users.role has no CHECK constraint any more (server.js validates it on every write) ----

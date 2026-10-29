@@ -547,23 +547,25 @@
       <h2 style="font-size:1.25rem">${task ? 'Edit task' : 'Assign a task'}</h2>
       <label class="f"><span>Title</span><input name="title" required maxlength="200" value="${esc(t.title)}"></label>
       <label class="f"><span>Description</span><textarea name="description" placeholder="What needs to be done, and what counts as finished">${esc(t.description)}</textarea></label>
-      ${pickerHtml('Assign to', task ? 'One person. Pick someone else to reassign.' : 'Pick one or more people. Each gets their own copy of the task.')}
+      ${pickerHtml('Assign to', task ? 'One person. Pick someone else to reassign.' : 'Pick one or more people. Each gets their own copy of the task, linked to the others.')}
       <div class="grid2">
         <label class="f"><span>Project</span><select name="project_id"><option value="">No project</option>
           ${projects.filter(p => p.status !== 'closed' || p.id === t.project_id).map(p => `<option value="${p.id}"${p.id === t.project_id ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
         <label class="f"><span>Priority</span><select name="priority">${options(PRIORITY, t.priority)}</select></label>
         <label class="f"><span>Deadline</span><input type="date" name="deadline" value="${esc(t.deadline || '')}"></label>
       </div>
+      ${task ? '' : fileInput()}
       ${modalActions(task ? 'Save changes' : 'Assign task')}`,
       async fd => {
         const body = Object.fromEntries(fd);
+        delete body.files;
         const ids = picker.values();
         if (!body.title.trim()) throw new Error('Enter a task title.');
         if (!ids.length) throw new Error(task ? 'Choose who this task is for.' : 'Choose at least one person.');
         if (task) { body.assignee_id = ids[0]; await api('/tasks/' + task.id, { method: 'PATCH', body }); toast('Task updated'); }
         else {
-          body.assignee_ids = ids;
-          const r = await api('/tasks', { method: 'POST', body });
+          // Files go once with the whole assignment; every copy shows them under its first update.
+          const r = await api('/tasks', { method: 'POST', body: formData({ ...body, assignee_ids: JSON.stringify(ids) }, modalForm.querySelector('[name=files]')) });
           toast(r.count > 1 ? `Task assigned to ${r.count} people` : 'Task assigned to ' + r.task.assignee_name);
         }
         router();
@@ -584,8 +586,13 @@
 
   // ---------- task detail ----------
   async function viewTask(id) {
-    const { task: t, updates, can_edit, can_update, can_submit, can_review, can_complete_directly, locked, request, approvers, approval_blocked, can_give_back } = await api('/tasks/' + id);
+    const { task: t, updates, can_edit, can_update, can_submit, can_review, can_complete_directly, locked, request, approvers, approval_blocked, can_give_back, group, group_send_count } = await api('/tasks/' + id);
     const isAssignee = t.assignee_id === me.id;
+    const others = group_send_count || 0;
+    // Only shown when the assigner (or a lead/manager of the team, or a manager/admin) may reach the other copies.
+    const groupBox = others ? `<label class="check-row"><input type="checkbox" name="also_group" checked> Also send to the other ${others === 1 ? 'person' : others + ' people'} in this assignment</label>` : '';
+    const groupBody = (f, body) => others && f.querySelector('[name=also_group]').checked ? { ...body, also_group: 1 } : body;
+    const sentToast = (r, text) => toast(r.sent_to ? `${text} · also sent to ${r.sent_to} other${r.sent_to === 1 ? '' : 's'}` : text);
     app.innerHTML = `
       <p style="margin:0 0 10px"><a href="#/tasks">← All tasks</a></p>
       <div class="page-head"><div><h1>${esc(t.title)}</h1><p>${statusPill(t)} <span style="margin-left:6px">${esc(dueText(t))}</span>${request ? ` <span style="margin-left:6px">· From <a href="#/requests/${request.id}">document request #${request.id}</a></span>` : ''}</p></div>
@@ -604,6 +611,7 @@
               ${t.completed_at ? `<div><dt>Completed on</dt><dd>${fmtDate(t.completed_at)}</dd></div>` : ''}
               ${t.submitted_at && t.status === 'submitted' ? `<div><dt>Submitted on</dt><dd>${fmtDateTime(t.submitted_at)}</dd></div>` : ''}
             </dl>
+            ${group && group.length ? `<p class="muted" style="margin:12px 0 0">Part of an assignment to: ${group.map(g => `<a href="#/tasks/${g.id}">${esc(g.assignee_name)}</a>`).join(', ')}</p>` : ''}
             <h2 style="margin-top:18px">Description</h2>
             <p class="desc">${t.description ? esc(t.description) : '<span class="muted">No description.</span>'}</p>
           </section>
@@ -617,6 +625,7 @@
             <form id="updForm">
               <label class="f"><span>${locked ? 'Comment' : 'What did you do? Any blockers?'}</span><textarea name="message" placeholder="${isAssignee ? 'For example: finished the login page, waiting for API access' : 'Add a note for the assignee'}"></textarea></label>
               ${fileInput()}
+              ${groupBox}
               ${locked ? '' : `<div class="grid2">
                 <label class="f"><span>Status</span><select name="status">${options(statusChoices(t, can_complete_directly), t.status)}</select></label>
                 <label class="f"><span>Progress</span><span class="progress-input"><input type="range" name="progress" min="0" max="100" step="5" value="${t.progress}"><output>${t.progress}%</output></span></label>
@@ -681,7 +690,7 @@
         e.preventDefault();
         const message = f.querySelector('[name=message]').value, fi = f.querySelector('[name=files]');
         if (!message.trim() && !fi.files.length) { $('#updErr').textContent = 'Write a comment first.'; return; }
-        try { await api(`/tasks/${t.id}/updates`, { method: 'POST', body: formData({ message }, fi) }); toast('Comment posted'); router(); }
+        try { sentToast(await api(`/tasks/${t.id}/updates`, { method: 'POST', body: formData(groupBody(f, { message }), fi) }), 'Comment posted'); router(); }
         catch (err) { $('#updErr').textContent = err.message; }
       };
     } else if (f) {
@@ -693,7 +702,7 @@
       };
       sel.onchange = () => { if (sel.value === 'completed' && can_complete_directly) { range.value = 100; out.textContent = '100%'; } };
       const send = async body => {
-        try { await api(`/tasks/${t.id}/updates`, { method: 'POST', body: formData(body, f.querySelector('[name=files]')) }); toast(body.status === 'completed' && t.status !== 'completed' ? 'Task completed' : 'Update posted'); router(); }
+        try { sentToast(await api(`/tasks/${t.id}/updates`, { method: 'POST', body: formData(groupBody(f, body), f.querySelector('[name=files]')) }), body.status === 'completed' && t.status !== 'completed' ? 'Task completed' : 'Update posted'); router(); }
         catch (err) { $('#updErr').textContent = err.message; }
       };
       f.onsubmit = e => {
