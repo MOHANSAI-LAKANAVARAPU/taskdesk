@@ -78,7 +78,7 @@ Other rules: a user cannot deactivate themself; only admins can create admins or
 
 The owner:
 - **Who.** The owner is set on the server only: `OWNER_EMAIL` in `server/.env` (Mohan Sai). It is resolved once at startup to `ownerId`, and only if it matches an **active, non-removed admin** (any letter case). Otherwise the server logs `[owner] WARNING: … nobody is treated as owner` and the normal admin rules apply, so nobody is ever locked out.
-- **Who can change it.** Nobody but the owner can change the owner's account in any way, admins included. Every attempt gets 403 "This is the owner account. Only the owner can change it." (`ownerRefused`) and is recorded on the owner.
+- **Who can change it.** Nobody but the owner can change the owner's account in any way, admins included. Every attempt gets 403 "This account can't be changed." (`ownerRefused`) and is recorded on the owner.
 - **Guarded endpoints.**
   - `ownerFirst(...)` runs before `requireBoss`/`requireAdmin`, so even a lead or employee gets the owner message on: `PATCH /api/users/:id` (any field), `POST /api/users/:id/welcome`, `GET /api/users/:id/removal`, `DELETE /api/users/:id`, `POST /api/users/:id/restore`.
   - On `PUT`/`DELETE /api/teams/:id/members/:userId` (`memberTarget`) the check comes after the team-power check.
@@ -88,24 +88,25 @@ The owner:
   - Sessions and password links are only touched by those endpoints (password, deactivate, remove, welcome), so they are covered.
   - "Forgot password?" stays open; the link only goes to the owner's own inbox.
 - **On their own account,** the owner may change name, team, lead and password (`PATCH` and the team page, including their own lead role).
-  - Changing their role, deactivating or removing themself → 403 "You're the owner, so your account can't be removed, deactivated or given a lower role. Ownership moves only with scripts/transfer-owner.sh on the server."
-  - Changing their email → 403, because it must stay equal to `OWNER_EMAIL`.
+  - Changing their role, deactivating or removing themself → 403 "This account can't be removed, deactivated or given a lower role."
+  - Changing their email → 403 "Role and email are fixed for this account.", because it must stay equal to `OWNER_EMAIL`.
   - Turning off their own protection → 403.
 - **Transfer.** Ownership moves only with [scripts/transfer-owner.sh](scripts/transfer-owner.sh) `<email of an active admin>`, which needs access to this computer. There is no API or UI. The script checks the person (read-only, through the container), keeps `.env.bak-<time>`, changes only the `OWNER_EMAIL` line, recreates the container and appends to `server/owner-transfers.log` (git-ignored, like `.env.bak-*`). Test overrides: `ENV_FILE`, `CHECK_DB`, `RESTART_CMD`, `LOG_FILE`. Recovery steps: [scripts/restore.md](scripts/restore.md), "If the owner leaves or is locked out".
 - **Recording a change of owner.** At startup the server compares the owner with `app_settings.owner_user_id`. If it changed (first setup, a transfer, or `OWNER_EMAIL` no longer matching), it records an `owner_transfer` event on the people concerned and stores the new id.
 
 Protected accounts:
 - **Which accounts.** `users.protected = 1`, and **the owner, always** (`isProtected`). Deepith Jain was protected once, by the migration that added the column.
-- **What is blocked.** A protected account can't be removed (`/removal`, `DELETE`), deactivated (`active: false`), or given a lower role (`ROLE_RANK`: admin 5 > manager 4 > team_manager 3 > lead 2 > employee 1), by anyone. The message is "This account is protected. Only the owner can turn off protection.", and the refusal is recorded.
+- **What is blocked.** A protected account can't be removed (`/removal`, `DELETE`), deactivated (`active: false`), or given a lower role (`ROLE_RANK`: admin 5 > manager 4 > team_manager 3 > lead 2 > employee 1), by anyone. The message is "This account is protected. It can't be removed, deactivated or given a lower role.", and the refusal is recorded.
 - **What still works.** Admins can still change its name, email, team and leads, reset its password, resend the welcome email, and raise its role.
-- **Turning it on or off.** Only the owner can, with `protected` in `PATCH`; anyone else gets 403 and the attempt is recorded. The owner's own protection can't be turned off. Each change is recorded as `protection_on` / `protection_off`.
+- **Turning it on or off.** Only the owner can, with `protected` in `PATCH`; anyone else gets 403 "You can't turn protection on or off." and the attempt is recorded. The owner's own protection can't be turned off ("This account is always protected."). Each change is recorded as `protection_on` / `protection_off`.
 
-The page:
-- **Badges.** `publicUser` and team members carry `is_owner` and `protected`. The page shows "👑 Owner" (owner) or "🔒 Protected" next to the role: in All people, team member lists and the Account page.
-- **Hidden controls.** For everyone but the owner, the owner's row has no Edit and no Remove / Remove person, and the owner isn't offered in "Add member". Protected people have no Active switch and no Remove person. Their role list only offers the same or higher roles, with a note.
-- **The owner's own form** has the role locked and the email read-only, with a note saying why.
+The page (**the owner is never labelled**):
+- **No "owner" anywhere people can see.** Nothing in the web app, its served files (`app.js`, `styles.css`) or any message other users can get says "owner". "Owner" wording stays only in server logs, `account_events`, this file and `scripts/restore.md`.
+- **Badges.** `publicUser` and team members carry `locked` (the owner; a neutral name on purpose) and `protected`, which is the stored `users.protected` flag only, so the owner shows as unprotected and their row looks like a normal admin row. The page shows "🔒 Protected" next to the role for other protected people (All people, team member lists, Account page). The enforcement still uses `isOwner` / `isProtected` on the server.
+- **Hidden controls.** For everyone but the owner, the `locked` row has no Edit and no Remove / Remove person, and isn't offered in "Add member". Protected people have no Active switch and no Remove person. Their role list only offers the same or higher roles, with a note.
+- **The owner's own form** has the role locked and the email read-only, with the note "Role and email are fixed for this account."
 - **The owner sees a "🔒 Protected account" checkbox** on other people's forms. Unticking it asks "Turn off protection for <name>?"; if they cancel, nothing is saved.
-- **Account history.** Managers/admins see "Account history" in the person form (`GET /api/users/:id/events`).
+- **Account history.** Managers/admins see "Account history" in the person form (`GET /api/users/:id/events`). The API never returns `owner_transfer` events, and returns `owner_refused` only to the owner. Both stay in the table.
 
 **No performance scores.** The dashboard shows only counts: tasks assigned (total), completed, in progress, not started, overdue — overall, per project and per employee — plus tasks due in 7 days and completed in the last 7 days. Do not add ratings/scores/rankings.
 

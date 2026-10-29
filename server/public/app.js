@@ -785,9 +785,8 @@
   // ---------- people (managers/admins: Teams page → "All people", and Edit on a team's member rows) ----------
   // "Lead of <team>" / "Manages <teams>" next to the role; a team lead who leads no team (or a team manager who
   // manages none) gets a warning.
-  // "👑 Owner" (always protected too) or "🔒 Protected" next to the role.
-  const accountBadge = u => u.is_owner ? ' <span class="pill owner" title="The owner account: only the owner can change it">👑 Owner</span>'
-    : u.protected ? ' <span class="pill prot" title="Can’t be removed, deactivated or given a lower role">🔒 Protected</span>' : '';
+  // "🔒 Protected" next to the role (a locked account shows like a normal one).
+  const accountBadge = u => u.protected && !u.locked ? ' <span class="pill prot" title="Can’t be removed, deactivated or given a lower role">🔒 Protected</span>' : '';
   function roleCell(u, teams) {
     const link = list => list.map(t => `<a href="#/teams/${t.id}">${esc(t.name)}</a>`).join(', ');
     const role = ROLE[u.role] + accountBadge(u);
@@ -805,8 +804,8 @@
     const emailOn = (await api('/me/email-prefs').catch(() => ({}))).email_enabled;
     const { admin, ...notAdmin } = ROLE;
     let roles = me.role === 'admin' ? ROLE : notAdmin;
-    // The owner on their own row: name, team and lead only. A protected person: no lower role, no deactivating or removing.
-    const ownSelf = !!u && u.is_owner && u.id === me.id, prot = !!u && u.protected && !u.is_owner;
+    // A locked account on its own row: name, team and lead only. A protected person: no lower role, no deactivating or removing.
+    const ownSelf = !!u && u.locked && u.id === me.id, prot = !!u && u.protected && !u.locked;
     if (prot) roles = Object.fromEntries(Object.entries(roles).filter(([k]) => ROLE_RANK[k] >= ROLE_RANK[u.role]));
     openModal(`
       <h2 style="font-size:1.25rem">${u ? 'Edit ' + esc(u.name) : 'Add a person'}</h2>
@@ -821,10 +820,10 @@
       ${!u && emailOn ? `<label class="check-row"><input type="checkbox" name="send_welcome" id="sendWelcome" checked> Send a welcome email with a “Set your password” link (valid 48 hours)</label>` : ''}
       <label class="f" id="pwField"${!u && emailOn ? ' hidden' : ''}><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="8" autocomplete="new-password" ${u || emailOn ? '' : 'required'}></label>
       ${u && emailOn && u.active && !u.removed && canEditPerson(u) ? `<p style="margin:-6px 0 12px;font-size:.875rem"><button type="button" class="btn ghost small" id="resendWelcome">Resend welcome email</button> <span class="muted">A new “Set your password” link to ${esc(u.email)}; earlier links stop working.</span></p>` : ''}
-      ${u && u.id !== me.id && !u.protected ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
-      ${ownSelf ? '<p class="note-box">👑 You’re the owner, so your role and email are fixed and your account can’t be deactivated or removed. Ownership moves only with scripts/transfer-owner.sh on the server.</p>' : ''}
-      ${prot ? '<p class="note-box">🔒 Protected: this account can’t be removed, deactivated or given a lower role. Only the owner can turn protection off.</p>' : ''}
-      ${u && me.is_owner && !u.is_owner ? `<label class="check-row"><input type="checkbox" name="protected"${u.protected ? ' checked' : ''}> 🔒 Protected account (can’t be removed, deactivated or given a lower role)</label>` : ''}
+      ${u && u.id !== me.id && !u.protected && !u.locked ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
+      ${ownSelf ? '<p class="note-box">Role and email are fixed for this account.</p>' : ''}
+      ${prot ? '<p class="note-box">🔒 Protected: this account can’t be removed, deactivated or given a lower role.</p>' : ''}
+      ${u && me.locked && !u.locked ? `<label class="check-row"><input type="checkbox" name="protected"${u.protected ? ' checked' : ''}> 🔒 Protected account (can’t be removed, deactivated or given a lower role)</label>` : ''}
       ${u && isBoss() ? '<details class="acct-hist" id="acctHist"><summary>Account history</summary><p class="muted">Loading…</p></details>' : ''}
       <p class="muted" style="font-size:.8125rem;margin-top:-4px">A team’s leads can assign tasks to the people in that team.</p>
       <div class="modal-actions">${canRemovePerson(u) ? '<button type="button" class="btn danger" id="removePersonBtn" style="margin-right:auto">Remove person</button>' : ''}
@@ -873,7 +872,7 @@
     };
   }
   // Admins only, never their own account (the server enforces both).
-  const canRemovePerson = u => !!u && me.role === 'admin' && u.id !== me.id && !u.removed && !u.protected;
+  const canRemovePerson = u => !!u && me.role === 'admin' && u.id !== me.id && !u.removed && !u.protected && !u.locked;
   // "Remove person": the server counts their records first. None → the account is deleted; otherwise it is kept for
   // History, marked "(removed)", signed out, taken out of teams, lead roles and group/team chats, and its email freed.
   async function removePerson(u) {
@@ -895,8 +894,8 @@
     if (!confirm(`Restore ${u.name.replace(/ \(removed\)$/, '')}? They can sign in again with their original email and password. Their team and team-lead roles are not given back – set them again on the Teams page.`)) return;
     try { await api(`/users/${u.id}/restore`, { method: 'POST' }); toast('Restored. Add them to a team again if needed.'); router(); } catch (e) { toast(e.message); }
   }
-  // Only the owner edits the owner's account.
-  const canEditPerson = u => !(u.role === 'admin' && me.role !== 'admin') && (!u.is_owner || u.id === me.id);
+  // A locked account is edited only by itself.
+  const canEditPerson = u => !(u.role === 'admin' && me.role !== 'admin') && (!u.locked || u.id === me.id);
   // The view switch at the top of the Teams page (managers/admins; team managers see the people of their teams).
   const teamsViewSwitch = people => isBoss() || isTM() ? `<div class="seg" role="group" aria-label="View">
       <a href="#/teams" aria-pressed="${!people}">Teams</a><a href="#/teams?view=people" aria-pressed="${people}">All people</a></div>` : '';
@@ -1024,7 +1023,7 @@
     });
     $('#addMember').onclick = () => {
       // Managers/admins: anyone active. Team managers: leads and employees of the other teams they manage, or with no team.
-      const pool = d.can_manage ? users.filter(u => u.active && u.team_id !== t.id && !(u.role === 'admin' && me.role !== 'admin') && (!u.is_owner || u.id === me.id))
+      const pool = d.can_manage ? users.filter(u => u.active && u.team_id !== t.id && !(u.role === 'admin' && me.role !== 'admin') && (!u.locked || u.id === me.id))
         : users.filter(u => u.active && u.team_id && u.team_id !== t.id && ['lead', 'employee'].includes(u.role)
           && (me.managed_teams || []).some(x => x.id === u.team_id)).concat(noTeam);
       const people = pool.map(u => ({ ...u, team_name: u.team_name ? 'now in ' + u.team_name : 'no team' }));
@@ -1086,7 +1085,7 @@
     };
   }
   // Managers/admins remove anyone (admins only by admins); team managers only leads and employees.
-  const canRemoveMember = (d, m) => (!m.is_owner || m.id === me.id)
+  const canRemoveMember = (d, m) => (!m.locked || m.id === me.id)
     && (d.can_manage ? !(m.role === 'admin' && me.role !== 'admin') : d.can_members && ['lead', 'employee'].includes(m.role));
 
   // ---------- document requests ----------

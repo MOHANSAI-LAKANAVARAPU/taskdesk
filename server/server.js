@@ -56,7 +56,7 @@ function publicUser(u) {
   const team = u.team_id ? db.prepare('SELECT name FROM teams WHERE id = ?').get(u.team_id) : null;
   return { id: u.id, name: u.name, email: u.email, role: u.role, lead_id: u.lead_id, team_id: u.team_id || null,
     team_name: team ? team.name : null, active: !!u.active, removed: !!u.removed_at,
-    managed_teams: isTM(u) ? managedTeams(u.id) : [], is_owner: isOwner(u), protected: isProtected(u) };
+    managed_teams: isTM(u) ? managedTeams(u.id) : [], locked: isOwner(u), protected: !!u.protected };
 }
 // Teams can have several leads (team_leads), all equal: every check is "any lead of the team". teams.lead_id is only
 // kept equal to the first lead for compatibility (syncLegacyLead); users.lead_id is no longer used.
@@ -504,9 +504,10 @@ function emailRequestReady(taskId, actor) {
 // Resolved once at startup: if OWNER_EMAIL matches no active admin, nobody is the owner and the normal admin rules
 // apply, so nobody is ever locked out. Ownership moves only with scripts/transfer-owner.sh (no API or UI).
 // Protected accounts (users.protected, and always the owner) can't be removed, deactivated or given a lower role.
-const OWNER_MSG = 'This is the owner account. Only the owner can change it.';
-const PROTECTED_MSG = 'This account is protected. Only the owner can turn off protection.';
-const OWNER_SELF_MSG = 'You’re the owner, so your account can’t be removed, deactivated or given a lower role. Ownership moves only with scripts/transfer-owner.sh on the server.';
+// Messages people see never mention the owner (the label is hidden in the app); server logs and account_events do.
+const OWNER_MSG = 'This account can’t be changed.';
+const PROTECTED_MSG = 'This account is protected. It can’t be removed, deactivated or given a lower role.';
+const OWNER_SELF_MSG = 'This account can’t be removed, deactivated or given a lower role.';
 const ROLE_RANK = { employee: 1, lead: 2, team_manager: 3, manager: 4, admin: 5 };
 // The person's account activity (who, what, when): protection changes, refused changes, owner transfers.
 function logAccount(userId, actorId, action, detail) {
@@ -637,8 +638,8 @@ app.patch('/api/users/:id', auth, ownerFirst(patchWhat), requireBoss, (req, res)
   if (isOwner(target)) {
     if ((req.body.role !== undefined && req.body.role !== target.role) || (req.body.active !== undefined && !req.body.active)) return bad(res, OWNER_SELF_MSG, 403);
     if (req.body.email !== undefined && str(req.body.email, 200).toLowerCase() !== target.email.toLowerCase())
-      return bad(res, 'The owner’s email is set by OWNER_EMAIL in server/.env, so it can’t be changed here. Change both on the server (see scripts/restore.md).', 403);
-    if (req.body.protected !== undefined && !req.body.protected) return bad(res, 'The owner account is always protected.', 403);
+      return bad(res, 'Role and email are fixed for this account.', 403); // it must stay equal to OWNER_EMAIL (see scripts/restore.md)
+    if (req.body.protected !== undefined && !req.body.protected) return bad(res, 'This account is always protected.', 403);
   }
   // Protected: never deactivated or given a lower role, by anyone.
   if (isProtected(target) && !isOwner(target)) {
@@ -650,7 +651,7 @@ app.patch('/api/users/:id', auth, ownerFirst(patchWhat), requireBoss, (req, res)
   const protChange = req.body.protected !== undefined && !isOwner(target) && !!req.body.protected !== !!target.protected;
   if (protChange && !isOwner(req.user)) {
     logAccount(target.id, req.user.id, 'protected_refused', `${req.user.name} tried to turn protection ${req.body.protected ? 'on' : 'off'}`);
-    return bad(res, 'Only the owner can turn protection on or off.', 403);
+    return bad(res, 'You can’t turn protection on or off.', 403);
   }
   const f = {};
   if (protChange) f.protected = req.body.protected ? 1 : 0;
@@ -708,8 +709,10 @@ app.patch('/api/users/:id', auth, ownerFirst(patchWhat), requireBoss, (req, res)
 app.get('/api/users/:id/events', auth, (req, res) => {
   const id = Number(req.params.id);
   if (!isBoss(req.user) && req.user.id !== id) return bad(res, 'Not allowed.', 403);
+  // Owner records stay in the table (and the server log) but aren't shown: transfers never, refusals only to the owner.
+  const hide = isOwner(req.user) ? `AND e.action != 'owner_transfer'` : `AND e.action NOT IN ('owner_transfer','owner_refused')`;
   res.json({ events: db.prepare(`SELECT e.id, e.action, e.detail, e.created_at, a.name AS actor_name FROM account_events e
-    LEFT JOIN users a ON a.id = e.actor_id WHERE e.user_id = ? ORDER BY e.id DESC LIMIT 100`).all(id) });
+    LEFT JOIN users a ON a.id = e.actor_id WHERE e.user_id = ? ${hide} ORDER BY e.id DESC LIMIT 100`).all(id) });
 });
 
 // ---------- remove person (admins only) ----------
@@ -1244,7 +1247,7 @@ app.get('/api/teams/:id', auth, (req, res) => {
     FROM users m WHERE m.team_id = ? ${can_members ? '' : 'AND m.active = 1'}
     ORDER BY m.active DESC, m.id IN (SELECT user_id FROM team_powers WHERE team_id = ?) DESC, m.name`).all(t.id, t.id)
     .map(m => { const x = { ...m, active: !!m.active, is_lead: team.leads.some(l => l.id === m.id), is_manager: team.managers.some(l => l.id === m.id),
-        is_owner: isOwner(m), protected: isProtected(m) };
+        locked: isOwner(m), protected: !!m.protected };
       if (!team.can_see_counts) delete x.open_tasks; return x; });
   const people = table => db.prepare(`SELECT us.id, us.name, us.role, us.email, us.team_id FROM ${table} tl JOIN users us ON us.id = tl.user_id
     WHERE tl.team_id = ? AND us.active = 1 ORDER BY tl.added_at, tl.rowid`).all(t.id).map(l => ({ ...l, member: l.team_id === t.id }));
