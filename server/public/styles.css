@@ -218,6 +218,8 @@ table.history td.reasons{white-space:normal;min-width:180px}
 .team-card h2{margin:0;font-size:1.0625rem;overflow-wrap:anywhere}
 .team-card p{margin:8px 0 0;font-size:.9375rem}
 .team-card .warn-text{margin:8px 0 0}
+.program-note{display:inline;margin:0;font-size:.75rem;font-weight:600}
+.file-info .program-note{display:block;white-space:normal}
 .team-counts{display:flex;gap:16px;flex-wrap:wrap;padding-top:10px;border-top:1px solid var(--line);margin-top:12px!important}
 .choice{display:flex;gap:18px;flex-wrap:wrap;border:0;padding:0;margin:0 0 14px}
 .choice legend{padding:0;margin-bottom:6px;font-size:.875rem;font-weight:600}

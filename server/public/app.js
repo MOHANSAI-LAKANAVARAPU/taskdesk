@@ -16,10 +16,15 @@
   const PRIORITY = { low: 'Low', medium: 'Medium', high: 'High', urgent: 'Urgent' };
   const PSTATUS = { active: 'Active', on_hold: 'On hold', closed: 'Closed' };
   const RSTATUS = { needs_team: 'Needs a team', open: 'Open', assigned: 'Assigned', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled' };
-  const FILE_ACCEPT = '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp,.txt,.csv,.zip';
-  const fileInput = (label = 'Attach files (optional)') => `<label class="f"><span>${label}</span><input type="file" name="files" multiple accept="${FILE_ACCEPT}"><small class="muted">PDF, Word, Excel, PowerPoint, images, text or ZIP · up to 25 MB each, 5 at a time</small></label>`;
+  // Any file type; the size limit per file comes from the server (MAX_UPLOAD_MB, sent with /api/me and /api/login).
+  let uploadMb = 50;
+  const fileInput = (label = 'Attach files (optional)') => `<label class="f"><span>${label}</span><input type="file" name="files" multiple><small class="muted">Any file type · up to ${uploadMb} MB each, 5 at a time</small></label>`;
+  // Programs and scripts get a warning next to them (the server never runs or renders any uploaded file).
+  const PROGRAM_EXT = ['exe', 'msi', 'bat', 'cmd', 'com', 'scr', 'ps1', 'vbs', 'js', 'jar', 'sh', 'apk', 'dll', 'lnk', 'hta', 'appimage', 'deb', 'rpm'];
+  const isProgram = name => PROGRAM_EXT.includes((String(name).split('.').pop() || '').toLowerCase());
+  const programNote = name => isProgram(name) ? ' <span class="warn-text program-note" title="Program or script file">⚠ Program file: only open it if you trust the sender</span>' : '';
   const fmtSize = n => n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
-  const fileList = files => files && files.length ? `<ul class="files">${files.map(f => `<li><a href="/api/files/${f.id}" download>${esc(f.original_name)}</a> <span class="muted">${fmtSize(f.size)}</span></li>`).join('')}</ul>` : '';
+  const fileList = files => files && files.length ? `<ul class="files">${files.map(f => `<li><a href="/api/files/${f.id}" download>${esc(f.original_name)}</a> <span class="muted">${fmtSize(f.size)}</span>${programNote(f.original_name)}</li>`).join('')}</ul>` : '';
   // "X or any manager" from the server's approvers list (never includes the assignee).
   const approverText = a => {
     if (!a) return 'the person who assigned it';
@@ -125,7 +130,7 @@
       return page === 'login' ? viewLogin() : page === 'forgot' ? viewForgot() : viewSetPassword();
     }
     if (!me) {
-      try { me = (await api('/me')).user; } catch (e) { location.hash = '#/login'; return; }
+      try { const r = await api('/me'); me = r.user; uploadMb = r.upload_max_mb || uploadMb; } catch (e) { location.hash = '#/login'; return; }
     }
     // The old "My team" page (and People for non-managers) is now the Teams page.
     if (route === 'my-team') return location.replace('#/teams');
@@ -172,7 +177,8 @@
       e.preventDefault();
       const fd = new FormData(e.target);
       try {
-        me = (await api('/login', { method: 'POST', body: { email: fd.get('email'), password: fd.get('password') } })).user;
+        const r = await api('/login', { method: 'POST', body: { email: fd.get('email'), password: fd.get('password') } });
+        me = r.user; uploadMb = r.upload_max_mb || uploadMb;
         location.hash = '#/';
       } catch (err) { $('#loginErr').textContent = err.message; }
     };
@@ -1363,7 +1369,7 @@
   // polls every 10 seconds. Messages are read when the conversation is open and the page is visible.
   const chat = { id: null, conv: null, members: [], messages: [], more: false, loading: false, pending: [], list: [] };
   let chatUnread = 0, stream = null, chatPollTimer = null;
-  const MAX_CHAT_FILES = 5, MAX_CHAT_BYTES = 25 * 1048576;
+  const MAX_CHAT_FILES = 5;
   const chatPage = () => !!$('#chat');
   const parseTs = d => new Date(d.replace(' ', 'T') + (d.includes('Z') || d.includes('T') ? '' : 'Z'));
   const fmtTime = d => parseTs(d).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
@@ -1521,7 +1527,7 @@
       <form class="composer" id="composer">
         <div class="pending" id="pending"></div>
         <div class="composer-row">
-          <label class="btn ghost clip" title="Attach files (or drop or paste them here)"><span aria-hidden="true">📎</span><span class="sr">Attach files</span><input type="file" id="chatFiles" multiple accept="${FILE_ACCEPT}" hidden></label>
+          <label class="btn ghost clip" title="Attach files (or drop or paste them here)"><span aria-hidden="true">📎</span><span class="sr">Attach files</span><input type="file" id="chatFiles" multiple hidden></label>
           <textarea id="chatText" rows="1" maxlength="5000" placeholder="Write a message…" title="Enter sends, Shift+Enter starts a new line" aria-label="Message"></textarea>
           <button class="btn" type="submit" id="chatSend">Send</button>
         </div></form>`}
@@ -1569,7 +1575,7 @@
   function fileHtml(f) {
     if (f.is_image) return `<button type="button" class="thumb" data-img="/api/files/${f.id}?inline=1" data-file="${f.id}" data-name="${esc(f.name)}" aria-label="Open image ${esc(f.name)}"><img src="/api/files/${f.id}?inline=1" alt="${esc(f.name)}" loading="lazy"></button>`;
     const ext = (f.name.split('.').pop() || '').slice(0, 4).toUpperCase();
-    return `<div class="file-card"><span class="file-ext">${esc(ext)}</span><span class="file-info"><b>${esc(f.name)}</b><small class="muted">${fmtSize(f.size)}</small></span>
+    return `<div class="file-card"><span class="file-ext">${esc(ext)}</span><span class="file-info"><b>${esc(f.name)}</b><small class="muted">${fmtSize(f.size)}</small>${isProgram(f.name) ? '<small class="warn-text program-note">⚠ Program file: only open it if you trust the sender</small>' : ''}</span>
       <a class="btn ghost small" href="/api/files/${f.id}" download>Download</a></div>`;
   }
   async function loadOlder() {
@@ -1636,11 +1642,9 @@
     text.focus();
   }
   function addFiles(files) {
-    const ok = FILE_ACCEPT.split(',');
     for (const f of files) {
       if (chat.pending.length >= MAX_CHAT_FILES) { toast(`You can attach up to ${MAX_CHAT_FILES} files to one message.`); break; }
-      if (!ok.includes('.' + (f.name.split('.').pop() || '').toLowerCase())) { toast(`“${f.name}” isn’t an allowed file type.`); continue; }
-      if (f.size > MAX_CHAT_BYTES) { toast(`“${f.name}” is bigger than 25 MB.`); continue; }
+      if (f.size > uploadMb * 1048576) { toast(`“${f.name}” is bigger than ${uploadMb} MB.`); continue; }
       chat.pending.push(f);
     }
     renderPending();

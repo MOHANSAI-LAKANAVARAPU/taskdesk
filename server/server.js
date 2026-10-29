@@ -217,24 +217,31 @@ function canAssignTo(u, assignee) {
 
 
 // ---------- file uploads ----------
-// Files are stored in data/uploads/ under random names; the original name is kept in the files table.
-const MAX_FILE_MB = 25;
-const FILE_TYPES = {
-  '.pdf': 'application/pdf', '.txt': 'text/plain', '.csv': 'text/csv', '.zip': 'application/zip',
-  '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  '.xls': 'application/vnd.ms-excel', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  '.ppt': 'application/vnd.ms-powerpoint', '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp'
-};
+// Files are stored in data/uploads/ under random names; the original name is kept in the files table. Any file type is
+// allowed (firmware, source code, archives, docs…). Size per file: MAX_UPLOAD_MB from .env (default 50).
+// Nothing uploaded is ever run or rendered inside TaskDesk: downloads are always attachments, typed
+// application/octet-stream unless the content really is an image or a PDF (sniffFile), with nosniff and a sandbox CSP.
+const MAX_FILE_MB = (n => Number.isFinite(n) && n > 0 ? Math.min(Math.round(n), 2048) : 50)(Number(process.env.MAX_UPLOAD_MB));
+// Types recognised by their first bytes (never by the name alone). Only these are shown inline (chat image previews).
+const IMAGE_MIME = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+function sniffBytes(b) {
+  if (b.length >= 8 && b.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b.length >= 6 && ['GIF87a', 'GIF89a'].includes(b.slice(0, 6).toString('latin1'))) return 'image/gif';
+  if (b.length >= 12 && b.slice(0, 4).toString('latin1') === 'RIFF' && b.slice(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  if (b.length >= 5 && b.slice(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
+  return 'application/octet-stream';
+}
+function sniffFile(file) {
+  let fd;
+  try { fd = fs.openSync(file, 'r'); const b = Buffer.alloc(16); return sniffBytes(b.slice(0, fs.readSync(fd, b, 0, 16, 0))); }
+  catch (e) { return 'application/octet-stream'; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+}
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const upload = multer({
   storage: multer.diskStorage({ destination: UPLOAD_DIR, filename: (req, file, cb) => cb(null, crypto.randomBytes(16).toString('hex')) }),
-  limits: { fileSize: MAX_FILE_MB * 1024 * 1024, files: 5, fields: 20, fieldSize: 64 * 1024, parts: 30 },
-  fileFilter: (req, file, cb) => {
-    if (FILE_TYPES[path.extname(file.originalname || '').toLowerCase()]) return cb(null, true);
-    const e = new Error(`“${cleanFileName(file.originalname)}” isn’t an allowed file type. Use PDF, Word, Excel, PowerPoint, images, text or ZIP.`);
-    e.userMessage = true; cb(e);
-  }
+  limits: { fileSize: MAX_FILE_MB * 1024 * 1024, files: 5, fields: 20, fieldSize: 64 * 1024, parts: 30 }
 });
 function cleanFileName(name) {
   let n = String(name || 'file');
@@ -268,7 +275,7 @@ function saveUploads(req, link) {
     VALUES (?,?,?,?,?,?,?,?,?)`);
   for (const f of req.files || []) {
     const name = cleanFileName(f.originalname);
-    ins.run(name, f.filename, f.size, FILE_TYPES[path.extname(name).toLowerCase()] || 'application/octet-stream',
+    ins.run(name, f.filename, f.size, sniffFile(f.path),
       req.user.id, link.task_id || null, link.update_id || null, link.request_id || null, link.message_id || null);
   }
 }
@@ -305,7 +312,7 @@ app.post('/api/login', (req, res) => {
   db.prepare(`INSERT INTO sessions (token,user_id,expires_at) VALUES (?,?,datetime('now', ?))`).run(token, user.id, `+${SESSION_DAYS} days`);
   db.prepare(`DELETE FROM sessions WHERE expires_at < datetime('now')`).run();
   res.cookie('sid', token, { httpOnly: true, sameSite: 'lax', secure: COOKIE_SECURE, maxAge: SESSION_DAYS * 864e5 });
-  res.json({ user: publicUser(user) });
+  res.json({ user: publicUser(user), upload_max_mb: MAX_FILE_MB });
 });
 
 app.post('/api/logout', (req, res) => {
@@ -314,7 +321,7 @@ app.post('/api/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
+app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), upload_max_mb: MAX_FILE_MB }));
 
 app.post('/api/me/password', auth, (req, res) => {
   const { current, next: nextPw } = req.body;
@@ -1613,7 +1620,6 @@ app.get('/api/stream', auth, (req, res) => {
 // Only members of a conversation can read it, its files and its search hits — admins and managers included.
 // Every endpoint about one conversation starts with chatMember(); no membership = 404.
 const CHAT_PAGE = 50;
-const IMAGE_MIME = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 const chatMember = (u, convId) => db.prepare(`SELECT c.*, cm.last_read_message_id, cm.muted FROM conversations c
   JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = ? WHERE c.id = ?`).get(u.id, Number(convId));
 const memberIds = convId => db.prepare('SELECT user_id FROM conversation_members WHERE conversation_id = ?').all(convId).map(r => r.user_id);
@@ -1863,13 +1869,17 @@ app.get('/api/files/:id', auth, (req, res) => {
     ok = !!r && canSeeRequestFiles(u, r);
   }
   if (!ok || !/^[0-9a-f]{32}$/.test(f.stored_name)) return bad(res, 'File not found.', 404);
-  res.set({ 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store' });
-  res.type(f.mime || 'application/octet-stream');
+  const file = path.join(UPLOAD_DIR, f.stored_name);
+  // The type comes from the stored bytes, so a renamed .html/.svg/.js is just bytes; only real images may be inline.
+  const type = sniffFile(file);
+  inline = inline && IMAGE_MIME.includes(type);
+  res.set({ 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store', 'Content-Security-Policy': "default-src 'none'; sandbox" });
   if (inline) {
-    res.set({ 'Content-Security-Policy': 'sandbox', 'Cache-Control': 'private, max-age=86400' });
-    return res.sendFile(path.join(UPLOAD_DIR, f.stored_name), err => { if (err && !res.headersSent) bad(res, 'File not found.', 404); });
+    res.set({ 'Cache-Control': 'private, max-age=86400' });
+    res.type(type);
+    return res.sendFile(file, err => { if (err && !res.headersSent) bad(res, 'File not found.', 404); });
   }
-  res.download(path.join(UPLOAD_DIR, f.stored_name), f.original_name, err => {
+  res.download(file, f.original_name, { headers: { 'Content-Type': type } }, err => {
     if (err && !res.headersSent) bad(res, 'File not found.', 404);
   });
 });

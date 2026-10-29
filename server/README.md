@@ -52,6 +52,7 @@ pm2 save && pm2 startup
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` | – | Mail server, used exactly as written. Zoho: `smtppro.zoho.com`, `465`, `true` (SSL) |
 | `SMTP_USER` / `SMTP_PASS` | – | Mailbox sign-in. For Zoho use an **app-specific password** (Zoho Mail → Settings → Security → App passwords). Leave empty to turn email off |
 | `SMTP_FROM` | `SMTP_USER` | Sender address (shown as "TaskDesk"); must be the mailbox or one of its aliases |
+| `MAX_UPLOAD_MB` | 50 | Largest file per upload, in MB (any file type is allowed). Behind a reverse proxy, allow at least 5 × this per request |
 | `APP_URL` | – | Address people open TaskDesk at, used for every link in emails, e.g. `http://192.168.1.222:3000` |
 
 ## Email
@@ -70,7 +71,7 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        client_max_body_size 130m;   # 5 files of up to 25 MB each
+        client_max_body_size 260m;   # 5 files of up to MAX_UPLOAD_MB (50) each; raise it with MAX_UPLOAD_MB
     }
     # Chat live updates (Server-Sent Events): don't buffer, and keep the connection open.
     location /api/stream {
