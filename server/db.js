@@ -285,7 +285,7 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
       used_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_password_tokens_user ON password_tokens(user_id);`);
-  for (const c of ['email_assigned', 'email_approval', 'email_ready', 'email_unassigned'])
+  for (const c of ['email_assigned', 'email_approval', 'email_ready', 'email_unassigned', 'email_notes'])
     if (!userCols.includes(c)) db.exec(`ALTER TABLE users ADD COLUMN ${c} INTEGER NOT NULL DEFAULT 0`);
   // Team managers: a person with role "team_manager" manages one or more teams (set by managers/admins).
   db.exec(`CREATE TABLE IF NOT EXISTS team_managers (
@@ -309,6 +309,10 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
       PRIMARY KEY (file_id, task_id)
     );
     CREATE INDEX IF NOT EXISTS idx_task_files_task ON task_files(task_id);`);
+  // note_kind: 'note' or 'files' on an update someone posted with a note or files (for "new note" notifications);
+  // empty on status-only updates and on older rows.
+  if (!db.prepare('PRAGMA table_info(task_updates)').all().some(c => c.name === 'note_kind'))
+    db.exec('ALTER TABLE task_updates ADD COLUMN note_kind TEXT');
 })();
 
 // ---- Roles: users.role has no CHECK constraint any more (server.js validates it on every write) ----

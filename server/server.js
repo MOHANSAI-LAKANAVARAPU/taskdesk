@@ -444,7 +444,7 @@ app.post('/api/email/test', auth, requireAdmin, async (req, res) => {
 });
 
 // Optional notification emails (all off by default). "Still unassigned" only for people who lead a team.
-const EMAIL_PREFS = ['email_assigned', 'email_approval', 'email_ready', 'email_unassigned'];
+const EMAIL_PREFS = ['email_assigned', 'email_approval', 'email_ready', 'email_unassigned', 'email_notes'];
 const leadsAnyTeam = u => !!db.prepare('SELECT 1 FROM team_powers WHERE user_id = ?').get(u.id); // leads and team managers
 const prefsOf = u => ({ ...Object.fromEntries(EMAIL_PREFS.map(k => [k, !!u[k]])), can_unassigned: leadsAnyTeam(u), email_enabled: mailer.enabled() });
 app.get('/api/me/email-prefs', auth, (req, res) => res.json(prefsOf(req.user)));
@@ -479,6 +479,19 @@ function emailApprovers(taskId, actor) {
   for (const u of db.prepare('SELECT * FROM users WHERE active = 1 AND removed_at IS NULL AND email_approval = 1 AND id != ?').all(t.assignee_id))
     if (canReviewTask(u, t)) notifyEmail(u.id, 'email_approval', `Waiting for your approval: ${t.title}`, 'A task is waiting for your approval',
       [`${t.assignee_name} submitted "${t.title}" for approval.`], 'Review the task', `tasks/${t.id}`, actor && actor.id);
+}
+// Someone added a note or files to a task: its assignee is told, or its assigner when the assignee posted.
+// Only the first 100 characters of the note, never the files.
+function emailNote(taskId, actor, message, fileCount) {
+  const t = db.prepare('SELECT id, title, assignee_id, assigned_by FROM tasks WHERE id = ?').get(taskId);
+  if (!t) return;
+  const to = actor.id === t.assignee_id ? t.assigned_by : t.assignee_id;
+  const files = fileCount ? `${fileCount} file${fileCount === 1 ? '' : 's'}` : '';
+  const short = message.length > 100 ? message.slice(0, 100) + '…' : message;
+  notifyEmail(to, 'email_notes', message ? `New note on: ${t.title}` : `Files added to: ${t.title}`,
+    message ? 'A note was added to your task' : 'Files were added to your task',
+    message ? [`${actor.name} added a note to "${t.title}"${files ? ` with ${files}` : ''}:`, `“${short}”`] : [`${actor.name} sent ${files} to "${t.title}".`],
+    'Open the task', `tasks/${t.id}`, actor.id);
 }
 function emailRequestReady(taskId, actor) {
   const r = db.prepare(`SELECT id, title, requested_by FROM requests WHERE task_id = ? AND status = 'delivered' AND deleted_at IS NULL`).get(taskId);
@@ -1006,23 +1019,26 @@ app.post('/api/tasks/:id/updates', auth, canPostUpdate, withUploads, (req, res) 
   const completedAt = newStatus === 'completed' ? (task.completed_at || new Date().toISOString()) : null;
   const approvedBy = newStatus === 'completed' ? (task.status === 'completed' ? task.approved_by : u.id) : null;
   const others = [true, 1, '1', 'true'].includes(req.body.also_group) && (message || hasFiles) ? groupTargets(u, task) : [];
+  const noteKind = message ? 'note' : hasFiles ? 'files' : null; // what the desktop app and emails announce
   db.transaction(() => {
     db.prepare(`UPDATE tasks SET status = ?, progress = ?, completed_at = ?, approved_by = ?, updated_at = datetime('now') WHERE id = ?`)
       .run(newStatus, newProgress, completedAt, approvedBy, task.id);
     const autoMsg = newStatus !== task.status ? ({ assigned: 'Moved back to not started', in_progress: 'Started work', completed: 'Marked as completed' })[newStatus] : '';
     // A manager/admin completing their own (non-plain) task approves it themselves.
     const selfApproved = newStatus === 'completed' && task.status !== 'completed' && u.id === task.assignee_id && !ownPlainTask(task) && isBoss(u);
-    const up = db.prepare('INSERT INTO task_updates (task_id,user_id,message,progress,status) VALUES (?,?,?,?,?)')
-      .run(task.id, u.id, selfApproved ? `Self-approved by ${u.name}` + (message ? ': ' + message : '') : message || autoMsg || (hasFiles && status === undefined && progress === null ? 'Attached files' : 'Progress updated'), progress, newStatus !== task.status ? newStatus : null);
+    const up = db.prepare('INSERT INTO task_updates (task_id,user_id,message,progress,status,note_kind) VALUES (?,?,?,?,?,?)')
+      .run(task.id, u.id, selfApproved ? `Self-approved by ${u.name}` + (message ? ': ' + message : '') : message || autoMsg || (hasFiles && status === undefined && progress === null ? 'Attached files' : 'Progress updated'), progress, newStatus !== task.status ? newStatus : null, noteKind);
     syncRequestWithTask(task.id, newStatus, task.status);
     if (!others.length) return saveUploads(req, { task_id: task.id, update_id: up.lastInsertRowid });
     const links = [{ task_id: task.id, update_id: up.lastInsertRowid }];
     for (const o of others) {
       db.prepare(`UPDATE tasks SET updated_at = datetime('now') WHERE id = ?`).run(o.id);
-      links.push({ task_id: o.id, update_id: db.prepare('INSERT INTO task_updates (task_id,user_id,message) VALUES (?,?,?)').run(o.id, u.id, message || 'Attached files').lastInsertRowid });
+      links.push({ task_id: o.id, update_id: db.prepare('INSERT INTO task_updates (task_id,user_id,message,note_kind) VALUES (?,?,?,?)').run(o.id, u.id, message || 'Attached files', noteKind).lastInsertRowid });
     }
     saveSharedUploads(req, links);
   })();
+  // One email per copy (its assignee, or the assigner when the assignee posted), for those who turned it on.
+  if (noteKind) for (const id of [task.id, ...others.map(o => o.id)]) emailNote(id, u, message, (req.files || []).length);
   res.json({ task: db.prepare(`${TASK_SELECT} WHERE t.id = ?`).get(task.id), sent_to: others.length });
 });
 
@@ -2087,8 +2103,14 @@ app.get('/api/my-summary', auth, (req, res) => {
     WHERE r.status = 'cancelled' AND r.deleted_at IS NULL AND r.withdrawn_from_id IS NOT NULL AND r.closed_at >= ? AND r.requested_by != ?
       AND (r.withdrawn_from_id = ? OR tm.id IN ${LED_TEAMS}) ORDER BY r.id DESC LIMIT 100`)
     .all(new Date(Date.now() - 3 * 864e5).toISOString(), u.id, u.id, u.id);
+  // Notes and files added in the last 3 days by someone else: on my tasks, and on tasks I assigned when the assignee
+  // posted (kind: note|files). The desktop app notifies each id once.
+  const task_notes = db.prepare(`SELECT up.id, up.task_id, t.title, p.name AS by_name, up.note_kind AS kind
+    FROM task_updates up JOIN tasks t ON t.id = up.task_id JOIN users p ON p.id = up.user_id
+    WHERE up.note_kind IS NOT NULL AND up.user_id != ? AND t.deleted_at IS NULL AND up.created_at >= datetime('now','-3 days')
+      AND (t.assignee_id = ? OR (t.assigned_by = ? AND up.user_id = t.assignee_id)) ORDER BY up.id DESC LIMIT 100`).all(u.id, u.id, u.id);
   res.json({ user: publicUser(u), open: counts.open || 0, overdue: counts.overdue || 0, tasks, recently_approved, approvals, team_requests,
-    ready_requests, needs_team_requests, assign_requests, unassigned_reminders, team_asks, withdrawn, chat_unread: chatUnreadTotal(u.id) });
+    ready_requests, needs_team_requests, assign_requests, unassigned_reminders, team_asks, withdrawn, task_notes, chat_unread: chatUnreadTotal(u.id) });
 });
 
 // ---------- dashboard ----------

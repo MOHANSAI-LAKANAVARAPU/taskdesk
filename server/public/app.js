@@ -1320,6 +1320,7 @@
   async function viewAccount() {
     const prefs = await api('/me/email-prefs');
     const emailRows = [['email_assigned', 'A task is assigned to me'], ['email_approval', 'A task is waiting for my approval'],
+      ['email_notes', 'Someone adds a note or files to my task'],
       ['email_ready', 'My request is ready'], ...(prefs.can_unassigned ? [['email_unassigned', 'A request for my team is still unassigned after 24 hours']] : [])];
     app.innerHTML = `
       <div class="page-head"><div><h1>Your account</h1><p>${esc(me.name)} · ${esc(me.email)} · ${ROLE[me.role]}</p></div></div>
