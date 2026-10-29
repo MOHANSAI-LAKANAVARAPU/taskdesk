@@ -1800,7 +1800,7 @@ const chatMember = (u, convId) => db.prepare(`SELECT c.*, cm.last_read_message_i
   JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = ? WHERE c.id = ?`).get(u.id, Number(convId));
 const memberIds = convId => db.prepare('SELECT user_id FROM conversation_members WHERE conversation_id = ?').all(convId).map(r => r.user_id);
 const UNREAD = `(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = cm.conversation_id AND m.id > cm.last_read_message_id
-  AND m.deleted_at IS NULL AND (m.sender_id IS NULL OR m.sender_id != cm.user_id))`;
+  AND m.deleted_at IS NULL AND m.system = 0 AND (m.sender_id IS NULL OR m.sender_id != cm.user_id))`;
 // Unread messages in the user's unmuted chats (the menu count and the desktop badge).
 const chatUnreadTotal = uid => db.prepare(`SELECT COALESCE(SUM(${UNREAD}), 0) AS n FROM conversation_members cm WHERE cm.user_id = ? AND cm.muted = 0`).get(uid).n;
 // A direct chat is named after the other person.
@@ -1810,13 +1810,42 @@ function chatName(c, uid) {
     WHERE cm.conversation_id = ? AND cm.user_id != ?`).get(c.id, uid);
   return o ? o.name : 'Former member';
 }
-// Group creators and managers/admins (who are members) may rename a group and add/remove people.
-const canManageChat = (u, c) => c.type === 'group' && !c.archived_at && (c.created_by === u.id || isBoss(u));
+// Group admins (group chats only): the creator, every member whose role is admin, manager, team_manager or lead, and
+// members another group admin made one (conversation_members.is_admin). They add and remove people, rename the group
+// and make group admins. Team chats follow the team; direct chats can't be changed.
+const AUTO_ADMIN_ROLES = ['admin', 'manager', 'team_manager', 'lead'];
+// Why a member is a group admin: 'creator', 'role', 'made' or null (also null for non-members and other chat types).
+function groupAdminReason(c, userId) {
+  if (c.type !== 'group') return null;
+  const m = db.prepare(`SELECT us.role, cm.is_admin FROM conversation_members cm JOIN users us ON us.id = cm.user_id
+    WHERE cm.conversation_id = ? AND cm.user_id = ?`).get(c.id, userId);
+  if (!m) return null;
+  return c.created_by === userId ? 'creator' : AUTO_ADMIN_ROLES.includes(m.role) ? 'role' : m.is_admin ? 'made' : null;
+}
+const canManageChat = (u, c) => c.type === 'group' && !c.archived_at && !!groupAdminReason(c, u.id);
+// Removing a member: the creator only by a company manager/admin; another group admin (made one, or by role) only by
+// the creator or a company manager/admin; everyone else by any group admin. Taking away admin rights that were given
+// (is_admin) follows the same rule, and anyone may give up their own.
+function canRemoveChatMember(u, c, targetId) {
+  if (!canManageChat(u, c) || targetId === u.id) return false;
+  const r = groupAdminReason(c, targetId);
+  if (r === 'creator') return isBoss(u);
+  return r ? c.created_by === u.id || isBoss(u) : true;
+}
+function canUnmakeChatAdmin(u, c, targetId) {
+  if (c.type !== 'group' || c.archived_at || groupAdminReason(c, targetId) !== 'made') return false;
+  return targetId === u.id || (canManageChat(u, c) && (c.created_by === u.id || isBoss(u)));
+}
+// A small system line in the chat ("X added Y"). Not a message: no notification, not unread, not in previews or search.
+function chatSystemLine(convId, actorId, text) {
+  db.prepare('INSERT INTO messages (conversation_id, sender_id, body, system) VALUES (?,?,?,1)').run(convId, actorId, text);
+}
 function messageViews(rows) {
   const files = rows.length ? db.prepare(`SELECT id, message_id, original_name AS name, size, mime FROM files
     WHERE message_id IN (${rows.map(() => '?').join(',')}) ORDER BY id`).all(...rows.map(m => m.id)) : [];
   return rows.map(m => m.deleted_at
     ? { id: m.id, sender_id: m.sender_id, sender_name: m.sender_name, created_at: m.created_at, deleted: true, body: '', files: [] }
+    : m.system ? { id: m.id, sender_id: m.sender_id, sender_name: m.sender_name, created_at: m.created_at, deleted: false, system: true, body: m.body, files: [] }
     : { id: m.id, sender_id: m.sender_id, sender_name: m.sender_name, created_at: m.created_at, deleted: false, body: m.body,
         files: files.filter(f => f.message_id === m.id).map(({ message_id, ...f }) => ({ ...f, is_image: IMAGE_MIME.includes(f.mime) })) });
 }
@@ -1856,7 +1885,7 @@ app.get('/api/chat', auth, (req, res) => {
       lm.id AS last_id, lm.body AS last_body, lm.deleted_at AS last_deleted, lm.sender_id AS last_sender_id, ls.name AS last_sender_name,
       (SELECT original_name FROM files f WHERE f.message_id = lm.id ORDER BY f.id LIMIT 1) AS last_file
     FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id
-    LEFT JOIN messages lm ON lm.id = (SELECT MAX(id) FROM messages WHERE conversation_id = c.id) LEFT JOIN users ls ON ls.id = lm.sender_id
+    LEFT JOIN messages lm ON lm.id = (SELECT MAX(id) FROM messages WHERE conversation_id = c.id AND system = 0) LEFT JOIN users ls ON ls.id = lm.sender_id
     WHERE cm.user_id = ? ORDER BY c.archived_at IS NOT NULL, COALESCE(c.last_message_at, c.created_at) DESC, c.id DESC`).all(u.id);
   const conversations = rows.map(c => ({
     id: c.id, type: c.type, name: chatName(c, u.id), muted: !!c.muted, archived: !!c.archived_at, unread: c.unread, member_count: c.member_count,
@@ -1902,7 +1931,7 @@ app.post('/api/chat/groups', auth, (req, res) => {
 function managedChat(req, res) {
   const c = chatMember(req.user, req.params.id);
   if (!c) { bad(res, 'Conversation not found.', 404); return null; }
-  if (!canManageChat(req.user, c)) { bad(res, c.type === 'group' ? 'Only the person who made this group or a manager can change it.' : 'Only groups can be changed.', 403); return null; }
+  if (!canManageChat(req.user, c)) { bad(res, c.type === 'group' ? (c.archived_at ? 'This chat is archived.' : 'Only group admins can change this group.') : 'Only groups can be changed.', 403); return null; }
   return c;
 }
 app.patch('/api/chat/:id', auth, (req, res) => {
@@ -1917,7 +1946,7 @@ app.put('/api/chat/:id/members/:userId', auth, (req, res) => {
   const c = managedChat(req, res); if (!c) return;
   const p = ACTIVE_USER(req.params.userId);
   if (!p) return bad(res, 'Choose an active person.');
-  addChatMembers(c.id, [p.id]);
+  db.transaction(() => { if (addChatMembers(c.id, [p.id]).length) chatSystemLine(c.id, req.user.id, `${req.user.name} added ${p.name}`); })();
   push(memberIds(c.id), 'conversation', { conversation_id: c.id });
   res.json({ ok: true });
 });
@@ -1926,8 +1955,45 @@ app.delete('/api/chat/:id/members/:userId', auth, (req, res) => {
   const uid = Number(req.params.userId);
   if (uid === req.user.id) return bad(res, 'Use "Leave" to leave the group.');
   const before = memberIds(c.id);
-  db.prepare('DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?').run(c.id, uid);
+  if (!before.includes(uid)) return bad(res, 'This person isn’t in the group.', 404);
+  if (!canRemoveChatMember(req.user, c, uid)) return bad(res, groupAdminReason(c, uid) === 'creator'
+    ? 'Only a company manager or admin can remove the person who made the group.'
+    : 'Only the person who made the group or a company manager or admin can remove another group admin.', 403);
+  const who = db.prepare('SELECT name FROM users WHERE id = ?').get(uid);
+  db.transaction(() => {
+    db.prepare('DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?').run(c.id, uid);
+    chatSystemLine(c.id, req.user.id, `${req.user.name} removed ${who.name}`);
+  })();
   push(before, 'conversation', { conversation_id: c.id });
+  res.json({ ok: true });
+});
+// Make a member a group admin (any group admin) / take back admin rights that were given (see canUnmakeChatAdmin).
+app.put('/api/chat/:id/admins/:userId', auth, (req, res) => {
+  const c = managedChat(req, res); if (!c) return;
+  const uid = Number(req.params.userId);
+  if (!memberIds(c.id).includes(uid)) return bad(res, 'This person isn’t in the group.', 404);
+  if (groupAdminReason(c, uid)) return bad(res, 'This person is already a group admin.', 409);
+  const who = db.prepare('SELECT name FROM users WHERE id = ?').get(uid);
+  db.transaction(() => {
+    db.prepare('UPDATE conversation_members SET is_admin = 1 WHERE conversation_id = ? AND user_id = ?').run(c.id, uid);
+    chatSystemLine(c.id, req.user.id, `${req.user.name} made ${who.name} a group admin`);
+  })();
+  push(memberIds(c.id), 'conversation', { conversation_id: c.id });
+  res.json({ ok: true });
+});
+app.delete('/api/chat/:id/admins/:userId', auth, (req, res) => {
+  const c = chatMember(req.user, req.params.id);
+  if (!c) return bad(res, 'Conversation not found.', 404);
+  const uid = Number(req.params.userId), why = groupAdminReason(c, uid);
+  if (why === 'creator' || why === 'role') return bad(res, why === 'creator' ? 'The person who made the group is always a group admin.' : 'This person is a group admin because of their role.', 409);
+  if (why !== 'made') return bad(res, 'This person isn’t a group admin.', 404);
+  if (!canUnmakeChatAdmin(req.user, c, uid)) return bad(res, 'Only the person who made the group or a company manager or admin can take away another group admin’s rights.', 403);
+  const who = db.prepare('SELECT name FROM users WHERE id = ?').get(uid);
+  db.transaction(() => {
+    db.prepare('UPDATE conversation_members SET is_admin = 0 WHERE conversation_id = ? AND user_id = ?').run(c.id, uid);
+    chatSystemLine(c.id, req.user.id, uid === req.user.id ? `${who.name} gave up group admin rights` : `${req.user.name} removed ${who.name}’s group admin rights`);
+  })();
+  push(memberIds(c.id), 'conversation', { conversation_id: c.id });
   res.json({ ok: true });
 });
 app.post('/api/chat/:id/leave', auth, (req, res) => {
@@ -1952,7 +2018,7 @@ app.get('/api/chat/search', auth, (req, res) => {
   const like = '%' + q.replace(/[\\%_]/g, c => '\\' + c) + '%';
   const rows = db.prepare(`${MSG_SELECT} JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
     JOIN conversations c ON c.id = m.conversation_id
-    WHERE m.deleted_at IS NULL AND (m.body LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM files f WHERE f.message_id = m.id AND f.original_name LIKE ? ESCAPE '\\'))
+    WHERE m.deleted_at IS NULL AND m.system = 0 AND (m.body LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM files f WHERE f.message_id = m.id AND f.original_name LIKE ? ESCAPE '\\'))
     ORDER BY m.id DESC LIMIT 50`).all(u.id, like, like);
   const names = {};
   res.json({ results: messageViews(rows).map((m, i) => {
@@ -1964,8 +2030,13 @@ app.get('/api/chat/search', auth, (req, res) => {
 app.get('/api/chat/:id', auth, (req, res) => {
   const u = req.user, c = chatMember(u, req.params.id);
   if (!c) return bad(res, 'Conversation not found.', 404);
+  // admin: why the member is a group admin ('creator', 'role', 'made' or null); can_*: what this user may do to them.
   const members = db.prepare(`SELECT us.id, us.name, us.active, tm.name AS team_name FROM conversation_members cm JOIN users us ON us.id = cm.user_id
-    LEFT JOIN teams tm ON tm.id = us.team_id WHERE cm.conversation_id = ? ORDER BY us.name`).all(c.id).map(m => ({ ...m, active: !!m.active }));
+    LEFT JOIN teams tm ON tm.id = us.team_id WHERE cm.conversation_id = ? ORDER BY us.name`).all(c.id).map(m => {
+      const admin = groupAdminReason(c, m.id), manage = canManageChat(u, c);
+      return { ...m, active: !!m.active, admin, can_remove: canRemoveChatMember(u, c, m.id),
+        can_make_admin: manage && !admin, can_unmake_admin: canUnmakeChatAdmin(u, c, m.id) };
+    });
   const rows = db.prepare(`${MSG_SELECT} WHERE m.conversation_id = ? ORDER BY m.id DESC LIMIT ?`).all(c.id, CHAT_PAGE).reverse();
   res.json({ conversation: { id: c.id, type: c.type, name: chatName(c, u.id), muted: !!c.muted, archived: !!c.archived_at, created_by: c.created_by,
     can_manage: canManageChat(u, c), last_read_message_id: c.last_read_message_id }, members, messages: messageViews(rows), more: rows.length === CHAT_PAGE });
@@ -2010,7 +2081,7 @@ app.post('/api/chat/:id/messages', auth, chatPostable, withUploads, (req, res) =
 app.delete('/api/chat/messages/:id', auth, (req, res) => {
   const m = db.prepare('SELECT * FROM messages WHERE id = ?').get(Number(req.params.id));
   if (!m || !chatMember(req.user, m.conversation_id)) return bad(res, 'Message not found.', 404);
-  if (m.sender_id !== req.user.id) return bad(res, 'You can only delete your own messages.', 403);
+  if (m.sender_id !== req.user.id || m.system) return bad(res, 'You can only delete your own messages.', 403);
   db.prepare(`UPDATE messages SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`).run(m.id); // files stay on disk
   push(memberIds(m.conversation_id), 'deleted', uid => ({ conversation_id: m.conversation_id, message_id: m.id, unread_total: chatUnreadTotal(uid) }));
   res.json({ ok: true });

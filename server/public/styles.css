@@ -382,3 +382,7 @@ details.group[open] > summary::before{transform:rotate(90deg)}
 .acct-hist summary{cursor:pointer;color:var(--accent-text);font-weight:600}
 .acct-events{list-style:none;padding:0;margin:8px 0 0;max-height:180px;overflow:auto}
 .acct-events li{padding:4px 0;border-bottom:1px solid var(--line)}
+/* Chat system lines ("X added Y") and the People dialog actions */
+.sys-line{text-align:center;color:var(--muted);font-size:.75rem;margin:8px 0}
+.chat-people li{gap:8px;flex-wrap:wrap}
+.chat-people .pill.adm{background:var(--soft);color:var(--muted)}

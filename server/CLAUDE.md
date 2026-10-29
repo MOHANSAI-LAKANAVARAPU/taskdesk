@@ -147,7 +147,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 
 ### Chat (1.0.14)
 - **Privacy:** only members of a conversation can read it, its files and its search hits — **admins and managers included**. Every chat endpoint starts with `chatMember(u, id)` (no membership → 404), and `GET /api/files/:id` for a chat file checks membership too. Don't add a "boss sees everything" shortcut here.
-- Types: `direct` (one per pair of people; found or created inside a transaction by `POST /api/chat/direct`), `group` (name + people; the creator and managers/admins **who are members** can rename and add/remove people; anyone can leave), `team` (one per team, kept in sync by `syncTeamChats()`: members = the team's active members plus all its leads and team managers, even those who aren't members; it runs at startup and after every change to users, teams, team members and leads; a rename of the team renames the chat). People added later see the history, but it doesn't count as unread (their `last_read_message_id` starts at the latest message). Someone removed loses access completely. Deactivated people leave team chats but stay in direct/group chats.
+- Types: `direct` (one per pair of people; found or created inside a transaction by `POST /api/chat/direct`), `group` (name + people; managed by its group admins, see "Group admins" below; anyone can leave), `team` (one per team, kept in sync by `syncTeamChats()`: members = the team's active members plus all its leads and team managers, even those who aren't members; it runs at startup and after every change to users, teams, team members and leads; a rename of the team renames the chat). People added later see the history, but it doesn't count as unread (their `last_read_message_id` starts at the latest message). Someone removed loses access completely. Deactivated people leave team chats but stay in direct/group chats.
 - Deleting a team archives its chat (`conversations.archived_at`, name gets " (team deleted)"): its members can still read it, nobody can post (409).
 - Messages: text up to 5000 characters and/or up to 5 files (same upload rules as everywhere: `withUploads`, any type, `MAX_UPLOAD_MB` each; membership is checked before the upload is parsed). Files are `files` rows with `message_id`. A sender can delete their own message: `deleted_at` is set, the API no longer returns its text or files ("This message was deleted"), the files return 404 but stay on disk (archive-not-delete). No editing yet (`edited_at` is unused).
 - Unread = messages after the member's `last_read_message_id`, not deleted, not their own. `chatUnreadTotal()` (menu count, desktop badge, `chat_unread` in my-summary) leaves out muted chats. `POST /api/chat/:id/read` only moves forward. The page marks a chat read only while it is open, the page is visible and the window focused.
@@ -155,6 +155,24 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - Images: `GET /api/files/:id?inline=1` sends PNG/JPG/GIF/WEBP **chat** images inline (thumbnails, lightbox) with `nosniff` and `Content-Security-Policy: sandbox`; everything else is always an attachment.
 - Search (`GET /api/chat/search?q=`, 2+ characters): message text and file names, only in the user's own conversations, deleted messages left out; `LIKE` with `%`/`_` escaped.
 - **Live updates:** `GET /api/stream` (Server-Sent Events, session cookie) keeps an in-memory `Map<userId, Set<res>>` (max 10 per user; a ping every 25 s also ends the stream when the session is gone). `push(userIds, event, data)` sends `message` (`conversation_id`, `conversation_name` as the receiver sees it, `type`, `muted` = the receiver's setting, `unread_total`, `message`), `deleted`, `read` (to the reader's own pages/apps only) and `conversation` (created/renamed/members changed; also to people just removed). The page uses `EventSource`; while it isn't open it polls `GET /api/chat` and `GET /api/chat/:id/messages?after=<id>` every 10 s. Behind Nginx, `/api/stream` needs `proxy_buffering off` (the server also sends `X-Accel-Buffering: no`) and a long `proxy_read_timeout` (see README).
+- **Group admins** (group chats only; backup `../backups/taskdesk-before-group-admins-2026-10-29.*`):
+  - **Who** (`groupAdminReason(c, userId)` → `creator` / `role` / `made`):
+    - the creator (`conversations.created_by`);
+    - every member whose role is admin, manager, team_manager or lead (`AUTO_ADMIN_ROLES`, from their current role);
+    - members another group admin made one (`conversation_members.is_admin`).
+  - **What they can do** (`canManageChat`, also needs the chat not archived): add active people (type-to-search, with the note "They'll be able to see earlier messages in this group."), remove members, rename the group, and make any member a group admin (`PUT /api/chat/:id/admins/:userId`).
+  - **Removing someone** (`canRemoveChatMember`):
+    - the creator only by a company manager/admin (`isBoss`);
+    - another group admin (by role or made one) only by the creator or a company manager/admin;
+    - plain members by any group admin.
+  - **Taking away admin rights** that were given (`DELETE /api/chat/:id/admins/:userId`, `canUnmakeChatAdmin`) follows the same rule, and anyone may give up their own. Admins by role or the creator can't be unmade (409).
+  - **Employees who aren't group admins** can read, send, mute and leave only. Anyone can leave, the creator included; nobody else can then remove them, since they're gone.
+  - **Not affected:** team chats stay automatic (no group admins, `Only groups can be changed.`) and direct chats are unchanged.
+  - **The People dialog** shows "Made the group" / "Group admin" and only the buttons the server allows: the per-member `admin`, `can_remove`, `can_make_admin` and `can_unmake_admin` from `GET /api/chat/:id`.
+- **System lines** (`messages.system = 1`, `chatSystemLine()`):
+  - The lines are "X added Y", "X removed Y", "X made Y a group admin", "X removed Y's group admin rights" and "Y gave up group admin rights". `sender_id` = who did it.
+  - They are shown as small centred lines (`system: true` in message views).
+  - They are **not messages**: never pushed as a `message` event (so no desktop or browser notification; the change is pushed as a `conversation` event, which reloads the open chat), never unread (`UNREAD`), never the chat-list preview, not in search, and can't be deleted.
 - Page: `#/chat` (list: name, last message, time, unread; search; "New chat" picks anyone active via `GET /api/chat/people`, "New group") and `#/chat/:id` (header with Mute/People/Rename/Leave; messages grouped per sender within 5 minutes, "Today"/"Yesterday" separators, links made clickable after escaping; paperclip, drag and drop, pasted images named `pasted-image-<time>.png`; image thumbnails open in a lightbox, other files as a card with Download; 50 messages, older ones load on scroll up). On phones the list and the conversation show one at a time.
 
 ### Files
@@ -231,8 +249,8 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - **files**: id, original_name, stored_name (random, unique), size, mime (from the content, `sniffFile`), uploaded_by → users, task_id → tasks (cascade), update_id → task_updates, request_id → requests (cascade), created_at, message_id → messages (cascade; chat attachments, added with `ALTER TABLE` in 1.0.14, backup `../backups/taskdesk-before-chat-2026-10-28.*`). A shared assignment file has no task_id/request_id/message_id; it is reached through `task_files`.
 - **task_files**: file_id → files (cascade), task_id → tasks (cascade), update_id → task_updates (SET NULL); primary key (file_id, task_id), index on task_id. Links one stored file to every copy of a multi-person assignment (see "Multi-person assignments").
 - **conversations** (1.0.14): id, type (direct|group|team, validated in server.js), name (groups/teams), team_id → teams (SET NULL; unique for type team), created_by → users (SET NULL), created_at, last_message_at, archived_at (team deleted).
-- **conversation_members**: conversation_id → conversations (cascade), user_id → users (cascade), joined_at, last_read_message_id, muted; primary key (conversation_id, user_id).
-- **messages**: id, conversation_id → conversations (cascade), sender_id → users (SET NULL), body, created_at, edited_at (unused), deleted_at.
+- **conversation_members**: conversation_id → conversations (cascade), user_id → users (cascade), joined_at, last_read_message_id, muted, is_admin (0/1, made a group admin; added with `ALTER TABLE`); primary key (conversation_id, user_id).
+- **messages**: id, conversation_id → conversations (cascade), sender_id → users (SET NULL), body, created_at, edited_at (unused), deleted_at, system (0/1, a system line like "X added Y"; added with `ALTER TABLE`).
 
 ## API endpoints ([server.js](server.js))
 
@@ -288,7 +306,8 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | GET `/api/chat` | signed in | The user's conversations (name, last message, time, unread, muted, archived, `can_manage`) + `unread_total` |
 | GET `/api/chat/people` | signed in | Everyone active (name, role, team) for New chat / New group |
 | POST `/api/chat/direct` / `/api/chat/groups` | signed in | `{user_id}` open or create a direct chat / `{name, user_ids}` new group |
-| PATCH `/api/chat/:id`, PUT/DELETE `/api/chat/:id/members/:userId` | group creator or manager/admin member | Rename / add / remove |
+| PATCH `/api/chat/:id`, PUT/DELETE `/api/chat/:id/members/:userId` | group admins (removing: see "Group admins") | Rename / add / remove (adds and removes write a system line) |
+| PUT/DELETE `/api/chat/:id/admins/:userId` | PUT: group admins; DELETE: the creator or a company manager/admin, or the person themself | Make a member a group admin / take away given admin rights |
 | POST `/api/chat/:id/leave`, PUT `/api/chat/:id/mute` | member | Leave a group / `{muted}` |
 | GET `/api/chat/:id`, GET `/api/chat/:id/messages?before=` / `?after=` | member | Conversation, members, latest 50 messages / older 50 / newer (polling) |
 | POST `/api/chat/:id/messages` | member (not archived) | `body` and/or `files` (multipart) |

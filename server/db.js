@@ -332,6 +332,12 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
     );
     CREATE INDEX IF NOT EXISTS idx_account_events_user ON account_events(user_id);
     CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT);`);
+  // Group chat admins: is_admin = made a group admin by another group admin (the creator and leads, team managers,
+  // managers and admins are group admins automatically). messages.system = a small system line ("X added Y").
+  if (!db.prepare('PRAGMA table_info(conversation_members)').all().some(c => c.name === 'is_admin'))
+    db.exec('ALTER TABLE conversation_members ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0');
+  if (!db.prepare('PRAGMA table_info(messages)').all().some(c => c.name === 'system'))
+    db.exec('ALTER TABLE messages ADD COLUMN system INTEGER NOT NULL DEFAULT 0');
 })();
 
 // ---- Roles: users.role has no CHECK constraint any more (server.js validates it on every write) ----

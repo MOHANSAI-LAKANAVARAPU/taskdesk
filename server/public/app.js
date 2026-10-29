@@ -1593,10 +1593,12 @@
     const box = $('#chatMsgs'); if (!box) return;
     const nearBottom = toBottom || box.scrollHeight - box.scrollTop - box.clientHeight < 120;
     let html = chat.more ? `<p class="chat-more muted">Scroll up for older messages</p>` : chat.messages.length ? '' : `<p class="empty">No messages yet. Say hello!</p>`;
-    let prev = null;
+    let prev = null, lastDay = null;
     for (const m of chat.messages) {
       const day = dayLabel(m.created_at);
-      if (!prev || dayLabel(prev.created_at) !== day) { html += `<div class="day-sep"><span>${esc(day)}</span></div>`; prev = null; }
+      if (day !== lastDay) { html += `<div class="day-sep"><span>${esc(day)}</span></div>`; prev = null; lastDay = day; }
+      // System lines ("X added Y"): small and centred, never grouped with messages.
+      if (m.system) { html += `<p class="sys-line" data-id="${m.id}">${esc(m.body)} · <time datetime="${esc(m.created_at)}">${esc(fmtTime(m.created_at))}</time></p>`; prev = null; continue; }
       const grouped = prev && prev.sender_id === m.sender_id && parseTs(m.created_at) - parseTs(prev.created_at) < 5 * 60e3;
       const mine = m.sender_id === me.id;
       html += `<div class="msg${mine ? ' mine' : ''}${grouped ? ' grouped' : ''}" data-id="${m.id}">
@@ -1718,16 +1720,21 @@
     });
     const picker = personPicker(modalForm.querySelector('.picker'), people);
   }
+  // People in a chat. In groups, group admins (the creator, leads, team managers, managers, admins, and members made
+  // admin) add people and see Remove / Make group admin where the server allows it (the per-member can_* flags).
   async function peopleDialog() {
     const c = chat.conv, manage = c.can_manage;
     const people = manage ? (await api('/chat/people')).people.filter(p => !chat.members.some(m => m.id === p.id)) : [];
+    const badge = m => m.admin === 'creator' ? ' <span class="pill accent">Made the group</span>' : m.admin ? ' <span class="pill adm">Group admin</span>' : '';
     openModal(`<h2 style="font-size:1.25rem">People in ${esc(c.name)}</h2>
       ${c.type === 'team' ? '<p class="muted">Team chats follow team membership (and include the team’s leads).</p>' : ''}
-      <ul class="rows chat-people">${chat.members.map(m => `<li><span><b>${esc(m.name)}</b>${m.id === me.id ? ' (you)' : ''}${m.id === c.created_by && c.type === 'group' ? ' <span class="pill accent">Made the group</span>' : ''}${m.active ? '' : ' <span class="muted">(deactivated)</span>'}
+      <ul class="rows chat-people">${chat.members.map(m => `<li><span><b>${esc(m.name)}</b>${m.id === me.id ? ' (you)' : ''}${c.type === 'group' ? badge(m) : ''}${m.active ? '' : ' <span class="muted">(deactivated)</span>'}
         <small class="muted">${esc(m.team_name || '')}</small></span>
-        ${manage && m.id !== me.id ? `<button type="button" class="btn danger small" data-rmm="${m.id}">Remove</button>` : ''}</li>`).join('')}</ul>
-      ${manage ? pickerHtml('Add people', 'Type a name, then press “Add”.') : ''}
-      <div class="modal-actions"><button class="btn ghost" value="cancel" formnovalidate>Close</button>${manage ? '<button class="btn" type="submit">Add</button>' : ''}</div>`, async () => {
+        <span class="inline-actions">${m.can_make_admin ? `<button type="button" class="btn ghost small" data-mkadm="${m.id}">Make group admin</button>` : ''}
+        ${m.can_unmake_admin ? `<button type="button" class="btn ghost small" data-unadm="${m.id}">${m.id === me.id ? 'Give up admin rights' : 'Remove admin rights'}</button>` : ''}
+        ${m.can_remove ? `<button type="button" class="btn danger small" data-rmm="${m.id}">Remove</button>` : ''}</span></li>`).join('')}</ul>
+      ${manage ? pickerHtml('Add people', 'They’ll be able to see earlier messages in this group.') : ''}
+      <div class="modal-actions"><button class="btn ghost" value="cancel" formnovalidate>Close</button>${manage ? '<button class="btn" type="submit">Add people</button>' : ''}</div>`, async () => {
       const ids = picker ? picker.values() : [];
       if (!ids.length) throw new Error('Choose someone to add.');
       for (const id of ids) await api(`/chat/${c.id}/members/${id}`, { method: 'PUT' });
@@ -1739,6 +1746,12 @@
       if (!confirm(`Remove ${m.name} from “${c.name}”?`)) return;
       try { await api(`/chat/${c.id}/members/${m.id}`, { method: 'DELETE' }); modal.close(); toast(m.name + ' removed'); reloadConversation(); } catch (e) { toast(e.message); }
     });
+    const adminAction = (attr, method, done) => modalForm.querySelectorAll(`[${attr}]`).forEach(b => b.onclick = async () => {
+      const m = chat.members.find(x => x.id === Number(b.getAttribute(attr)));
+      try { await api(`/chat/${c.id}/admins/${m.id}`, { method }); modal.close(); toast(done(m)); reloadConversation(); } catch (e) { toast(e.message); }
+    });
+    adminAction('data-mkadm', 'PUT', m => `${m.name} is now a group admin`);
+    adminAction('data-unadm', 'DELETE', m => m.id === me.id ? 'You’re no longer a group admin' : `${m.name} is no longer a group admin`);
   }
 
   router();
