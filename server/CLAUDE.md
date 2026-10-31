@@ -83,6 +83,11 @@ Roles: `admin`, `manager` (shown as "Manager (all teams)": the company manager),
 
 Other rules: a user cannot deactivate themself; only admins can create admins or modify admin accounts. Deadlines/start dates are `YYYY-MM-DD`.
 
+**Password rules (Security A1, `passwordProblem`)** apply wherever a password is set: Account → Change password (`POST /api/me/password`), set-password links from the welcome email and "Forgot password?" (`POST /api/password/set`), and passwords a manager types (`POST /api/users`, `PATCH /api/users/:id`). Existing passwords keep working; only new ones are checked. A refused password leaves a set-password link usable.
+- At least 10 characters (at most 200).
+- Not a common password: `common-passwords.txt` holds the top 1000 of the SecLists "10k most common" list, plus its 51 entries of 10+ characters, since the length rule already stops every top-1000 one. Also refused: such a password with digits or symbols around it (`password123!`, `2024monkey!!`), the same one twice (`dragondragon`), and one repeated character.
+- It can't contain the person's email name: the part before `@` (and before `+`) if it has 3+ characters, or a 4+ character piece of it split at `.`, `_` or `-`.
+
 **Owner and protected accounts** (backup `../backups/taskdesk-before-owner-2026-10-29.*`):
 
 The owner:

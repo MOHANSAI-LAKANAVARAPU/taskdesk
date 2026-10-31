@@ -226,15 +226,15 @@
     const welcome = info.purpose === 'welcome';
     app.innerHTML = loginCard(welcome ? 'Set your password' : 'Choose a new password', `
         <p class="muted" style="margin:-6px 0 14px;font-size:.9375rem">${welcome ? `Welcome, ${esc(info.name)}. Choose the password you’ll use to sign in.` : `Hi ${esc(info.name)}. Choose a new password. This signs you out everywhere.`}</p>
-        <label class="f"><span>New password</span><input name="password" type="password" minlength="8" autocomplete="new-password" required></label>
-        <label class="f"><span>Repeat the password</span><input name="again" type="password" minlength="8" autocomplete="new-password" required></label>
-        <p class="muted" style="font-size:.8125rem;margin-top:-6px">At least 8 characters.</p>
+        <label class="f"><span>New password</span><input name="password" type="password" minlength="10" autocomplete="new-password" required></label>
+        <label class="f"><span>Repeat the password</span><input name="again" type="password" minlength="10" autocomplete="new-password" required></label>
+        <p class="muted" style="font-size:.8125rem;margin-top:-6px">At least 10 characters. Not a common password, and not your email name.</p>
         <p class="err" id="spErr"></p>
         <button class="btn" style="width:100%">${welcome ? 'Set password' : 'Change password'}</button>`, 'setPwForm');
     $('#setPwForm').onsubmit = async e => {
       e.preventDefault();
       const fd = new FormData(e.target), pw = fd.get('password');
-      if (pw.length < 8) return $('#spErr').textContent = 'Password must be at least 8 characters.';
+      if (pw.length < 10) return $('#spErr').textContent = 'Password must be at least 10 characters.';
       if (pw !== fd.get('again')) return $('#spErr').textContent = 'The two passwords don’t match.';
       const btn = e.target.querySelector('button'); btn.disabled = true;
       try {
@@ -816,7 +816,7 @@
       </div>
       <div id="tmTeams"${u?.role === 'team_manager' ? '' : ' hidden'}>${pickerHtml('Manages teams', 'A team manager has a lead’s powers in these teams only, and can add and remove their members and set their leads. Their own team can be one of them, but doesn’t have to be.').replace('Type a name…', 'Type a team…')}</div>
       ${!u && emailOn ? `<label class="check-row"><input type="checkbox" name="send_welcome" id="sendWelcome" checked> Send a welcome email with a “Set your password” link (valid 48 hours)</label>` : ''}
-      <label class="f" id="pwField"${!u && emailOn ? ' hidden' : ''}><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="8" autocomplete="new-password" ${u || emailOn ? '' : 'required'}></label>
+      <label class="f" id="pwField"${!u && emailOn ? ' hidden' : ''}><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="10" autocomplete="new-password" ${u || emailOn ? '' : 'required'}></label>
       ${u && emailOn && u.active && !u.removed && canEditPerson(u) ? `<p style="margin:-6px 0 12px;font-size:.875rem"><button type="button" class="btn ghost small" id="resendWelcome">Resend welcome email</button> <span class="muted">A new “Set your password” link to ${esc(u.email)}; earlier links stop working.</span></p>` : ''}
       ${u && u.id !== me.id && !u.protected && !u.locked ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
       ${ownSelf ? '<p class="note-box">Role and email are fixed for this account.</p>' : ''}
@@ -1354,7 +1354,7 @@
         <form class="card" id="pwForm">
           <h2>Change password</h2>
           <label class="f"><span>Current password</span><input type="password" name="current" required autocomplete="current-password"></label>
-          <label class="f"><span>New password</span><input type="password" name="next" required minlength="8" autocomplete="new-password"></label>
+          <label class="f"><span>New password</span><input type="password" name="next" required minlength="10" autocomplete="new-password"></label>
           <p class="err" id="pwErr"></p>
           <button class="btn">Change password</button>
         </form>

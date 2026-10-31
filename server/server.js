@@ -329,6 +329,28 @@ app.post('/api/login', (req, res) => {
   res.json({ user: publicUser(user), upload_max_mb: MAX_FILE_MB });
 });
 
+// ---------- password rules ----------
+// At least 10 characters; not one of the 1000 most common passwords (common-passwords.txt: the top 1000 of the SecLists
+// "10k most common" list, plus the 51 entries of 10+ characters from the rest of it, since the length rule already
+// stops every top-1000 one), nor such a password with digits/symbols added, repeated or reversed in order
+// ("password123!", "dragondragon", "2024monkey"); and not containing the person's email name. Checked wherever a
+// password is set: change password, set-password links (welcome and forgot password), and passwords set by a manager.
+// Existing passwords keep working (only new passwords are checked).
+const COMMON_PASSWORDS = new Set(fs.readFileSync(path.join(__dirname, 'common-passwords.txt'), 'utf8').split('\n').map(l => l.trim()).filter(Boolean));
+function passwordProblem(pw, email) {
+  if (typeof pw !== 'string' || pw.length < 10) return 'Password must be at least 10 characters.';
+  if (pw.length > 200) return 'Password must be at most 200 characters.';
+  const low = pw.toLowerCase();
+  const core = low.replace(/^[^a-z]+|[^a-z]+$/g, ''); // without leading/trailing digits and symbols
+  const half = low.length % 2 === 0 && low.slice(0, low.length / 2) === low.slice(low.length / 2) ? low.slice(0, low.length / 2) : null;
+  if (COMMON_PASSWORDS.has(low) || (core.length >= 4 && COMMON_PASSWORDS.has(core)) || (half && COMMON_PASSWORDS.has(half)) || /^(.)\1+$/.test(low))
+    return 'This password is too common. Choose a less predictable one.';
+  const name = String(email || '').toLowerCase().split('@')[0].split('+')[0];
+  if (name.length >= 3 && low.includes(name)) return 'The password can’t contain your email name.';
+  for (const part of name.split(/[._-]+/)) if (part.length >= 4 && low.includes(part)) return 'The password can’t contain your email name.';
+  return null;
+}
+
 app.post('/api/logout', (req, res) => {
   if (req.cookies.sid) db.prepare('DELETE FROM sessions WHERE token = ?').run(req.cookies.sid);
   res.clearCookie('sid');
@@ -340,7 +362,8 @@ app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), up
 app.post('/api/me/password', auth, (req, res) => {
   const { current, next: nextPw } = req.body;
   if (!bcrypt.compareSync(String(current || ''), req.user.password_hash)) return bad(res, 'Current password is incorrect.');
-  if (typeof nextPw !== 'string' || nextPw.length < 8) return bad(res, 'New password must be at least 8 characters.');
+  const problem = passwordProblem(nextPw, req.user.email);
+  if (problem) return bad(res, problem);
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(nextPw, 10), req.user.id);
   db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.user.id, req.cookies.sid);
   res.json({ ok: true });
@@ -363,7 +386,7 @@ function issueToken(user, purpose, byId) {
 // A token that can still be used (not used, not expired, person active and not removed), with its person.
 function liveToken(token) {
   if (typeof token !== 'string' || token.length < 20 || token.length > 100) return null;
-  return db.prepare(`SELECT pt.id, pt.purpose, pt.user_id, u.name FROM password_tokens pt JOIN users u ON u.id = pt.user_id
+  return db.prepare(`SELECT pt.id, pt.purpose, pt.user_id, u.name, u.email FROM password_tokens pt JOIN users u ON u.id = pt.user_id
     WHERE pt.token_hash = ? AND pt.used_at IS NULL AND pt.expires_at > datetime('now') AND u.active = 1 AND u.removed_at IS NULL`).get(hashToken(token));
 }
 function sendWelcome(user, by) {
@@ -417,9 +440,10 @@ app.get('/api/password/check', (req, res) => {
 app.post('/api/password/set', (req, res) => {
   if (overLimit('pwlink-ip:' + req.ip, 60, 15 * 60e3)) return bad(res, 'Too many attempts. Try again in 15 minutes.', 429);
   const password = typeof req.body.password === 'string' ? req.body.password : '';
-  if (password.length < 8) return bad(res, 'Password must be at least 8 characters.');
   const t = liveToken(req.body.token);
   if (!t) return bad(res, DEAD_LINK, 410);
+  const problem = passwordProblem(password, t.email);
+  if (problem) return bad(res, problem);
   const ok = db.transaction(() => {
     if (!db.prepare(`UPDATE password_tokens SET used_at = datetime('now') WHERE id = ? AND used_at IS NULL`).run(t.id).changes) return false;
     db.prepare(`UPDATE password_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL`).run(t.user_id);
@@ -581,7 +605,7 @@ app.post('/api/users', auth, requireBoss, (req, res) => {
   // Welcome email with a "Set your password" link (when email is set up), or a password typed by the manager as before.
   const welcome = req.body.send_welcome !== undefined ? !!req.body.send_welcome && !password : !password;
   if (welcome && !mailer.enabled()) return bad(res, 'Email isn’t set up, so enter a temporary password for this person.');
-  if (!welcome && password.length < 8) return bad(res, 'Password must be at least 8 characters.');
+  if (!welcome) { const problem = passwordProblem(password, email); if (problem) return bad(res, problem); }
   if (lead_id && !db.prepare(`SELECT 1 FROM users WHERE id = ? AND role IN ('lead','manager','admin')`).get(lead_id)) return bad(res, 'Choose a valid team lead.');
   if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return bad(res, 'A user with this email already exists.');
   const r = db.prepare('INSERT INTO users (name,email,password_hash,role,lead_id,team_id) VALUES (?,?,?,?,?,?)')
@@ -683,7 +707,8 @@ app.patch('/api/users/:id', auth, ownerFirst(patchWhat), requireBoss, (req, res)
     f.active = req.body.active ? 1 : 0;
   }
   if (req.body.password) {
-    if (String(req.body.password).length < 8) return bad(res, 'Password must be at least 8 characters.');
+    const problem = passwordProblem(String(req.body.password), f.email || target.email);
+    if (problem) return bad(res, problem);
     f.password_hash = bcrypt.hashSync(String(req.body.password), 10);
   }
   const keys = Object.keys(f);
