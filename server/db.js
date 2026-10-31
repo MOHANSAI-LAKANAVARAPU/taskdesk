@@ -342,6 +342,10 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   db.exec(`CREATE TABLE IF NOT EXISTS login_failures (email TEXT NOT NULL, at TEXT NOT NULL DEFAULT (datetime('now')));
     CREATE INDEX IF NOT EXISTS idx_login_failures_email ON login_failures(email, at);
     CREATE TABLE IF NOT EXISTS login_locks (email TEXT PRIMARY KEY, locked_until TEXT NOT NULL);`);
+  // Idle sign-out (Security A1): when the person last did something with this session (background checks don't count).
+  // Sessions from before this are empty and get a value on their next request.
+  if (!db.prepare('PRAGMA table_info(sessions)').all().some(c => c.name === 'last_active_at'))
+    db.exec('ALTER TABLE sessions ADD COLUMN last_active_at TEXT');
 })();
 
 // ---- Roles: users.role has no CHECK constraint any more (server.js validates it on every write) ----

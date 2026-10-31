@@ -93,6 +93,13 @@ Other rules: a user cannot deactivate themself; only admins can create admins or
 - A successful sign-in clears the failures; using a set-password link (welcome / Forgot password) lifts the lock.
 - The older per-IP limit (in memory: more than 10 attempts from one address in 15 minutes → "Too many sign-in attempts…") is checked first and unchanged.
 
+**Sessions (Security A1).** A session ends after **8 hours without activity** (`IDLE_HOURS`, `sessions.last_active_at`, written at most once a minute) with 401 "You were signed out after 8 hours without activity…", besides the 30-day limit.
+- Background calls never count as activity: the desktop app's `/api/my-summary` and `/api/stream` (by path, so the desktop app needs no change), and web-app refreshes sent with `X-Background: 1` (`api(path, { background: true })`: the chat list and unread count, the polling fallback, reloading the open chat after a live event, and automatic "mark as read").
+- The stream's 25-second ping also ends idle sessions.
+- Sessions from before this change get a value on their first request.
+- Account page → "Signed-in devices": `GET /api/me/sessions` counts other live sessions (other browsers; the desktop app is one), and "Sign out all other devices" (`POST /api/me/sessions/sign-out-others`) ends them.
+- A password change ends the other sessions (Account page) or all of them (a manager setting it, set-password links).
+
 **Owner and protected accounts** (backup `../backups/taskdesk-before-owner-2026-10-29.*`):
 
 The owner:
@@ -254,7 +261,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - **login_failures**: email (lowercased), at. One row per failed sign-in; rows older than a day are dropped. **login_locks**: email (PK), locked_until. Account lockout (Security A1, backup `../backups/taskdesk-before-security-a1-2026-10-31.*`).
 - **app_settings**: key (PK), value. `owner_user_id` = the owner at the last start (empty = nobody), used to notice and record a change of owner.
 - **password_tokens**: id, user_id → users (cascade), token_hash (SHA-256, unique), purpose (welcome|reset), created_by → users (SET NULL), created_at, expires_at, used_at. "Set your password" links; the token itself is never stored.
-- **sessions**: token (PK), user_id → users (cascade), expires_at
+- **sessions**: token (PK), user_id → users (cascade), expires_at, last_active_at (idle sign-out; added with `ALTER TABLE` in Security A1, older rows empty until their next request)
 - **projects**: id, name, description, status (active|on_hold|closed), created_by → users, created_at
 - **project_teams**: project_id → projects (cascade), team_id → teams (cascade); primary key (project_id, team_id). A project's teams (team tabs); none = "No team". Added for team tabs, backup `../backups/taskdesk-before-team-tabs-2026-10-28.*`.
 - **tasks**: id, title, description, project_id → projects (SET NULL), assignee_id → users, assigned_by → users, priority (low|medium|high|urgent), status (assigned|in_progress|submitted|completed), progress (0–100), start_date, deadline, completed_at, submitted_at, approved_by → users, created_at, updated_at, deleted_at, deleted_by → users (SET NULL), archived_request_id → requests (SET NULL) — the last three added with `ALTER TABLE` for archiving (backup `../backups/taskdesk-before-archive-2026-10-27.*`), assignment_group_id (the copies of one multi-person assignment; the first copy's id, no foreign key; added with `ALTER TABLE`, backup `../backups/taskdesk-before-assignment-groups-2026-10-29.*`). Indexes on assignee_id, project_id, assignment_group_id.

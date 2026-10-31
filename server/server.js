@@ -329,13 +329,28 @@ function clearLoginFailures(key, unlock) {
   if (unlock) db.prepare('DELETE FROM login_locks WHERE email = ?').run(key);
 }
 
+// Idle sign-out: a session ends after 8 hours without activity. Background calls don't count as activity: the
+// desktop app's checks (/api/my-summary, /api/stream) and the web app's own refreshes (header X-Background: 1, e.g.
+// chat polling, unread counts, mark as read). last_active_at is written at most once a minute.
+const IDLE_HOURS = 8;
+const BACKGROUND_PATHS = new Set(['/api/my-summary', '/api/stream']);
+const isBackground = req => BACKGROUND_PATHS.has(req.path) || req.get('X-Background') === '1';
 function auth(req, res, next) {
   const token = req.cookies.sid;
   if (!token) return bad(res, 'Please sign in.', 401);
-  const row = db.prepare(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token = ? AND s.expires_at > datetime('now') AND u.active = 1`).get(token);
+  const row = db.prepare(`SELECT u.*, s.last_active_at AS s_active,
+      s.last_active_at IS NOT NULL AND s.last_active_at < datetime('now', ?) AS s_idle,
+      s.last_active_at IS NULL OR s.last_active_at < datetime('now', '-60 seconds') AS s_touch
+    FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires_at > datetime('now') AND u.active = 1`).get(`-${IDLE_HOURS} hours`, token);
   if (!row) return bad(res, 'Your session has ended. Please sign in again.', 401);
-  req.user = row;
+  if (row.s_idle) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    return bad(res, `You were signed out after ${IDLE_HOURS} hours without activity. Please sign in again.`, 401);
+  }
+  // Older sessions without a value get one on their first request, even a background one.
+  if (row.s_touch && (!isBackground(req) || !row.s_active)) db.prepare(`UPDATE sessions SET last_active_at = datetime('now') WHERE token = ?`).run(token);
+  const { s_active, s_idle, s_touch, ...user } = row;
+  req.user = user;
   next();
 }
 function requireBoss(req, res, next) { return isBoss(req.user) ? next() : bad(res, 'Only managers and admins can do this.', 403); }
@@ -354,7 +369,7 @@ app.post('/api/login', (req, res) => {
   loginAttempts.delete(req.ip);
   clearLoginFailures(key);
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare(`INSERT INTO sessions (token,user_id,expires_at) VALUES (?,?,datetime('now', ?))`).run(token, user.id, `+${SESSION_DAYS} days`);
+  db.prepare(`INSERT INTO sessions (token,user_id,expires_at,last_active_at) VALUES (?,?,datetime('now', ?),datetime('now'))`).run(token, user.id, `+${SESSION_DAYS} days`);
   db.prepare(`DELETE FROM sessions WHERE expires_at < datetime('now')`).run();
   res.cookie('sid', token, { httpOnly: true, sameSite: 'lax', secure: COOKIE_SECURE, maxAge: SESSION_DAYS * 864e5 });
   res.json({ user: publicUser(user), upload_max_mb: MAX_FILE_MB });
@@ -389,6 +404,15 @@ app.post('/api/logout', (req, res) => {
 });
 
 app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), upload_max_mb: MAX_FILE_MB }));
+
+// Account page: how many other sessions (browsers, the desktop app) are signed in, and "Sign out all other devices".
+const otherSessions = req => db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND token != ? AND expires_at > datetime('now')
+  AND (last_active_at IS NULL OR last_active_at >= datetime('now', ?))`).get(req.user.id, req.cookies.sid, `-${IDLE_HOURS} hours`).n;
+app.get('/api/me/sessions', auth, (req, res) => res.json({ others: otherSessions(req) }));
+app.post('/api/me/sessions/sign-out-others', auth, (req, res) => {
+  const n = db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.user.id, req.cookies.sid).changes;
+  res.json({ ok: true, signed_out: n });
+});
 
 app.post('/api/me/password', auth, (req, res) => {
   const { current, next: nextPw } = req.body;
@@ -1843,8 +1867,9 @@ app.get('/api/stream', auth, (req, res) => {
   set.add(res);
   if (set.size > 10) { const oldest = set.values().next().value; set.delete(oldest); oldest.end(); }
   // Ping every 25 s; also ends the stream once the session is gone (signed out, password changed, deactivated).
-  const sessionOk = db.prepare(`SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires_at > datetime('now') AND u.active = 1`);
-  const ping = setInterval(() => { if (!sessionOk.get(token)) return res.end(); res.write(': ping\n\n'); }, 25000);
+  const sessionOk = db.prepare(`SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires_at > datetime('now') AND u.active = 1
+    AND (s.last_active_at IS NULL OR s.last_active_at >= datetime('now', ?))`);
+  const ping = setInterval(() => { if (!sessionOk.get(token, `-${IDLE_HOURS} hours`)) return res.end(); res.write(': ping\n\n'); }, 25000);
   const done = () => { clearInterval(ping); set.delete(res); if (!set.size && streams.get(uid) === set) streams.delete(uid); };
   res.on('close', done);
 });

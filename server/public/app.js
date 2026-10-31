@@ -45,7 +45,8 @@
   async function api(path, opts = {}) {
     const res = await fetch('/api' + path, {
       method: opts.method || 'GET',
-      headers: opts.body && !(opts.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {},
+      // background: refreshes the person didn't ask for (they don't count as activity for the 8-hour idle sign-out)
+      headers: { ...(opts.body && !(opts.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...(opts.background ? { 'X-Background': '1' } : {}) },
       body: opts.body instanceof FormData ? opts.body : opts.body ? JSON.stringify(opts.body) : undefined,
       credentials: 'same-origin'
     });
@@ -1358,6 +1359,12 @@
           <p class="err" id="pwErr"></p>
           <button class="btn">Change password</button>
         </form>
+        <section class="card" id="devicesCard">
+          <h2>Signed-in devices</h2>
+          <p class="muted" style="font-size:.875rem;margin-top:-4px">You’re signed out automatically after 8 hours without activity, and everywhere else when your password changes.</p>
+          <p id="devicesText">Checking…</p>
+          <button class="btn ghost" type="button" id="signOutOthers" hidden>Sign out all other devices</button>
+        </section>
         <form class="card" id="prefsForm">
           <h2>Email notifications</h2>
           <p class="muted" style="font-size:.875rem;margin-top:-4px">Short emails to ${esc(me.email)} with a button to open the item. All are off until you turn them on.</p>
@@ -1367,10 +1374,23 @@
         </form>
         ${me.role === 'admin' ? '<section class="card" id="emailSettings"><h2>Email settings</h2><p class="muted">Loading…</p></section>' : ''}
       </div>`;
+    // Other signed-in sessions (other browsers, the desktop app) and "Sign out all other devices".
+    async function showDevices() {
+      try {
+        const { others } = await api('/me/sessions');
+        $('#devicesText').textContent = others ? `You’re also signed in on ${others} other ${others === 1 ? 'device or browser' : 'devices or browsers'} (the desktop app counts as one).` : 'You’re only signed in here.';
+        $('#signOutOthers').hidden = !others;
+      } catch (e) { $('#devicesText').textContent = e.message; }
+    }
+    showDevices();
+    $('#signOutOthers').onclick = async () => {
+      if (!confirm('Sign out everywhere else? Other browsers and the desktop app will ask you to sign in again.')) return;
+      try { const r = await api('/me/sessions/sign-out-others', { method: 'POST' }); toast(`Signed out ${r.signed_out} other ${r.signed_out === 1 ? 'session' : 'sessions'}`); showDevices(); } catch (e) { toast(e.message); }
+    };
     $('#pwForm').onsubmit = async e => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      try { await api('/me/password', { method: 'POST', body: { current: fd.get('current'), next: fd.get('next') } }); e.target.reset(); $('#pwErr').textContent = ''; toast('Password changed'); }
+      try { await api('/me/password', { method: 'POST', body: { current: fd.get('current'), next: fd.get('next') } }); e.target.reset(); $('#pwErr').textContent = ''; toast('Password changed'); showDevices(); }
       catch (err) { $('#pwErr').textContent = err.message; }
     };
     $('#prefsForm').onsubmit = async e => {
@@ -1458,7 +1478,7 @@
       if (chatPage() && chat.id) {
         const last = chat.messages.length ? chat.messages[chat.messages.length - 1].id : 0;
         try {
-          const r = await api(`/chat/${chat.id}/messages?after=${last}`);
+          const r = await api(`/chat/${chat.id}/messages?after=${last}`, { background: true });
           let changed = false;
           for (const m of r.messages) if (!chat.messages.some(x => x.id === m.id)) { chat.messages.push(m); changed = true; }
           for (const id of r.deleted) { const m = chat.messages.find(x => x.id === id); if (m && !m.deleted) { Object.assign(m, { deleted: true, body: '', files: [] }); changed = true; } }
@@ -1468,7 +1488,7 @@
     }, 10000);
   }
   async function refreshChatCount() {
-    try { const r = await api('/chat'); setChatUnread(r.unread_total); if (chatPage()) { chat.list = r.conversations; renderChatList(); } } catch (e) { /* offline */ }
+    try { const r = await api('/chat', { background: true }); setChatUnread(r.unread_total); if (chatPage()) { chat.list = r.conversations; renderChatList(); } } catch (e) { /* offline */ }
   }
   const refreshChatList = refreshChatCount;
   function onChatMessage(d) {
@@ -1490,7 +1510,7 @@
     const last = chat.messages[chat.messages.length - 1].id;
     if (last <= (chat.conv.last_read_message_id || 0)) return;
     chat.conv.last_read_message_id = last;
-    try { const r = await api(`/chat/${chat.id}/read`, { method: 'POST', body: { message_id: last } }); setChatUnread(r.unread_total); } catch (e) { /* ignore */ }
+    try { const r = await api(`/chat/${chat.id}/read`, { method: 'POST', body: { message_id: last }, background: true }); setChatUnread(r.unread_total); } catch (e) { /* ignore */ }
   }
   document.addEventListener('visibilitychange', markRead);
   window.addEventListener('focus', markRead);
@@ -1534,14 +1554,14 @@
       : `<li class="empty">Nothing found in your chats.</li>`;
   }
   async function reloadConversation() {
-    try { await openConversation(chat.id, true); }
+    try { await openConversation(chat.id, true, true); }
     catch (e) { chat.id = null; $('#chatMain').innerHTML = `<div class="empty">You’re no longer in this chat.</div>`; $('#chat').classList.remove('has-open'); }
   }
-  async function openConversation(id, keepScroll) {
+  async function openConversation(id, keepScroll, background) {
     const main = $('#chatMain');
     $('#chat').classList.toggle('has-open', !!id);
     if (!id) { chat.id = null; main.innerHTML = `<div class="empty chat-empty">Choose a chat on the left, or start a new one.</div>`; renderChatList(); return; }
-    const d = await api('/chat/' + id).catch(e => { if (keepScroll) throw e; main.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return null; });
+    const d = await api('/chat/' + id, { background }).catch(e => { if (keepScroll) throw e; main.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return null; });
     if (!d) { chat.id = null; return; }
     const same = chat.id === id, draft = same && $('#chatText') ? $('#chatText').value : '';
     Object.assign(chat, { id, conv: d.conversation, members: d.members });
