@@ -56,8 +56,8 @@ const sha = file => new Promise((res, rej) => { const h = crypto.createHash('sha
     if (want[n] && (got.sha256 !== want[n].sha256 || got.size !== want[n].size)) fail(`${n} doesn't decrypt to its original bytes`);
     sizes[n] = got.size;
   }
-  const Database = require('better-sqlite3'); // read-only, just the file list
-  const db = new Database(path.join(DATA, 'taskdesk.db'), { readonly: true, fileMustExist: true });
+  const dbfile = require('../dbfile'); // read-only, just the file list
+  const db = dbfile.openDb(path.join(DATA, 'taskdesk.db'), { readonly: true, fileMustExist: true });
   const rows = db.prepare('SELECT stored_name, size FROM files').all(); db.close();
   const missing = rows.filter(r => sizes[r.stored_name] === undefined), wrong = rows.filter(r => sizes[r.stored_name] !== undefined && sizes[r.stored_name] !== r.size);
   if (missing.length) fail(`${missing.length} files rows have no file: ${missing.slice(0, 5).map(r => r.stored_name).join(', ')}`);

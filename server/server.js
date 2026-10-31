@@ -12,7 +12,9 @@ const keys = require('./keys');
 let MASTER_KEY;
 try { MASTER_KEY = keys.loadMasterKey(); console.log(`[keys] master.key loaded from ${keys.DIR}`); }
 catch (e) { console.error('[keys] ' + e.message); process.exit(1); }
-const db = require('./db');
+// The database is encrypted (dbfile.js). A plain database or a key that doesn't fit stops the server with the reason.
+let db;
+try { db = require('./db'); } catch (e) { console.error('[db] ' + e.message); process.exit(1); }
 const mailer = require('./mailer');
 const filecrypt = require('./filecrypt');
 filecrypt.init(MASTER_KEY);

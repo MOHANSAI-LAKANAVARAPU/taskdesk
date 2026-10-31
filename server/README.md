@@ -87,11 +87,7 @@ Then get a free certificate with `sudo certbot --nginx -d tasks.yourcompany.com`
 
 ## Backups
 
-All data is in one file: `data/taskdesk.db`. Back it up regularly, for example with a daily cron job:
-
-```bash
-sqlite3 /path/to/taskdesk/data/taskdesk.db ".backup '/backups/taskdesk-$(date +%F).db'"
-```
+The data is `data/taskdesk.db` (encrypted) and `data/uploads/` (encrypted files). Both are locked with `secrets/master.key`; keep a copy of the keys on a USB drive (`scripts/KEYS.md`). The plain `sqlite3` tool can't back up or open the encrypted database. Use `scripts/backup.sh` (run by cron twice a day), and `scripts/restore.md` to restore.
 
 ## How team leads work
 

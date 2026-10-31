@@ -22,16 +22,17 @@ OLD=$(grep -m1 '^OWNER_EMAIL=' "$ENV_FILE" | cut -d= -f2- || true)
 if [ -n "$OLD" ] && [ "${OLD,,}" = "${NEW,,}" ]; then echo "$NEW is already the owner. Nothing changed."; exit 0; fi
 
 # The new owner must be an active, non-removed admin (read-only check). Prints their name.
-CHECK='const D = require(process.env.SQLITE_MOD), d = new D(process.env.DB_FILE, { readonly: true, fileMustExist: true });
+# The database is encrypted (dbfile.js opens it with the key from master.key).
+CHECK='const d = require(process.env.DBFILE_MOD).openDb(process.env.DB_FILE, { readonly: true, fileMustExist: true });
 const u = d.prepare("SELECT name, role, active, removed_at FROM users WHERE email = ? COLLATE NOCASE").get(process.env.NEW_EMAIL);
 if (!u) { console.log("No TaskDesk account has this email."); process.exit(1); }
 if (u.role !== "admin" || !u.active || u.removed_at) { console.log(`${u.name} is not an active admin (role ${u.role}${u.active ? "" : ", deactivated"}${u.removed_at ? ", removed" : ""}). Make them an admin first.`); process.exit(1); }
 console.log(u.name);'
 if [ -n "${CHECK_DB:-}" ]; then
-  NAME=$(NEW_EMAIL="$NEW" SQLITE_MOD="$DIR/node_modules/better-sqlite3" DB_FILE="$CHECK_DB" node -e "$CHECK") || fail "$NAME"
+  NAME=$(NEW_EMAIL="$NEW" DBFILE_MOD="$DIR/dbfile.js" DB_FILE="$CHECK_DB" node -e "$CHECK") || fail "$NAME"
 else
   docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true || fail "the $CONTAINER container is not running (cd $DIR && docker compose up -d)."
-  NAME=$(docker exec -e NEW_EMAIL="$NEW" -e SQLITE_MOD=/app/node_modules/better-sqlite3 -e DB_FILE=/app/data/taskdesk.db "$CONTAINER" node -e "$CHECK") || fail "$NAME"
+  NAME=$(docker exec -e NEW_EMAIL="$NEW" -e DBFILE_MOD=/app/dbfile.js -e DB_FILE=/app/data/taskdesk.db "$CONTAINER" node -e "$CHECK") || fail "$NAME"
 fi
 
 # Change only the OWNER_EMAIL line (a dated copy of .env is kept next to it; it holds secrets, never commit it).

@@ -1,12 +1,13 @@
 const path = require('path');
 const fs = require('fs');
-const Database = require('better-sqlite3');
+const dbfile = require('./dbfile');
 const bcrypt = require('bcryptjs');
 
 const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
 fs.mkdirSync(dataDir, { recursive: true });
 
-const db = new Database(path.join(dataDir, 'taskdesk.db'));
+// Encrypted with a key from master.key (Security A2, dbfile.js); a plain database file is refused.
+const db = dbfile.openDb(path.join(dataDir, 'taskdesk.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
@@ -78,7 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   if (!row || row.sql.includes("'submitted'")) return;
   console.log('Upgrading tasks table for the approval step...');
   const snapshot = path.join(dataDir, 'taskdesk-before-approval-migration.db');
-  if (!fs.existsSync(snapshot)) db.exec(`VACUUM INTO '${snapshot.replace(/'/g, "''")}'`);
+  if (!fs.existsSync(snapshot)) dbfile.exportCopy(db, snapshot); // encrypted like the database (VACUUM INTO would write it plain)
   const cols = db.prepare('PRAGMA table_info(tasks)').all().map(c => c.name);
   const keep = ['id','title','description','project_id','assignee_id','assigned_by','priority','status','progress',
     'start_date','deadline','completed_at','created_at','updated_at'];
@@ -400,7 +401,7 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   if (!row || !/CHECK\s*\(\s*role IN/i.test(row.sql)) return;
   console.log('Upgrading users table (role check moves to the server)...');
   const snapshot = path.join(dataDir, 'taskdesk-before-team-manager-migration.db');
-  if (!fs.existsSync(snapshot)) db.exec(`VACUUM INTO '${snapshot.replace(/'/g, "''")}'`);
+  if (!fs.existsSync(snapshot)) dbfile.exportCopy(db, snapshot); // encrypted like the database (VACUUM INTO would write it plain)
   const sql = row.sql.replace(/\s*CHECK\s*\(\s*role IN\s*\([^)]*\)\s*\)/i, '').replace(/^CREATE TABLE\s+"?users"?/i, 'CREATE TABLE users_new');
   if (/CHECK\s*\(\s*role/i.test(sql) || !/^CREATE TABLE users_new/.test(sql)) throw new Error('Unexpected users table definition; nothing was changed.');
   const list = db.prepare('PRAGMA table_info(users)').all().map(c => c.name).join(', ');

@@ -4,6 +4,8 @@
 # that day's copy. Keeps the newest 14 days. Verifies each copy (read-only: integrity, foreign keys, row counts, every
 # stored file present). Everything is logged to ~/TaskDesk-backups/backup.log. Restore: see restore.md next to this file.
 # Run by cron at 13:00 and 18:00 (crontab -l). Exit code 0 = backup made and verified.
+# The database and the files stay encrypted with master.key (Security A2), so restoring needs that key (scripts/KEYS.md).
+# The keys (server/secrets/) are never part of a backup.
 set -u
 export PATH=/usr/local/bin:/usr/bin:/bin
 CONTAINER=${TASKDESK_CONTAINER:-taskdesk}
@@ -24,35 +26,42 @@ log "Backup started"
 docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true || fail "the $CONTAINER container is not running (start it with: cd ~/Downloads/TaskDesk/server && docker compose up -d)"
 TMP=$(mktemp -d "$DEST_ROOT/.tmp-$DAY-XXXXXX")
 
-# 1. Database: SQLite's online backup API (better-sqlite3 db.backup) gives a consistent copy while the server runs.
-docker exec "$CONTAINER" node -e "
-  const D = require('/app/node_modules/better-sqlite3');
-  const db = new D('/app/data/taskdesk.db', { readonly: true, fileMustExist: true });
-  db.backup(process.argv[1]).then(() => db.close()).catch(e => { console.error(e.message); process.exit(1); });" "$IN" \
-  || fail "the database backup inside the container failed"
+# 1. Database: an encrypted copy made inside the container (dbfile.js exportCopy: a new database keyed like the live
+#    one, every table read in one read transaction, so the copy is consistent while the server keeps running; SQLite's
+#    own backup API can't write an encrypted copy). The copy is then checked there, read-only: integrity, foreign
+#    keys, row counts, the stored file names, and its SHA-256 (to make sure the file copied out is the one checked).
+CHECKED=$(docker exec "$CONTAINER" node -e "
+  const dbfile = require('/app/dbfile'), fs = require('fs'), crypto = require('crypto'), out = process.argv[1];
+  const src = dbfile.openDb('/app/data/taskdesk.db', { readonly: true, fileMustExist: true });
+  dbfile.exportCopy(src, out); src.close();
+  const c = dbfile.openDb(out, { readonly: true, fileMustExist: true }), h = dbfile.health(c);
+  const tables = c.prepare(\"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name\").all().map(r => r.name);
+  const counts = tables.map(t => t + '=' + c.prepare('SELECT COUNT(*) AS n FROM \"' + t + '\"').get().n).join(' ');
+  const stored = c.prepare('SELECT stored_name FROM files').all().map(r => r.stored_name); c.close();
+  console.log(JSON.stringify({ integrity: h.integrity, fk: h.foreign_key_problems, counts, stored,
+    plain: dbfile.isPlainSqlite(out), sha256: crypto.createHash('sha256').update(fs.readFileSync(out)).digest('hex') }));" "$IN") \
+  || fail "the database copy inside the container failed"
 docker cp -q "$CONTAINER:$IN" "$TMP/taskdesk.db" || fail "could not copy the backup out of the container"
 docker exec "$CONTAINER" rm -f "$IN"
 
-# 2. Uploaded files, copied after the database: every file the copy refers to was already on disk.
+# 2. Uploaded files (encrypted on disk), copied after the database: every file the copy refers to was already there.
 docker cp -q "$CONTAINER:/app/data/uploads" "$TMP/uploads" || fail "could not copy data/uploads"
 
-# 3. Verify: open the copy read-only, check integrity and foreign keys, count rows, and check every stored file is there.
-RESULT=$(python3 -I - "$TMP/taskdesk.db" "$TMP/uploads" <<'PY'
-import os, sqlite3, sys
-db, uploads = sys.argv[1], sys.argv[2]
-c = sqlite3.connect(f'file:{db}?immutable=1', uri=True)
-integrity = c.execute('PRAGMA integrity_check').fetchone()[0]
-fk = c.execute('PRAGMA foreign_key_check').fetchall()
-tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-counts = ' '.join(f'{t}={c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]}' for t in tables)
-stored = [r[0] for r in c.execute('SELECT stored_name FROM files')]
-missing = [s for s in stored if not os.path.isfile(os.path.join(uploads, s))]
-ok = integrity == 'ok' and not fk and not missing
-print(('OK' if ok else 'BAD') + f' | integrity {integrity} | foreign keys {"ok" if not fk else str(len(fk)) + " problems"}'
-      + f' | files {len(stored) - len(missing)}/{len(stored)} present' + (f' (missing: {", ".join(missing[:5])})' if missing else '')
-      + f' | {counts}')
+# 3. Verify: the checks above passed, the copied file is the one checked, it's encrypted, and every stored file is
+#    there and encrypted too (starts with TDF1, see filecrypt.js).
+RESULT=$(python3 -I - "$TMP/taskdesk.db" "$TMP/uploads" "$CHECKED" <<'PY'
+import hashlib, json, os, sys
+db, uploads, c = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+same = hashlib.sha256(open(db, 'rb').read()).hexdigest() == c['sha256']
+missing = [s for s in c['stored'] if not os.path.isfile(os.path.join(uploads, s))]
+plain_files = [n for n in os.listdir(uploads) if open(os.path.join(uploads, n), 'rb').read(4) != b'TDF1']
+ok = c['integrity'] == 'ok' and not c['fk'] and same and not c['plain'] and not missing and not plain_files
+print(('OK' if ok else 'BAD') + f' | integrity {c["integrity"]} | foreign keys {"ok" if not c["fk"] else str(c["fk"]) + " problems"}'
+      + f' | database {"encrypted" if not c["plain"] else "NOT ENCRYPTED"}, copy {"identical" if same else "DIFFERS"}'
+      + f' | files {len(c["stored"]) - len(missing)}/{len(c["stored"])} present' + (f' (missing: {", ".join(missing[:5])})' if missing else '')
+      + (f' | {len(plain_files)} files NOT ENCRYPTED' if plain_files else ', all encrypted') + f' | {c["counts"]}')
 PY
-) || fail "could not open the backup copy to verify it"
+) || fail "could not verify the backup copy"
 log "Verify: $RESULT"
 [ "${RESULT%% *}" = OK ] || fail "the backup copy did not pass the check (kept in $TMP for a look)"
 
