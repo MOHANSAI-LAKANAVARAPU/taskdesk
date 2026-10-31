@@ -116,6 +116,18 @@ Other rules: a user cannot deactivate themself; only admins can create admins or
 - **The desktop app:** its own calls are GETs only (`/api/me`, `/api/version`, `/api/my-summary`, `/api/stream`), and its window runs the web app, so it needed no change.
 - **New code that changes something** must go through `api()` or send the header.
 
+**Audit log (Security A1).** `audit_log` is append-only: triggers in db.js refuse every UPDATE and DELETE, there's no endpoint that changes entries, and there are no foreign keys, so entries outlive the people and teams they name (names are copied in).
+- `audit(req, action, { actor, target, details })` records who (`actor_id`/`actor_name`; empty when not signed in), when (`at`, UTC), IP (without `::ffff:`), action, target (`target_type`/`target_id`/`target_name`) and details.
+- **Recorded:**
+  - sign-ins: `sign_in`, `sign_in_failed` (with the email and the reason: wrong password, unknown email, deactivated, account locked, too many attempts from this address), `account_locked`;
+  - passwords and sessions: `password_changed`, `password_reset_requested`, `password_reset` (set with a link), `password_set_by_manager`, `welcome_resent`, `signed_out_other_devices`;
+  - people: `person_added`, `person_edited` (name/email), `role_changed`, `team_changed` (person form and team page), `lead_changed`, `managed_teams_changed`, `account_activated`/`account_deactivated`, `protection_changed`, `person_removed`, `person_restored`;
+  - teams: `team_leads_changed`, `team_managers_changed`, `team_deleted`;
+  - files and exports: `file_downloaded` (real downloads only, not inline image previews), `history_exported` (History CSV), `audit_exported`.
+- **"Audit log" page** (`#/audit`, menu item for admins only; `GET /api/audit`, admins only): newest first, 200 per page ("Load more", `before=<id>`); filters `from`/`to` (local dates), `action`, `q` (who, target, details, IP). `?format=csv` exports up to 50,000 matching rows, and the export is itself recorded.
+- **Tests must not write to the live audit log,** since entries can't be removed. Run audit tests on a copy of the database with a second server (`DATA_DIR=<copy> PORT=3001 …`).
+- Owner/protected refusals and protection changes are also kept per person in `account_events` (shown in the person form).
+
 **Owner and protected accounts** (backup `../backups/taskdesk-before-owner-2026-10-29.*`):
 
 The owner:
@@ -275,6 +287,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - **users.protected** (0/1, default 0): protected account (see "Owner and protected accounts"); added with `ALTER TABLE`, which set it once for deepith@hifocuscctv.com.
 - **account_events**: id, user_id → users (cascade), actor_id → users (SET NULL; empty for server events), action (`owner_transfer`, `owner_refused`, `protected_refused`, `protection_on`, `protection_off`), detail ("<who> tried to …", "Owner changed from A to B …"), created_at. A person's account activity, index on user_id. Read with `GET /api/users/:id/events`.
 - **login_failures**: email (lowercased), at. One row per failed sign-in; rows older than a day are dropped. **login_locks**: email (PK), locked_until. Account lockout (Security A1, backup `../backups/taskdesk-before-security-a1-2026-10-31.*`).
+- **audit_log** (Security A1): id, at (UTC), actor_id, actor_name, ip, action, target_type, target_id, target_name, details. Append-only (triggers `audit_log_no_update` / `audit_log_no_delete`); no foreign keys. Indexes on at, action, actor_id.
 - **app_settings**: key (PK), value. `owner_user_id` = the owner at the last start (empty = nobody), used to notice and record a change of owner.
 - **password_tokens**: id, user_id → users (cascade), token_hash (SHA-256, unique), purpose (welcome|reset), created_by → users (SET NULL), created_at, expires_at, used_at. "Set your password" links; the token itself is never stored.
 - **sessions**: token (PK), user_id → users (cascade), expires_at, last_active_at (idle sign-out; added with `ALTER TABLE` in Security A1, older rows empty until their next request)
@@ -313,6 +326,8 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | GET `/api/users` | signed in (scoped by role) | List users (without removed people; `?removed=1` for managers/admins includes them, with `removed: true`; `?pool=no_team` for team managers: active leads/employees without a team). Team managers carry `managed_teams` [{id, name}] (also in `/api/me`) |
 | POST `/api/users` | boss | Add person (returns `became_lead`); no `password` (or `send_welcome: true`) → welcome email with a "Set your password" link (`welcome_sent`); role `team_manager` needs `managed_team_ids` |
 | PATCH `/api/users/:id` | boss (never the owner's account unless you are the owner) | Edit name/email/role/lead_id/active/password (not a removed person); `managed_team_ids` replaces a team manager's teams (required when the role becomes `team_manager`); `protected` (owner only). Protected accounts: no deactivating or lower role |
+| GET `/api/audit` | admin | Audit log: `entries` (200, newest first; `before=<id>` for more), `more`, `actions`; filters `from`, `to`, `action`, `q`; `format=csv` exports (recorded) |
+| GET `/api/me/sessions`, POST `/api/me/sessions/sign-out-others` | signed in | Count other sessions / end them |
 | GET `/api/users/:id/events` | boss, or the person themself | Account history: last 100 `account_events` with `actor_name` |
 | GET `/api/users/:id/removal`, DELETE `/api/users/:id`, POST `/api/users/:id/restore` | admin (not themself) | Remove person: preview the records / remove (delete or keep-as-removed) / restore |
 | GET `/api/projects` | signed in | Projects (with `teams`) and total/completed counts over visible tasks; `team=<id>` = that team's projects counted over that team's tasks, `team=none` = projects without a team |

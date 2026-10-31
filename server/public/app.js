@@ -120,6 +120,7 @@
   function renderNav(route) {
     const items = [['#/', 'Dashboard'], ['#/tasks', me.role === 'employee' ? 'My tasks' : 'Tasks'], ['#/requests', 'Requests'], ['#/projects', 'Projects']];
     items.push(['#/teams', 'Teams'], ['#/chat', `Chat <span class="pill nav-count" id="chatCount"${chatUnread ? '' : ' hidden'}>${chatUnread > 99 ? '99+' : chatUnread}</span>`], ['#/history', 'History']);
+    if (me.role === 'admin') items.push(['#/audit', 'Audit log']);
     $('#nav').innerHTML = items.map(([h, l]) => {
       const cur = h === '#/' ? route === '' : route.startsWith(h.slice(2));
       return `<a href="${h}"${cur ? ' aria-current="page"' : ''}>${l}</a>`;
@@ -161,6 +162,7 @@
       else if (parts[0] === 'teams' && parts[1]) await viewTeam(Number(parts[1]));
       else if (parts[0] === 'teams') await viewTeams();
       else if (parts[0] === 'history') await viewHistory();
+      else if (parts[0] === 'audit') await viewAudit();
       else if (parts[0] === 'chat') await viewChat(Number(parts[1]) || null);
       else if (parts[0] === 'account') await viewAccount();
       else app.innerHTML = `<div class="empty">This page doesn’t exist. <a href="#/">Go to the dashboard</a>.</div>`;
@@ -1295,6 +1297,48 @@
   }
 
   // ---------- history ----------
+  // ---------- audit log (admins; read-only) ----------
+  const AUDIT_LABEL = { sign_in: 'Signed in', sign_in_failed: 'Sign-in failed', account_locked: 'Account locked', signed_out_other_devices: 'Signed out other devices',
+    password_changed: 'Password changed', password_reset_requested: 'Password reset requested', password_reset: 'Password set with a link',
+    password_set_by_manager: 'Password set by a manager', welcome_resent: 'Welcome email resent', person_added: 'Person added', person_edited: 'Name or email changed',
+    role_changed: 'Role changed', team_changed: 'Team changed', lead_changed: 'Lead changed', managed_teams_changed: 'Managed teams changed',
+    team_leads_changed: 'Team leads changed', team_managers_changed: 'Team managers changed', team_deleted: 'Team deleted', protection_changed: 'Protection changed',
+    account_activated: 'Account activated', account_deactivated: 'Account deactivated', person_removed: 'Person removed', person_restored: 'Person restored',
+    file_downloaded: 'File downloaded', history_exported: 'History exported (CSV)', audit_exported: 'Audit log exported (CSV)' };
+  async function viewAudit() {
+    if (me.role !== 'admin') { app.innerHTML = `<div class="empty">Only admins can see the audit log.</div>`; return; }
+    const q = new URLSearchParams(location.hash.split('?')[1] || ''), params = new URLSearchParams();
+    for (const k of ['from', 'to', 'action', 'q']) if (q.get(k)) params.set(k, q.get(k));
+    const d = await api('/audit?' + params);
+    const row = e => `<tr><td style="white-space:nowrap">${esc(fmtDateTime(e.at))}</td><td>${e.actor_name ? esc(e.actor_name) : '<span class="muted">not signed in</span>'}</td>
+      <td>${esc(AUDIT_LABEL[e.action] || e.action)}</td><td>${esc(e.target_name || '')}</td><td>${esc(e.details || '')}</td><td class="muted">${esc(e.ip || '')}</td></tr>`;
+    app.innerHTML = `<div class="page-head"><div><h1>Audit log</h1><p>Sign-ins, lockouts, password and account changes, removals, file downloads and exports. Entries can’t be changed or deleted.</p></div>
+        <a class="btn ghost" id="auditCsv" href="/api/audit?${esc(new URLSearchParams([...params, ['format', 'csv']]).toString())}" download>Export CSV</a></div>
+      <form class="filters" id="auditFilters">
+        <label class="muted">From <input type="date" name="from" value="${esc(q.get('from') || '')}"></label>
+        <label class="muted">To <input type="date" name="to" value="${esc(q.get('to') || '')}"></label>
+        <select name="action" aria-label="Action"><option value="">All actions</option>${d.actions.map(a => `<option value="${a}"${q.get('action') === a ? ' selected' : ''}>${esc(AUDIT_LABEL[a] || a)}</option>`).join('')}</select>
+        <input class="search" type="search" name="q" value="${esc(q.get('q') || '')}" placeholder="Search names, details or IP">
+        <button class="btn">Filter</button>${params.toString() ? ' <a href="#/audit">Clear</a>' : ''}
+      </form>
+      <section class="card table-wrap"><table class="history"><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Target</th><th>Details</th><th>IP</th></tr></thead>
+        <tbody id="auditRows">${d.entries.length ? d.entries.map(row).join('') : '<tr><td colspan="6" class="muted">Nothing matches.</td></tr>'}</tbody></table>
+        <p id="auditMore" style="margin:12px 0 0">${d.more ? '<button class="btn ghost small" type="button">Load more</button>' : ''}</p></section>`;
+    $('#auditFilters').onsubmit = e => {
+      e.preventDefault();
+      const p = new URLSearchParams(); for (const [k, v] of new FormData(e.target)) if (String(v).trim()) p.set(k, String(v).trim());
+      location.hash = '#/audit' + (p.toString() ? '?' + p : '');
+    };
+    let last = d.entries.length ? d.entries[d.entries.length - 1].id : 0;
+    $('#auditMore').onclick = async e => {
+      if (!e.target.closest('button')) return;
+      const more = await api('/audit?' + new URLSearchParams([...params, ['before', last]]));
+      $('#auditRows').insertAdjacentHTML('beforeend', more.entries.map(row).join(''));
+      if (more.entries.length) last = more.entries[more.entries.length - 1].id;
+      if (!more.more) $('#auditMore').innerHTML = '';
+    };
+  }
+
   async function viewHistory() {
     const { q, go } = pageQuery('history');
     const { teams } = await api('/teams');

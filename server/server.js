@@ -326,6 +326,22 @@ const taskFiles = taskId => db.prepare(`SELECT id, original_name, size, update_i
   UNION ALL SELECT f.id, f.original_name, f.size, tf.update_id, f.uploaded_by, f.created_at FROM task_files tf JOIN files f ON f.id = tf.file_id
   WHERE tf.task_id = ? ORDER BY id`).all(taskId, taskId);
 
+// ---------- audit log (Security A1) ----------
+// Append-only record of security-relevant events: who (actor, or empty for someone not signed in), when (UTC), from
+// which IP, what (action), on what (target type/id/name) and details. Names are copied in, so entries stay readable
+// after people or teams are removed. Triggers in db.js refuse UPDATE/DELETE; there is no endpoint to change entries.
+function audit(req, action, { actor, target, details } = {}) {
+  const a = actor !== undefined ? actor : req && req.user;
+  try {
+    db.prepare(`INSERT INTO audit_log (actor_id, actor_name, ip, action, target_type, target_id, target_name, details) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(a ? a.id : null, a ? a.name : null, req && req.ip ? String(req.ip).replace(/^::ffff:/, '') : null, action, target ? target.type : null, target && target.id != null ? target.id : null,
+        target ? target.name || null : null, details == null ? '' : typeof details === 'string' ? details : JSON.stringify(details));
+  } catch (e) { console.error('[audit] could not record', action, e.message); }
+}
+const personTarget = u => u ? { type: 'person', id: u.id, name: u.name } : null;
+const teamLabel = id => id ? ((db.prepare('SELECT name FROM teams WHERE id = ?').get(id) || {}).name || `team #${id}`) : 'no team';
+const personLabel = id => id ? ((db.prepare('SELECT name FROM users WHERE id = ?').get(id) || {}).name || `person #${id}`) : 'nobody';
+
 // ---------- auth ----------
 const loginAttempts = new Map();
 function rateLimited(ip) {
@@ -389,15 +405,22 @@ function requireBoss(req, res, next) { return isBoss(req.user) ? next() : bad(re
 function requireAdmin(req, res, next) { return req.user.role === 'admin' ? next() : bad(res, 'Only admins can do this.', 403); }
 
 app.post('/api/login', (req, res) => {
-  if (rateLimited(req.ip)) return bad(res, 'Too many sign-in attempts. Try again in 15 minutes.', 429);
   const email = str(req.body.email, 200), password = typeof req.body.password === 'string' ? req.body.password : '';
   const key = loginKey(email);
-  if (isLocked(key)) return bad(res, LOCKED_MSG, 429);
+  const failed = (reason, user) => audit(req, 'sign_in_failed', { actor: null, target: user ? personTarget(user) : null, details: `${key} (${reason})` });
+  if (rateLimited(req.ip)) { failed('too many attempts from this address'); return bad(res, 'Too many sign-in attempts. Try again in 15 minutes.', 429); }
+  if (isLocked(key)) { failed('account locked'); return bad(res, LOCKED_MSG, 429); }
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
   if (!user || !user.active || !bcrypt.compareSync(password, user.password_hash)) {
-    if (recordLoginFailure(key)) { console.log(`[login] account locked for ${LOCK_MINUTES} minutes after ${LOCK_FAILS} failed sign-ins`); return bad(res, LOCKED_MSG, 429); }
+    failed(!user ? 'unknown email' : !user.active ? 'account deactivated' : 'wrong password', user);
+    if (recordLoginFailure(key)) {
+      console.log(`[login] account locked for ${LOCK_MINUTES} minutes after ${LOCK_FAILS} failed sign-ins`);
+      audit(req, 'account_locked', { actor: null, target: user ? personTarget(user) : null, details: `${key}: ${LOCK_FAILS} failed sign-ins within ${LOCK_MINUTES} minutes; locked for ${LOCK_MINUTES} minutes` });
+      return bad(res, LOCKED_MSG, 429);
+    }
     return bad(res, 'Email or password is incorrect.', 401);
   }
+  audit(req, 'sign_in', { actor: user, target: personTarget(user) });
   loginAttempts.delete(req.ip);
   clearLoginFailures(key);
   const token = crypto.randomBytes(32).toString('hex');
@@ -443,6 +466,7 @@ const otherSessions = req => db.prepare(`SELECT COUNT(*) AS n FROM sessions WHER
 app.get('/api/me/sessions', auth, (req, res) => res.json({ others: otherSessions(req) }));
 app.post('/api/me/sessions/sign-out-others', auth, (req, res) => {
   const n = db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.user.id, req.cookies.sid).changes;
+  audit(req, 'signed_out_other_devices', { target: personTarget(req.user), details: `${n} other session${n === 1 ? '' : 's'} ended` });
   res.json({ ok: true, signed_out: n });
 });
 
@@ -453,6 +477,7 @@ app.post('/api/me/password', auth, (req, res) => {
   if (problem) return bad(res, problem);
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(nextPw, 10), req.user.id);
   db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.user.id, req.cookies.sid);
+  audit(req, 'password_changed', { target: personTarget(req.user), details: 'changed on the Account page; other sessions ended' });
   res.json({ ok: true });
 });
 
@@ -505,6 +530,7 @@ app.post('/api/password/forgot', (req, res) => {
   const ipOver = overLimit('forgot-ip:' + req.ip, 10, 3600e3), emailOver = overLimit('forgot-email:' + email, 3, 3600e3);
   if (ipOver || emailOver) { console.log(`[email] forgot-password limit reached (${ipOver ? 'IP' : 'email'}); nothing sent`); return answer(); }
   const user = db.prepare('SELECT * FROM users WHERE email = ? AND active = 1 AND removed_at IS NULL').get(email);
+  audit(req, 'password_reset_requested', { actor: null, target: user ? personTarget(user) : null, details: user ? (mailer.enabled() ? 'reset link emailed' : 'email is off; nothing sent') : `${email} (no active account)` });
   if (user && mailer.enabled()) {
     mailer.queue(user.email, 'Reset your TaskDesk password', mailer.layout({
       heading: 'Reset your password',
@@ -541,6 +567,7 @@ app.post('/api/password/set', (req, res) => {
   })();
   if (!ok) return bad(res, DEAD_LINK, 410);
   console.log(`[password] ${t.purpose} link used by user ${t.user_id}; sessions ended`);
+  audit(req, 'password_reset', { actor: null, target: { type: 'person', id: t.user_id, name: t.name }, details: `set with a ${t.purpose === 'welcome' ? 'welcome' : 'Forgot password'} link; all sessions ended` });
   res.json({ ok: true });
 });
 
@@ -698,6 +725,7 @@ app.post('/api/users', auth, requireBoss, (req, res) => {
   if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return bad(res, 'A user with this email already exists.');
   const r = db.prepare('INSERT INTO users (name,email,password_hash,role,lead_id,team_id) VALUES (?,?,?,?,?,?)')
     .run(name, email, bcrypt.hashSync(welcome ? crypto.randomBytes(32).toString('hex') : password, 10), role, lead_id, team_id);
+  audit(req, 'person_added', { target: { type: 'person', id: r.lastInsertRowid, name }, details: `${email}; role ${role}; team ${teamLabel(team_id)}${managed.ids ? `; manages ${managed.ids.map(teamLabel).join(', ')}` : ''}; ${welcome ? 'welcome email' : 'password set by ' + req.user.name}` });
   const became_lead = autoLead(r.lastInsertRowid, req.user.id);
   if (managed.ids) setManagedTeams(r.lastInsertRowid, managed.ids, req.user.id);
   syncTeamChats();
@@ -734,6 +762,7 @@ app.post('/api/users/:id/welcome', auth, ownerFirst('resend the welcome email (a
   if (!target.active) return bad(res, 'This account is deactivated. Activate it first.', 409);
   if (!mailer.enabled()) return bad(res, 'Email isn’t set up. Set a password for this person instead.', 409);
   sendWelcome(target, req.user);
+  audit(req, 'welcome_resent', { target: personTarget(target), details: 'new “Set your password” link emailed; earlier links stop working' });
   res.json({ ok: true, email: target.email });
 });
 
@@ -815,6 +844,18 @@ app.patch('/api/users/:id', auth, ownerFirst(patchWhat), requireBoss, (req, res)
   // Only when the team changed or the role became lead: a lead a manager removed on the team page stays removed.
   const became_lead = (f.team_id !== undefined && f.team_id !== target.team_id) || (f.role === 'lead' && target.role !== 'lead') ? autoLead(target.id, req.user.id) : null;
   syncTeamChats(); // team chats follow team membership, leads and deactivation
+  // Audit: one entry per kind of change, old → new.
+  const tgt = personTarget({ id: target.id, name: f.name || target.name });
+  if (f.role !== undefined && f.role !== target.role) audit(req, 'role_changed', { target: tgt, details: `${target.role} → ${f.role}` });
+  if (f.team_id !== undefined && (f.team_id || null) !== (target.team_id || null)) audit(req, 'team_changed', { target: tgt, details: `${teamLabel(target.team_id)} → ${teamLabel(f.team_id)}` });
+  if (f.lead_id !== undefined && (f.lead_id || null) !== (target.lead_id || null)) audit(req, 'lead_changed', { target: tgt, details: `lead ${personLabel(target.lead_id)} → ${personLabel(f.lead_id)}` });
+  if (managed.ids) audit(req, 'managed_teams_changed', { target: tgt, details: `manages ${managed.ids.map(teamLabel).join(', ') || 'no team'}` });
+  if (f.active !== undefined && f.active !== target.active) audit(req, f.active ? 'account_activated' : 'account_deactivated', { target: tgt, details: f.active ? '' : 'sessions ended' });
+  if (f.protected !== undefined) audit(req, 'protection_changed', { target: tgt, details: f.protected ? 'protection on' : 'protection off' });
+  if (f.password_hash) audit(req, 'password_set_by_manager', { target: tgt, details: 'all sessions ended' });
+  if ((f.name !== undefined && f.name !== target.name) || (f.email !== undefined && f.email !== target.email))
+    audit(req, 'person_edited', { target: tgt, details: [f.name !== undefined && f.name !== target.name ? `name ${target.name} → ${f.name}` : '', f.email !== undefined && f.email !== target.email ? `email ${target.email} → ${f.email}` : ''].filter(Boolean).join('; ') });
+  if (became_lead) audit(req, 'lead_changed', { target: tgt, details: `now a lead of ${became_lead.team_name}` });
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(target.id)), became_lead });
 });
 
@@ -890,6 +931,7 @@ app.delete('/api/users/:id', auth, ownerFirst('remove the account'), requireAdmi
     for (const id of led) syncLegacyLead(id);
   })();
   syncTeamChats();
+  audit(req, 'person_removed', { target: personTarget(t), details: r.total ? `${t.email}; account kept for History (marked removed)` : `${t.email}; account deleted (no records)` });
   res.json({ ok: true, mode: r.total ? 'kept' : 'deleted' });
 });
 // Restore a removed person: their original email must still be free. Teams and lead roles are not given back.
@@ -901,6 +943,7 @@ app.post('/api/users/:id/restore', auth, ownerFirst('restore the account'), requ
     return bad(res, `${t.original_email} is now used by another account, so ${t.name.replace(/ \(removed\)$/, '')} can’t be restored.`, 409);
   db.prepare(`UPDATE users SET active = 1, email = original_email, original_email = NULL, removed_at = NULL, removed_by = NULL,
     name = ? WHERE id = ?`).run(t.name.replace(/ \(removed\)$/, ''), t.id);
+  audit(req, 'person_restored', { target: { type: 'person', id: t.id, name: t.name.replace(/ \(removed\)$/, '') }, details: t.original_email });
   res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id = ?').get(t.id)) });
 });
 
@@ -1434,6 +1477,7 @@ app.delete('/api/teams/:id', auth, requireBoss, (req, res) => {
     db.prepare('DELETE FROM teams WHERE id = ?').run(team.id);
   })();
   if (chat) push(memberIds(chat.id), 'conversation', { conversation_id: chat.id });
+  audit(req, 'team_deleted', { target: { type: 'team', id: team.id, name: team.name }, details: 'its members now have no team' });
   res.json({ ok: true });
 });
 // Add (or move) a person into a team / remove them. A person belongs to one team.
@@ -1459,6 +1503,7 @@ app.put('/api/teams/:id/members/:userId', auth, requireTeamPower, (req, res) => 
   db.prepare('UPDATE users SET team_id = ? WHERE id = ?').run(t.team.id, t.user.id);
   const became_lead = t.user.team_id !== t.team.id ? autoLead(t.user.id, req.user.id) : null; // only when they actually moved
   syncTeamChats();
+  if (t.user.team_id !== t.team.id) audit(req, 'team_changed', { target: personTarget(t.user), details: `${teamLabel(t.user.team_id)} → ${t.team.name}${became_lead ? ` (now a lead of ${t.team.name})` : ''}` });
   res.json({ ok: true, became_lead });
 });
 // Managers/admins and the team's team managers: the full list of this team's leads (replaces the old list).
@@ -1475,9 +1520,12 @@ app.put('/api/teams/:id/leads', auth, requireTeamPower, (req, res) => {
     if (added.some(id => !db.prepare(`SELECT 1 FROM users WHERE id = ? AND role = 'lead' AND team_id IN ${MANAGED_TEAMS}`).get(id, req.user.id)))
       return bad(res, 'Choose team leads from the teams you manage.', 403);
   }
+  const before = leadsOf(team.id).map(l => l.name);
   const err = setTeamLeads(team.id, ids, req.user.id);
   if (err) return bad(res, err);
   syncTeamChats();
+  const after = leadsOf(team.id).map(l => l.name);
+  if (before.join('|') !== after.join('|')) audit(req, 'team_leads_changed', { target: { type: 'team', id: team.id, name: team.name }, details: `${before.join(', ') || 'none'} → ${after.join(', ') || 'none'}` });
   res.json({ leads: leadsOf(team.id) });
 });
 // Managers/admins: the full list of this team's team managers (active people with the role team_manager).
@@ -1495,6 +1543,7 @@ app.put('/api/teams/:id/managers', auth, requireBoss, (req, res) => {
     for (const id of ids) add.run(team.id, id, req.user.id);
   })();
   syncTeamChats();
+  audit(req, 'team_managers_changed', { target: { type: 'team', id: team.id, name: team.name }, details: managersOf(team.id).map(m => m.name).join(', ') || 'none' });
   res.json({ managers: managersOf(team.id) });
 });
 // Managers/admins: the full list of teams this team works with (replaces the old list).
@@ -1512,8 +1561,9 @@ app.put('/api/teams/:id/connections', auth, requireBoss, (req, res) => {
 });
 app.delete('/api/teams/:id/members/:userId', auth, requireTeamPower, (req, res) => {
   const t = memberTarget(req, res); if (!t) return;
-  db.prepare('UPDATE users SET team_id = NULL WHERE id = ? AND team_id = ?').run(t.user.id, t.team.id);
+  const moved = db.prepare('UPDATE users SET team_id = NULL WHERE id = ? AND team_id = ?').run(t.user.id, t.team.id).changes;
   syncTeamChats();
+  if (moved) audit(req, 'team_changed', { target: personTarget(t.user), details: `${t.team.name} → no team` });
   res.json({ ok: true });
 });
 
@@ -2244,6 +2294,8 @@ app.get('/api/files/:id', auth, (req, res) => {
     res.type(type);
     return res.sendFile(file, err => { if (err && !res.headersSent) bad(res, 'File not found.', 404); });
   }
+  audit(req, 'file_downloaded', { target: { type: 'file', id: f.id, name: f.original_name },
+    details: f.message_id ? `chat message #${f.message_id}` : f.task_id ? `task #${f.task_id}` : f.request_id ? `request #${f.request_id}` : 'shared assignment file' });
   res.download(file, f.original_name, { headers: { 'Content-Type': type } }, err => {
     if (err && !res.headersSent) bad(res, 'File not found.', 404);
   });
@@ -2315,9 +2367,43 @@ app.get('/api/history', auth, (req, res) => {
     ['Completed date', r => localTime(r.completed_at)], ['Approved by', r => r.approved_by_name], ['Send-back reasons', r => r.send_back_reasons],
     ['Deleted', r => r.deleted_at ? `Deleted by ${r.deleted_by_name || 'unknown'} on ${localTime(r.deleted_at)}` : '']];
   const lines = [cols.map(c => csvCell(c[0])).join(',')].concat(rows.map(r => cols.map(c => csvCell(c[1](r))).join(',')));
+  audit(req, 'history_exported', { details: `${rows.length} rows; filters ${JSON.stringify(Object.fromEntries(Object.entries(req.query).filter(([k]) => k !== 'format')))}` });
   res.set('Content-Type', 'text/csv; charset=utf-8');
   res.attachment(`taskdesk-history-${new Date().toISOString().slice(0, 10)}.csv`);
   res.send('﻿' + lines.join('\r\n') + '\r\n');
+});
+
+// ---------- audit log page (admins only; read and export, nothing else) ----------
+// Filters: from / to (YYYY-MM-DD, local dates), action, q (text in who, target, details or IP). Newest first, 200 per
+// page (before=<id> for the next page). format=csv exports everything that matches (up to 50,000 rows) and is itself
+// recorded.
+const AUDIT_ACTIONS = ['sign_in', 'sign_in_failed', 'account_locked', 'signed_out_other_devices', 'password_changed', 'password_reset_requested',
+  'password_reset', 'password_set_by_manager', 'welcome_resent', 'person_added', 'person_edited', 'role_changed', 'team_changed', 'lead_changed',
+  'managed_teams_changed', 'team_leads_changed', 'team_managers_changed', 'team_deleted', 'protection_changed', 'account_activated',
+  'account_deactivated', 'person_removed', 'person_restored', 'file_downloaded', 'history_exported', 'audit_exported'];
+function auditWhere(q) {
+  const where = [], params = [];
+  if (DATE_RE.test(String(q.from || ''))) { where.push(`date(at, 'localtime') >= ?`); params.push(q.from); }
+  if (DATE_RE.test(String(q.to || ''))) { where.push(`date(at, 'localtime') <= ?`); params.push(q.to); }
+  if (AUDIT_ACTIONS.includes(q.action)) { where.push('action = ?'); params.push(q.action); }
+  const text = str(q.q, 100);
+  if (text) { where.push(`(actor_name LIKE ? ESCAPE '\\' OR target_name LIKE ? ESCAPE '\\' OR details LIKE ? ESCAPE '\\' OR ip LIKE ? ESCAPE '\\')`); params.push(...Array(4).fill(likeText(text))); }
+  return { sql: where.length ? 'WHERE ' + where.join(' AND ') : '', params };
+}
+app.get('/api/audit', auth, requireAdmin, (req, res) => {
+  const w = auditWhere(req.query);
+  if (req.query.format === 'csv') {
+    const rows = db.prepare(`SELECT * FROM audit_log ${w.sql} ORDER BY id DESC LIMIT 50000`).all(...w.params);
+    audit(req, 'audit_exported', { details: `${rows.length} rows; filters ${JSON.stringify(Object.fromEntries(Object.entries(req.query).filter(([k]) => k !== 'format')))}` });
+    const cols = [['When', r => localTime(r.at)], ['Who', r => r.actor_name || '(not signed in)'], ['IP', r => r.ip], ['Action', r => r.action],
+      ['Target type', r => r.target_type], ['Target', r => r.target_name], ['Details', r => r.details]];
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.attachment(`taskdesk-audit-${new Date().toISOString().slice(0, 10)}.csv`);
+    return res.send('\ufeff' + [cols.map(c => csvCell(c[0])).join(',')].concat(rows.map(r => cols.map(c => csvCell(c[1](r))).join(','))).join('\r\n') + '\r\n');
+  }
+  const before = Number(req.query.before) || Number.MAX_SAFE_INTEGER;
+  const rows = db.prepare(`SELECT * FROM audit_log ${w.sql ? w.sql + ' AND' : 'WHERE'} id < ? ORDER BY id DESC LIMIT 201`).all(...w.params, before);
+  res.json({ entries: rows.slice(0, 200), more: rows.length > 200, actions: AUDIT_ACTIONS });
 });
 
 // ---------- desktop app summary ----------

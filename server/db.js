@@ -346,6 +346,25 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   // Sessions from before this are empty and get a value on their next request.
   if (!db.prepare('PRAGMA table_info(sessions)').all().some(c => c.name === 'last_active_at'))
     db.exec('ALTER TABLE sessions ADD COLUMN last_active_at TEXT');
+  // Audit log (Security A1): append-only. No foreign keys (entries outlive the people and items they name; names are
+  // copied in), and triggers refuse every UPDATE and DELETE, so nothing in the app can change or remove an entry.
+  db.exec(`CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      at TEXT NOT NULL DEFAULT (datetime('now')),
+      actor_id INTEGER,
+      actor_name TEXT,
+      ip TEXT,
+      action TEXT NOT NULL,
+      target_type TEXT,
+      target_id INTEGER,
+      target_name TEXT,
+      details TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at);
+    CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+    CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
+    CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;`);
 })();
 
 // ---- Roles: users.role has no CHECK constraint any more (server.js validates it on every write) ----
