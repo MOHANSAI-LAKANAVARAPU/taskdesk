@@ -410,3 +410,7 @@ dialog.wide{width:min(1000px,calc(100% - 24px))}
 .import-table{font-size:.8125rem}
 .import-table th,.import-table td{padding:6px 8px;vertical-align:top}
 .import-table tr[hidden]{display:none}
+/* "Load more" under paged lists (Scale) */
+.more-row{margin:12px 0;text-align:center}
+.chat-list .more-row{margin:8px 0;list-style:none}
+.board-col .more-row{margin:8px 0 0}

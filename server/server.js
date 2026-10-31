@@ -904,6 +904,23 @@ function protectedRefused(req, res, target, what) {
 // ---------- users ----------
 app.get('/api/users', auth, (req, res) => {
   const u = req.user;
+  // All people (Scale), managers/admins: ?paged=1&q=&team=&role=&status=&limit=&offset= -> { users, total, total_all, more }.
+  // status: active | inactive | removed | (empty = everyone who isn't removed). total_all = everyone in that status group.
+  // Without paged=1 the whole list comes back as before: the pickers (task form, filters, team page) need all of it.
+  if (isBoss(u) && req.query.paged === '1') {
+    const status = String(req.query.status || ''), base = status === 'removed' ? 'removed_at IS NOT NULL' : 'removed_at IS NULL';
+    const where = [base], params = [];
+    if (status === 'active') where.push('active = 1'); else if (status === 'inactive') where.push('active = 0');
+    teamFilter(req.query.team, 'team_id', where, params);
+    if (ROLES.includes(req.query.role)) { where.push('role = ?'); params.push(req.query.role); }
+    const text = str(req.query.q, 100);
+    if (text) { where.push(`(name LIKE ? ESCAPE '\\' OR email LIKE ? ESCAPE '\\')`); params.push(likeText(text), likeText(text)); }
+    const { limit, offset } = pageOf(req, 50), W = where.join(' AND ');
+    const total = db.prepare(`SELECT COUNT(*) AS n FROM users WHERE ${W}`).get(...params).n;
+    const total_all = db.prepare(`SELECT COUNT(*) AS n FROM users WHERE ${base}`).get().n;
+    const rows = db.prepare(`SELECT * FROM users WHERE ${W} ORDER BY active DESC, name, id LIMIT ? OFFSET ?`).all(...params, limit, offset);
+    return res.json({ users: rows.map(r => u.role === 'admin' ? { ...publicUser(r), two_step: !!r.totp_enabled_at } : publicUser(r)), total, total_all, more: offset + rows.length < total });
+  }
   let rows;
   // Removed people are left out of every list and picker; managers/admins can ask for them (All people → "Removed").
   if (isBoss(u)) rows = db.prepare(`SELECT * FROM users ${req.query.removed === '1' ? '' : 'WHERE removed_at IS NULL'} ORDER BY active DESC, name`).all();
@@ -1417,6 +1434,9 @@ function teamFilter(value, column, where, params) {
   if (value === 'none') where.push(`${column} IS NULL`);
   else if (/^\d+$/.test(String(value || ''))) { where.push(`${column} = ?`); params.push(Number(value)); }
 }
+// Paging (Scale): lists take ?limit= and ?offset= and answer with the page plus the totals the page shows, so nothing is
+// counted from the rows that happen to be loaded. limit is capped at 200.
+const pageOf = (req, def = 100) => ({ limit: Math.min(Math.max(parseInt(req.query.limit) || def, 1), 200), offset: Math.min(Math.max(parseInt(req.query.offset) || 0, 0), 1e6) });
 // Search text for LIKE (with % and _ taken literally).
 const likeText = q => '%' + String(q).replace(/[\\%_]/g, c => '\\' + c) + '%';
 
@@ -1441,13 +1461,23 @@ app.get('/api/tasks/summary', auth, (req, res) => {
   for (const r of db.prepare(`SELECT a.team_id, ${cols} ${from} GROUP BY a.team_id`).all(...s.params)) { const { team_id, ...c } = r; teams[teamKey(team_id)] = c; }
   res.json({ teams, all: db.prepare(`SELECT ${cols} ${from}`).get(...s.params) });
 });
+const TASK_FROM = TASK_SELECT.slice(TASK_SELECT.indexOf('FROM tasks t'));
+const OVERDUE_SQL = `t.status != 'completed' AND t.deadline IS NOT NULL AND t.deadline < date('now','localtime')`;
+const TASK_STATS = `COUNT(*) AS total, COALESCE(SUM(t.status != 'completed'), 0) AS open, COALESCE(SUM(${OVERDUE_SQL}), 0) AS overdue`;
+// The tasks list, in pages (Scale). All of these only narrow what taskScope allows:
+//   ?limit=&offset=            a page of the list (default 100, at most 200) -> { tasks, total, more, stats }
+//   ?group=team&per_group=30   the "All teams" view: the first rows of every team + each team's totals -> { groups, stats }
+//   ?view=board&per_column=40  the board: the first rows of every status column + each column's total -> { columns, stats }
+//   ?col=<status>              only that status (the board's "Load more"); sort=completed = newest completed first
+// stats = { total, open, overdue } for everything the filters match (not just the rows sent).
 app.get('/api/tasks', auth, (req, res) => {
   const s = taskScope(req.user);
   const where = [s.sql], params = [...s.params];
   const { status, project, assignee, mine } = req.query;
-  if (status === 'overdue') where.push(`t.status != 'completed' AND t.deadline IS NOT NULL AND t.deadline < date('now','localtime')`);
+  if (status === 'overdue') where.push(OVERDUE_SQL);
   else if (status === 'open') where.push(`t.status != 'completed'`);
   else if (STATUSES.includes(status)) { where.push('t.status = ?'); params.push(status); }
+  if (STATUSES.includes(req.query.col)) { where.push('t.status = ?'); params.push(req.query.col); }
   if (project) { where.push('t.project_id = ?'); params.push(Number(project)); }
   if (assignee) { where.push('t.assignee_id = ?'); params.push(Number(assignee)); }
   if (mine === 'assigned_by_me') { where.push('t.assigned_by = ?'); params.push(req.user.id); }
@@ -1455,7 +1485,7 @@ app.get('/api/tasks', auth, (req, res) => {
   teamFilter(req.query.team, 'a.team_id', where, params);
   const q = str(req.query.q, 100);
   if (q) { where.push(`(t.title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\')`); params.push(likeText(q), likeText(q)); }
-  if (req.query.due === 'overdue') where.push(`t.status != 'completed' AND t.deadline IS NOT NULL AND t.deadline < date('now','localtime')`);
+  if (req.query.due === 'overdue') where.push(OVERDUE_SQL);
   else if (req.query.due === 'week') where.push(`t.status != 'completed' AND t.deadline BETWEEN date('now','localtime') AND date('now','localtime','+6 days')`);
   if (req.query.priority === 'high') where.push(`t.priority IN ('urgent','high')`);
   else if (PRIORITIES.includes(req.query.priority)) { where.push('t.priority = ?'); params.push(req.query.priority); }
@@ -1463,9 +1493,31 @@ app.get('/api/tasks', auth, (req, res) => {
   const PRIO = `CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END`;
   const order = req.query.sort === 'priority' ? `t.status = 'completed', ${PRIO}, t.deadline IS NULL, t.deadline, t.id DESC`
     : req.query.sort === 'newest' ? 't.id DESC'
+    : req.query.sort === 'completed' ? 't.completed_at DESC, t.id DESC'
     : `t.status = 'completed', t.deadline IS NULL, t.deadline, ${PRIO}, t.id DESC`; // "deadline" (the default)
-  const rows = db.prepare(`${TASK_SELECT} WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT 1000`).all(...params);
-  res.json({ tasks: rows });
+  const W = where.join(' AND ');
+  const stats = db.prepare(`SELECT ${TASK_STATS} ${TASK_FROM} WHERE ${W}`).get(...params);
+  if (req.query.group === 'team') { // "All teams": the first rows of every team
+    const per = Math.min(Math.max(parseInt(req.query.per_group) || 30, 1), 100);
+    const rows = db.prepare(`SELECT * FROM (${TASK_SELECT.replace('SELECT t.*,', `SELECT t.*, ROW_NUMBER() OVER (PARTITION BY a.team_id ORDER BY ${order}) AS rn,`)} WHERE ${W})
+      WHERE rn <= ? ORDER BY team_id IS NULL, team_id, rn`).all(...params, per);
+    const groups = db.prepare(`SELECT a.team_id, tm.name AS team_name, ${TASK_STATS} ${TASK_FROM} WHERE ${W} GROUP BY a.team_id`).all(...params)
+      .map(g => ({ ...g, tasks: [] }));
+    const by = new Map(groups.map(g => [g.team_id, g]));
+    for (const r of rows) { delete r.rn; by.get(r.team_id).tasks.push(r); }
+    return res.json({ groups, stats });
+  }
+  if (req.query.view === 'board') { // one column per status
+    const per = Math.min(Math.max(parseInt(req.query.per_column) || 40, 1), 100), columns = {};
+    for (const st of STATUSES) {
+      const total = db.prepare(`SELECT COUNT(*) AS n ${TASK_FROM} WHERE ${W} AND t.status = ?`).get(...params, st).n;
+      columns[st] = { total, tasks: total ? db.prepare(`${TASK_SELECT} WHERE ${W} AND t.status = ? ORDER BY ${st === 'completed' ? 't.completed_at DESC, t.id DESC' : order} LIMIT ?`).all(...params, st, per) : [] };
+    }
+    return res.json({ columns, stats });
+  }
+  const { limit, offset } = pageOf(req);
+  const rows = db.prepare(`${TASK_SELECT} WHERE ${W} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...params, limit, offset);
+  res.json({ tasks: rows, total: stats.total, more: offset + rows.length < stats.total, stats });
 });
 
 // Create tasks: one separate task per person in assignee_ids (or the single assignee_id, kept for compatibility).
@@ -2028,6 +2080,13 @@ function requestFlags(u, r) {
   };
 }
 
+const REQ_ORDER = `CASE r.status WHEN 'needs_team' THEN 0 WHEN 'open' THEN 1 WHEN 'assigned' THEN 2 WHEN 'delivered' THEN 3 ELSE 4 END, r.needed_by IS NULL, r.needed_by, r.id DESC`;
+const reqRowOut = r => ({ id: r.id, title: r.title, requested_by: r.requested_by, requested_by_name: r.requested_by_name,
+  target_team_id: r.target_team_id, team_name: r.team_name, requester_team_id: r.requester_team_id, requester_team_name: r.requester_team_name,
+  needed_by: r.needed_by, status: r.status, assignee_name: r.assignee_name, asked_person_name: r.asked_person_name, created_at: r.created_at });
+// The requests board, in pages (Scale): ?limit=&offset= -> { requests, total, more, stats }; ?group=team&per_group=30 (the
+// "All teams" view, grouped by the team a request was sent to) -> { groups, stats }. stats = { total, waiting } for
+// everything the filters match; waiting = needs a team or open, as the group headers say "waiting for someone".
 app.get('/api/requests', auth, (req, res) => {
   const scope = requestScope(req.user);
   const where = [scope.sql], params = [...scope.params];
@@ -2037,13 +2096,23 @@ app.get('/api/requests', auth, (req, res) => {
   if (q) { where.push(`(r.title LIKE ? ESCAPE '\\' OR r.description LIKE ? ESCAPE '\\')`); params.push(likeText(q), likeText(q)); }
   if (req.query.status === 'active') where.push(`r.status IN ('needs_team','open','assigned','delivered')`);
   else if (REQ_STATUSES.includes(req.query.status)) { where.push('r.status = ?'); params.push(req.query.status); }
-  const rows = db.prepare(`${REQ_SELECT} WHERE ${where.join(' AND ')}
-    ORDER BY CASE r.status WHEN 'needs_team' THEN 0 WHEN 'open' THEN 1 WHEN 'assigned' THEN 2 WHEN 'delivered' THEN 3 ELSE 4 END,
-      r.needed_by IS NULL, r.needed_by, r.id DESC LIMIT 1000`).all(...params);
-  res.json({ requests: rows.map(r => ({ id: r.id, title: r.title, requested_by: r.requested_by, requested_by_name: r.requested_by_name,
-    target_team_id: r.target_team_id, team_name: r.team_name, requester_team_id: r.requester_team_id, requester_team_name: r.requester_team_name,
-    needed_by: r.needed_by, status: r.status, assignee_name: r.assignee_name,
-    asked_person_name: r.asked_person_name, created_at: r.created_at })) });
+  const W = where.join(' AND '), WAITING = `r.status IN ('needs_team','open')`;
+  const FROM = 'FROM requests r JOIN users rb ON rb.id = r.requested_by';
+  const stats = db.prepare(`SELECT COUNT(*) AS total, COALESCE(SUM(${WAITING}), 0) AS waiting ${FROM} WHERE ${W}`).get(...params);
+  if (req.query.group === 'team') {
+    const per = Math.min(Math.max(parseInt(req.query.per_group) || 30, 1), 100);
+    const rows = db.prepare(`SELECT * FROM (${REQ_SELECT.replace('SELECT r.*,', `SELECT r.*, ROW_NUMBER() OVER (PARTITION BY r.target_team_id ORDER BY ${REQ_ORDER}) AS rn,`)} WHERE ${W})
+      WHERE rn <= ? ORDER BY target_team_id IS NULL, target_team_id, rn`).all(...params, per);
+    const groups = db.prepare(`SELECT r.target_team_id AS team_id, tm.name AS team_name, COUNT(*) AS total, COALESCE(SUM(${WAITING}), 0) AS waiting ${FROM}
+      LEFT JOIN teams tm ON tm.id = r.target_team_id WHERE ${W} GROUP BY r.target_team_id`).all(...params)
+      .map(g => ({ ...g, requests: [] }));
+    const by = new Map(groups.map(g => [g.team_id, g]));
+    for (const r of rows) by.get(r.target_team_id).requests.push(reqRowOut(r));
+    return res.json({ groups, stats });
+  }
+  const { limit, offset } = pageOf(req);
+  const rows = db.prepare(`${REQ_SELECT} WHERE ${W} ORDER BY ${REQ_ORDER} LIMIT ? OFFSET ?`).all(...params, limit, offset);
+  res.json({ requests: rows.map(reqRowOut), total: stats.total, more: offset + rows.length < stats.total, stats });
 });
 // Per team: incoming requests waiting for someone (open, or needs a team → "none"), requests the team's members sent that
 // aren't finished (needs_team/open/assigned/delivered, the "Not finished" filter), and requests delivered to others in
@@ -2436,22 +2505,29 @@ function syncTeamChats() {
 }
 syncTeamChats();
 
+// The chat list, 50 at a time (Scale). Order: active chats before archived ones, then the latest activity, then id. The
+// cursor ?before=<archived 0|1>|<activity time>|<id> is the last row the page already has, so a chat that moves up the
+// list while the person scrolls can't make the next page skip or repeat rows. -> { conversations, more, unread_total }
 app.get('/api/chat', auth, (req, res) => {
-  const u = req.user;
-  const rows = db.prepare(`SELECT c.*, cm.muted, ${UNREAD} AS unread,
+  const u = req.user, limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+  const cur = String(req.query.before || '').match(/^([01])\|([\d\- :TZ.]*)\|(\d+)$/);
+  const ACT = 'COALESCE(c.last_message_at, c.created_at)', ARCH = '(c.archived_at IS NOT NULL)';
+  const after = cur ? `AND (${ARCH} > ? OR (${ARCH} = ? AND (${ACT} < ? OR (${ACT} = ? AND c.id < ?))))` : '';
+  const rows = db.prepare(`SELECT c.*, ${ACT} AS activity_at, cm.muted, ${UNREAD} AS unread,
       (SELECT COUNT(*) FROM conversation_members x WHERE x.conversation_id = c.id) AS member_count,
       lm.id AS last_id, lm.body AS last_body, lm.deleted_at AS last_deleted, lm.sender_id AS last_sender_id, ls.name AS last_sender_name,
       (SELECT original_name FROM files f WHERE f.message_id = lm.id ORDER BY f.id LIMIT 1) AS last_file
     FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id
     LEFT JOIN messages lm ON lm.id = (SELECT MAX(id) FROM messages WHERE conversation_id = c.id AND system = 0) LEFT JOIN users ls ON ls.id = lm.sender_id
-    WHERE cm.user_id = ? ORDER BY c.archived_at IS NOT NULL, COALESCE(c.last_message_at, c.created_at) DESC, c.id DESC`).all(u.id);
+    WHERE cm.user_id = ? ${after} ORDER BY ${ARCH}, ${ACT} DESC, c.id DESC LIMIT ?`).all(u.id, ...(cur ? [Number(cur[1]), Number(cur[1]), cur[2], cur[2], Number(cur[3])] : []), limit + 1);
+  const more = rows.length > limit; if (more) rows.pop();
   const conversations = rows.map(c => ({
     id: c.id, type: c.type, name: chatName(c, u.id), muted: !!c.muted, archived: !!c.archived_at, unread: c.unread, member_count: c.member_count,
-    last_message_at: c.last_message_at, can_manage: canManageChat(u, c),
+    last_message_at: c.last_message_at, activity_at: c.activity_at, can_manage: canManageChat(u, c),
     last: c.last_id ? { sender_name: c.last_sender_id === u.id ? 'You' : c.last_sender_name, deleted: !!c.last_deleted,
       text: c.last_deleted ? 'This message was deleted' : c.last_body ? c.last_body.slice(0, 120) : c.last_file ? '📎 ' + c.last_file : '' } : null
   }));
-  res.json({ conversations, unread_total: chatUnreadTotal(u.id) });
+  res.json({ conversations, more, unread_total: chatUnreadTotal(u.id) });
 });
 // Everyone active (name and team only), for "New chat" / "New group".
 app.get('/api/chat/people', auth, (req, res) => {
@@ -2706,32 +2782,38 @@ const LATEST_SUBMIT = `(SELECT MAX(created_at) FROM task_updates WHERE task_id =
 const LATEST_APPROVE = `(SELECT MAX(created_at) FROM task_updates WHERE task_id = t.id AND status = 'completed' AND (message LIKE 'Approved%' OR message LIKE 'Self-approved by %'))`;
 const SELF_APPROVED = `EXISTS (SELECT 1 FROM task_updates WHERE task_id = t.id AND message LIKE 'Self-approved by %')`;
 const SEND_BACKS = `(SELECT group_concat(substr(message, 12), ' | ') FROM task_updates WHERE task_id = t.id AND message LIKE 'Sent back: %')`;
-function historyRows(u, q) {
-  const s = taskScope(u, true); // History also lists archived (deleted) tasks and requests, with status deleted
-  const taskRows = db.prepare(`SELECT 'task' AS type, t.id, t.title, t.status, a.team_id, tm.name AS team_name,
+// The two kinds of History row. Shared by the full list (historyRows: the CSV) and the paged one (historyPage).
+const HIST_TASK_SELECT = `SELECT 'task' AS type, t.id, t.title, t.status, a.team_id, tm.name AS team_name,
       t.assignee_id, a.name AS assignee_name, t.assigned_by, b.name AS assigned_by_name, NULL AS requested_by, NULL AS requested_by_name,
       t.created_at AS assigned_at, ${LATEST_SUBMIT} AS submitted_at, ${LATEST_APPROVE} AS approved_at, t.completed_at,
       ab.name AS approved_by_name, t.status = 'completed' AND ${SELF_APPROVED} AS self_approved, ${SEND_BACKS} AS send_back_reasons, t.created_at AS created_at, t.id AS task_id,
       t.deleted_at, td.name AS deleted_by_name
     FROM tasks t JOIN users a ON a.id = t.assignee_id JOIN users b ON b.id = t.assigned_by
-    LEFT JOIN teams tm ON tm.id = a.team_id LEFT JOIN users ab ON ab.id = t.approved_by LEFT JOIN users td ON td.id = t.deleted_by
-    WHERE ${s.sql} AND t.id NOT IN (SELECT task_id FROM requests WHERE task_id IS NOT NULL)`).all(...s.params);
-  // Requests: the same people who can see them on the board (requestScope).
-  const { sql: rsql, params: rparams } = requestScope(u, true);
-  const reqRows = db.prepare(`SELECT 'request' AS type, r.id, r.title, r.status, r.target_team_id AS team_id, tm.name AS team_name,
+    LEFT JOIN teams tm ON tm.id = a.team_id LEFT JOIN users ab ON ab.id = t.approved_by LEFT JOIN users td ON td.id = t.deleted_by`;
+const HIST_REQ_SELECT = `SELECT 'request' AS type, r.id, r.title, r.status, r.target_team_id AS team_id, tm.name AS team_name,
       t.assignee_id, a.name AS assignee_name, t.assigned_by, b.name AS assigned_by_name, r.requested_by, rb.name AS requested_by_name,
       t.created_at AS assigned_at, ${LATEST_SUBMIT} AS submitted_at, ${LATEST_APPROVE} AS approved_at, r.closed_at AS completed_at,
       ab.name AS approved_by_name, t.status = 'completed' AND ${SELF_APPROVED} AS self_approved, ${SEND_BACKS} AS send_back_reasons, r.created_at AS created_at, r.task_id,
       r.deleted_at, rd.name AS deleted_by_name
     FROM requests r JOIN users rb ON rb.id = r.requested_by LEFT JOIN teams tm ON tm.id = r.target_team_id LEFT JOIN users rd ON rd.id = r.deleted_by
     LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN users a ON a.id = t.assignee_id LEFT JOIN users b ON b.id = t.assigned_by
-    LEFT JOIN users ab ON ab.id = t.approved_by WHERE ${rsql}`).all(...rparams);
-  let rows = taskRows.concat(reqRows);
+    LEFT JOIN users ab ON ab.id = t.approved_by`;
+const HIST_NOT_REQUEST_TASK = `t.id NOT IN (SELECT task_id FROM requests WHERE task_id IS NOT NULL)`;
+function historyFixups(u, rows) {
   // A task approved directly (no "Approved" update) still has an approval date: when it was completed.
   for (const r of rows) if (!r.approved_at && r.type === 'task' && r.approved_by_name && r.completed_at) r.approved_at = r.completed_at;
   for (const r of rows) if (r.type === 'request' && r.status === 'needs_team') r.team_name = 'Not decided yet';
   for (const r of rows) if (r.self_approved && r.approved_by_name) r.approved_by_name += ' (self-approved)';
   for (const r of rows) if (r.deleted_at) { r.status = 'deleted'; r.can_restore = canManageArchived(u, r.team_id); }
+  return rows;
+}
+function historyRows(u, q) {
+  const s = taskScope(u, true); // History also lists archived (deleted) tasks and requests, with status deleted
+  const taskRows = db.prepare(`${HIST_TASK_SELECT} WHERE ${s.sql} AND ${HIST_NOT_REQUEST_TASK}`).all(...s.params);
+  // Requests: the same people who can see them on the board (requestScope).
+  const { sql: rsql, params: rparams } = requestScope(u, true);
+  const reqRows = db.prepare(`${HIST_REQ_SELECT} WHERE ${rsql}`).all(...rparams);
+  let rows = historyFixups(u, taskRows.concat(reqRows));
   const person = Number(q.person), team = Number(q.team);
   if (person) rows = rows.filter(r => [r.assignee_id, r.assigned_by, r.requested_by].includes(person));
   if (team) rows = rows.filter(r => r.team_id === team);
@@ -2742,6 +2824,36 @@ function historyRows(u, q) {
   if (DATE_RE.test(q.from || '')) rows = rows.filter(r => day(r.created_at) >= q.from);
   if (DATE_RE.test(q.to || '')) rows = rows.filter(r => day(r.created_at) <= q.to);
   return rows.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+}
+// The same list as historyRows, one page at a time (Scale), with the filters done in SQL. Two steps: first only the keys
+// (type, id, created_at) of every matching row, newest first, which is cheap; then the full rows, with their
+// per-row look-ups (submitted/approved dates, send-back reasons), for just the page. Returns { rows, total }.
+function historyPage(u, q, limit, offset) {
+  const person = Number(q.person), team = Number(q.team);
+  const f = { task: [], req: [] }, p = { task: [], req: [] };
+  if (person) { f.task.push('(t.assignee_id = ? OR t.assigned_by = ?)'); p.task.push(person, person); f.req.push('(t.assignee_id = ? OR t.assigned_by = ? OR r.requested_by = ?)'); p.req.push(person, person, person); }
+  if (team) { f.task.push('a.team_id = ?'); p.task.push(team); f.req.push('r.target_team_id = ?'); p.req.push(team); }
+  else if (q.team === 'none') { f.task.push('a.team_id IS NULL'); f.req.push('r.target_team_id IS NULL'); }
+  if (q.status) { // "deleted" is what an archived row shows instead of its own status
+    f.task.push(`CASE WHEN t.deleted_at IS NOT NULL THEN 'deleted' ELSE t.status END = ?`); p.task.push(String(q.status));
+    f.req.push(`CASE WHEN r.deleted_at IS NOT NULL THEN 'deleted' ELSE r.status END = ?`); p.req.push(String(q.status));
+  }
+  if (DATE_RE.test(q.from || '')) { f.task.push('substr(t.created_at, 1, 10) >= ?'); p.task.push(q.from); f.req.push('substr(r.created_at, 1, 10) >= ?'); p.req.push(q.from); }
+  if (DATE_RE.test(q.to || '')) { f.task.push('substr(t.created_at, 1, 10) <= ?'); p.task.push(q.to); f.req.push('substr(r.created_at, 1, 10) <= ?'); p.req.push(q.to); }
+  const ts = taskScope(u, true), rs = requestScope(u, true);
+  const T = `FROM tasks t JOIN users a ON a.id = t.assignee_id WHERE ${ts.sql} AND ${HIST_NOT_REQUEST_TASK}${f.task.map(x => ' AND ' + x).join('')}`;
+  const R = `FROM requests r JOIN users rb ON rb.id = r.requested_by LEFT JOIN tasks t ON t.id = r.task_id WHERE ${rs.sql}${f.req.map(x => ' AND ' + x).join('')}`;
+  const tp = [...ts.params, ...p.task], rp = [...rs.params, ...p.req];
+  const total = db.prepare(`SELECT (SELECT COUNT(*) ${T}) + (SELECT COUNT(*) ${R}) AS n`).get(...tp, ...rp).n;
+  const keys = db.prepare(`SELECT type, id FROM (SELECT 'task' AS type, t.id AS id, t.created_at AS created_at ${T} UNION ALL SELECT 'request', r.id, r.created_at ${R})
+    ORDER BY created_at DESC, type, id DESC LIMIT ? OFFSET ?`).all(...tp, ...rp, limit, offset);
+  const ids = type => keys.filter(k => k.type === type).map(k => k.id);
+  const tIds = ids('task'), rIds = ids('request');
+  const rows = historyFixups(u, [
+    ...(tIds.length ? db.prepare(`${HIST_TASK_SELECT} WHERE t.id IN (${tIds.map(() => '?').join(',')})`).all(...tIds) : []),
+    ...(rIds.length ? db.prepare(`${HIST_REQ_SELECT} WHERE r.id IN (${rIds.map(() => '?').join(',')})`).all(...rIds) : [])]);
+  const at = new Map(rows.map(r => [r.type + '/' + r.id, r]));
+  return { rows: keys.map(k => at.get(k.type + '/' + k.id)), total };
 }
 const STATUS_LABEL = { assigned: 'Not started', in_progress: 'In progress', submitted: 'Waiting for approval', completed: 'Completed',
   needs_team: 'Needs a team', open: 'Open', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled', deleted: 'Deleted' };
@@ -2758,6 +2870,11 @@ function csvCell(v) {
   return /[",\r\n;]/.test(s) || s !== s.trim() ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 app.get('/api/history', auth, (req, res) => {
+  // The page asks for ?limit= (a page at a time); the CSV and old callers get every matching row.
+  if (req.query.format !== 'csv' && req.query.limit !== undefined) {
+    const { limit, offset } = pageOf(req, 100), h = historyPage(req.user, req.query, limit, offset);
+    return res.json({ rows: h.rows, total: h.total, more: offset + h.rows.length < h.total });
+  }
   const rows = historyRows(req.user, req.query);
   if (req.query.format !== 'csv') return res.json({ rows });
   const cols = [['Title', r => r.title], ['Type', r => r.type === 'request' ? 'Request' : 'Task'], ['Status', r => STATUS_LABEL[r.status] || r.status],

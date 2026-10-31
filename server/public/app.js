@@ -491,6 +491,31 @@
       || ((order.indexOf(a.id) + 1 || 1e6) - (order.indexOf(b.id) + 1 || 1e6)) || a.name.localeCompare(b.name));
   }
 
+  // Paging (Scale): lists come a page at a time. moreBtn() is the "Load more" button under a list (nothing when everything is
+  // shown); wireMore() makes it fetch the next page, append it (skipping rows already shown, since the list can shift while
+  // someone scrolls) and keep "(n more)" true; the totals always come from the server.
+  const moreBtn = (key, shown, total) => total > shown ? `<p class="more-row"><button type="button" class="btn ghost" data-more="${esc(key)}" data-shown="${shown}" data-total="${total}">Load more <span class="muted">(${total - shown} more)</span></button></p>` : '';
+  function wireMore(btn, { load, idOf, seen, append }) {
+    let consumed = Number(btn.dataset.shown), total = Number(btn.dataset.total);
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const r = await load(consumed);
+        consumed += r.rows.length; total = r.total;
+        const fresh = r.rows.filter(x => !seen.has(idOf(x))); fresh.forEach(x => seen.add(idOf(x)));
+        append(fresh);
+        if (r.rows.length && total > consumed) { btn.disabled = false; btn.querySelector('.muted').textContent = `(${total - consumed} more)`; } else btn.parentElement.remove();
+      } catch (e) { toast(e.message); btn.disabled = false; }
+    };
+  }
+  // The team groups the server sends ({ team_id, team_name, ... }) in the same order byTeam() gives: the tab order first, then
+  // any other team (alphabetical), then "No team" / the fallback name.
+  function orderGroups(groups, tabs, none = 'No team') {
+    const order = tabs.map(t => t.id);
+    return groups.map(g => ({ ...g, id: g.team_id ? String(g.team_id) : 'none', name: g.team_id ? g.team_name : none }))
+      .sort((a, b) => (a.id === 'none') - (b.id === 'none') || ((order.indexOf(a.id) + 1 || 1e6) - (order.indexOf(b.id) + 1 || 1e6)) || a.name.localeCompare(b.name));
+  }
+
   // Tasks: team tabs (a task belongs to its assignee's team), List (grouped by team on "All") or Board, search, quick
   // filter chips and sort — all in the URL, all applied by the server inside the user's normal task scope.
   async function viewTasks() {
@@ -500,9 +525,14 @@
     const params = new URLSearchParams();
     for (const k of ['status', 'project', 'assignee', 'mine', 'q', 'due', 'priority', 'review', 'sort']) if (q.get(k)) params.set(k, q.get(k));
     if (cur !== 'all') params.set('team', cur);
-    const [{ tasks }, { projects }, { users }] = landing && !q.get('q') ? [{ tasks: [] }, { projects: [] }, { users: [] }]
-      : await Promise.all([api('/tasks?' + params), api('/projects'), api('/users')]);
     const board = q.get('view') === 'board';
+    // Pages (Scale): the list 100 at a time, the "All teams" view 30 per team, the board 40 per column; "Load more" fetches the rest.
+    const grouped = !landing && !board && cur === 'all' && tabs.length > 0, pq = params.toString();
+    const withP = extra => { const u = new URLSearchParams(pq); for (const [k, v] of Object.entries(extra)) u.set(k, v); return '/tasks?' + u; };
+    const noData = { tasks: [], total: 0, stats: { total: 0, open: 0, overdue: 0 } };
+    const [data, { projects }, { users }] = landing && !q.get('q') ? [noData, { projects: [] }, { users: [] }]
+      : await Promise.all([api(withP(grouped ? { group: 'team', per_group: 30 } : board ? { view: 'board', per_column: 40 } : { limit: 100 })), api('/projects'), api('/users')]);
+    const stats = data.stats, tasks = data.tasks || [], seen = new Set(tasks.map(t => t.id));
     const filtered = ['status', 'project', 'assignee', 'mine', 'q', 'due', 'priority', 'review'].some(k => q.get(k));
     const people = /^\d+$/.test(cur) ? users.filter(u => u.team_id === Number(cur)) : cur === 'none' ? users.filter(u => !u.team_id) : users;
 
@@ -511,38 +541,41 @@
         <span class="t-meta">${withTeam ? `<span>${esc(t.team_name || 'No team')}</span>` : ''}<span>${esc(dueText(t))}</span>${me.role !== 'employee' ? `<span>${esc(t.assignee_name)}</span>` : `<span>From ${esc(t.assigned_by_name)}</span>`}${t.project_name ? `<span>${esc(t.project_name)}</span>` : ''}<span class="pr-${t.priority}">${PRIORITY[t.priority]} priority</span></span>
         <span class="t-side">${statusPill(t)}<span class="mini" aria-label="${t.progress}% done"><i style="width:${t.progress}%"></i></span></span>
       </a></li>`;
-    const counts = list => {
-      const open = list.filter(t => t.status !== 'completed').length, over = list.filter(t => t.overdue).length;
-      return `(${list.length}) · ${open} open${over ? ` · <span class="over">${over} overdue</span>` : ''}`;
-    };
+    const counts = g => `(${g.total}) · ${g.open} open${g.overdue ? ` · <span class="over">${g.overdue} overdue</span>` : ''}`;
+    // "Load more" under the list, under each team on "All", and under each board column.
+    const wireTaskMore = () => app.querySelectorAll('[data-more]').forEach(btn => {
+      const key = btn.dataset.more, list = key.startsWith('col:') ? app.querySelector(`[data-col="${key.slice(4)}"]`) : app.querySelector(`[data-list="${key}"]`);
+      const idOf = t => t.id;
+      if (key.startsWith('col:')) { const st = key.slice(4);
+        wireMore(btn, { idOf, seen, load: off => api(withP({ col: st, limit: 40, offset: off, ...(st === 'completed' ? { sort: 'completed' } : {}) })).then(r => ({ rows: r.tasks, total: r.total })), append: rows => list.insertAdjacentHTML('beforeend', rows.map(card).join('')) }); }
+      else wireMore(btn, { idOf, seen, load: off => api(withP({ limit: 50, offset: off, ...(key.startsWith('g:') ? { team: key.slice(2) } : {}) })).then(r => ({ rows: r.tasks, total: r.total })),
+        append: rows => list.insertAdjacentHTML('beforeend', rows.map(t => row(t, landing)).join('')) });
+    });
+    const card = t => `<a class="b-card" href="#/tasks/${t.id}"><b>${esc(t.title)}</b>
+        <span class="muted">${esc(t.assignee_name)}</span>
+        <span class="b-meta"><span class="${t.overdue ? 'over' : 'muted'}">${esc(dueText(t))}</span><span class="pr-${t.priority}">${PRIORITY[t.priority]}</span></span></a>`;
     if (landing) return renderLanding({ page: 'tasks', title: me.role === 'employee' ? 'My tasks' : 'Tasks', tabs, q, go,
       sub: 'Choose a team, or open all teams.', placeholder: 'Search tasks in all your teams',
       actions: canAssign() ? `<button class="btn" id="newTask">Assign a task</button>` : '',
       body: c => `<p class="block-stats">${stat(c.open, 'open')}${stat(c.overdue, 'overdue', c.overdue ? 'over' : '')}${stat(c.submitted, 'waiting for approval')}${stat(c.done_week, 'completed in 7 days')}</p>`,
-      results: tasks.length ? `<ul class="task-list">${tasks.map(t => row(t, true)).join('')}</ul>` : '<div class="card empty">No tasks match.</div>'
-    }).then(() => { const nb = $('#newTask'); if (nb) nb.onclick = () => taskForm(); });
+      results: tasks.length ? `<ul class="task-list" data-list="all">${tasks.map(t => row(t, true)).join('')}</ul>${moreBtn('all', tasks.length, data.total)}` : '<div class="card empty">No tasks match.</div>'
+    }).then(() => { const nb = $('#newTask'); if (nb) nb.onclick = () => taskForm(); wireTaskMore(); });
     let body;
-    if (!tasks.length) body = `<div class="card empty">${filtered ? 'No tasks match these filters.' : canAssign() ? 'No tasks yet. Assign the first one to get started.' : 'No tasks have been assigned to you yet.'}</div>`;
+    if (!stats.total) body = `<div class="card empty">${filtered ? 'No tasks match these filters.' : canAssign() ? 'No tasks yet. Assign the first one to get started.' : 'No tasks have been assigned to you yet.'}</div>`;
     else if (board) {
-      // Board: one column per status; Completed shows the 20 most recently completed.
+      // Board: one column per status (the server sends each column's first 40 and its true total; Completed newest first).
       const cols = [['assigned', 'Not started'], ['in_progress', 'In progress'], ['submitted', 'Waiting for approval'], ['completed', 'Completed']];
-      const card = t => `<a class="b-card" href="#/tasks/${t.id}"><b>${esc(t.title)}</b>
-        <span class="muted">${esc(t.assignee_name)}</span>
-        <span class="b-meta"><span class="${t.overdue ? 'over' : 'muted'}">${esc(dueText(t))}</span><span class="pr-${t.priority}">${PRIORITY[t.priority]}</span></span></a>`;
-      body = `<div class="board">${cols.map(([st, label]) => {
-        let list = tasks.filter(t => t.status === st), more = 0;
-        if (st === 'completed') { list = list.sort((a, b) => String(b.completed_at).localeCompare(String(a.completed_at))); more = Math.max(0, list.length - 20); list = list.slice(0, 20); }
-        return `<section class="board-col" aria-label="${label}"><h2>${label} <span class="muted">${list.length + more}</span></h2>
-          ${list.map(card).join('') || '<p class="muted b-empty">None</p>'}${more ? `<p class="muted b-empty">+${more} more in the list view</p>` : ''}</section>`;
-      }).join('')}</div>`;
-    } else if (cur === 'all' && tabs.length) {
-      body = byTeam(tasks, t => t.team_id, t => t.team_name, tabs).map(g =>
-        groupHtml('tasks:' + g.id, g.name, counts(g.rows), `<ul class="task-list">${g.rows.map(t => row(t)).join('')}</ul>`)).join('');
-    } else body = `<ul class="task-list">${tasks.map(t => row(t)).join('')}</ul>`;
+      body = `<div class="board">${cols.map(([st, label]) => { const c = data.columns[st];
+        return `<section class="board-col" aria-label="${label}"><h2>${label} <span class="muted">${c.total}</span></h2>
+          <div data-col="${st}">${c.tasks.map(card).join('') || '<p class="muted b-empty">None</p>'}</div>${moreBtn('col:' + st, c.tasks.length, c.total)}</section>`; }).join('')}</div>`;
+    } else if (grouped) {
+      body = orderGroups(data.groups, tabs).map(g =>
+        groupHtml('tasks:' + g.id, g.name, counts(g), `<ul class="task-list" data-list="g:${g.id}">${g.tasks.map(t => row(t)).join('')}</ul>${moreBtn('g:' + g.id, g.tasks.length, g.total)}`)).join('');
+    } else body = `<ul class="task-list" data-list="all">${tasks.map(t => row(t)).join('')}</ul>${moreBtn('all', tasks.length, data.total)}`;
 
     const chip = (key, val, label) => `<button type="button" class="chip-filter" data-chip="${key}=${val}" aria-pressed="${q.get(key) === val}">${label}</button>`;
     app.innerHTML = `
-      <div class="page-head"><div><h1>${me.role === 'employee' ? 'My tasks' : 'Tasks'}</h1><p>${tasks.length} task${tasks.length === 1 ? '' : 's'}</p></div>
+      <div class="page-head"><div><h1>${me.role === 'employee' ? 'My tasks' : 'Tasks'}</h1><p>${stats.total} task${stats.total === 1 ? '' : 's'}</p></div>
         <div class="inline-actions"><div class="seg" role="group" aria-label="View">
           <button type="button" data-view="" aria-pressed="${!board}">List</button><button type="button" data-view="board" aria-pressed="${board}">Board</button></div>
         ${canAssign() ? `<button class="btn" id="newTask">Assign a task</button>` : ''}</div></div>
@@ -564,7 +597,7 @@
       </div>
       <div class="chips-row" role="group" aria-label="Quick filters">${chip('due', 'overdue', 'Overdue')}${chip('due', 'week', 'Due this week')}${chip('priority', 'high', 'Urgent/High')}${canAssign() ? chip('review', 'mine', 'Waiting for my approval') : ''}</div>
       ${body}`;
-    wireTabs(go); wireGroups(); wireSearch('tSearch', go);
+    wireTabs(go); wireGroups(); wireSearch('tSearch', go); wireTaskMore();
     app.querySelectorAll('[data-view]').forEach(b => b.onclick = () => go({ view: b.dataset.view }));
     app.querySelectorAll('[data-chip]').forEach(b => b.onclick = () => { const [k, v] = b.dataset.chip.split('='); go({ [k]: q.get(k) === v ? '' : v }); });
     $('#fStatus').onchange = e => go({ status: e.target.value });
@@ -1048,15 +1081,26 @@
   async function viewAllPeople() {
     const { q, go } = pageQuery('teams');
     const team = q.get('team') || '', role = q.get('role') || '', status = q.get('status') || '', text = (q.get('q') || '').toLowerCase();
-    // Removed people only appear with the "Removed" status filter.
-    const [{ users }, all] = await Promise.all([api('/users' + (status === 'removed' && isBoss() ? '?removed=1' : '')), api('/teams')]);
+    // Removed people only appear with the "Removed" status filter. Managers/admins get the filtered list from the server, 50 at a
+    // time (Scale); team managers see the small list of their teams' people and filter it here.
+    const paged = isBoss();
+    const peoplePath = offset => '/users?' + new URLSearchParams({ paged: 1, limit: 50, offset, ...Object.fromEntries(['q', 'team', 'role', 'status'].filter(k => q.get(k)).map(k => [k, q.get(k)])) });
+    const [res, all] = await Promise.all([api(paged ? peoplePath(0) : '/users'), api('/teams')]);
+    const users = res.users;
     const teams = isBoss() ? all.teams : all.teams.filter(runsTeam);
     const byId = Object.fromEntries(users.map(u => [u.id, u]));
-    const list = users.filter(u => (!team || (team === 'none' ? !u.team_id : String(u.team_id) === team))
+    const list = paged ? users : users.filter(u => (!team || (team === 'none' ? !u.team_id : String(u.team_id) === team))
       && (!role || u.role === role) && (status === 'removed' ? u.removed : !u.removed && (!status || (status === 'active' ? u.active : !u.active)))
       && (!text || u.name.toLowerCase().includes(text) || u.email.toLowerCase().includes(text)));
+    const shownOf = paged ? res.total : list.length, allOf = paged ? res.total_all : users.length;
+    const personRow = u => `<tr>
+          <td><a href="#/tasks?assignee=${u.id}&team=all">${esc(u.name)}</a></td><td>${esc(u.email)}</td><td>${roleCell(u, teams)}</td>
+          <td>${u.team_name ? `<a href="#/teams/${u.team_id}">${esc(u.team_name)}</a>` : '<span class="muted">No team</span>'}</td>
+          <td>${u.removed ? '<span class="muted">Removed</span>' : u.active ? 'Active' : '<span class="muted">Deactivated</span>'}</td>
+          <td><div class="inline-actions">${u.removed ? (me.role === 'admin' ? `<button class="btn ghost small" data-restore="${u.id}">Restore</button>` : '')
+            : `${isBoss() && canEditPerson(u) ? `<button class="btn ghost small" data-edit="${u.id}">Edit</button>` : ''}${canRemovePerson(u) ? `<button class="btn danger small" data-removep="${u.id}">Remove person</button>` : ''}`}</div></td></tr>`;
     app.innerHTML = `
-      <div class="page-head"><div><h1>${isBoss() ? 'All people' : 'People in your teams'}</h1><p>${list.length} of ${users.length} people. ${isBoss() ? 'Add people and choose their team. A team lead added to a team becomes one of its leads.' : 'The people in the teams you manage. Add or remove members and set leads on each team’s page.'}</p></div>
+      <div class="page-head"><div><h1>${isBoss() ? 'All people' : 'People in your teams'}</h1><p>${shownOf} of ${allOf} people. ${isBoss() ? 'Add people and choose their team. A team lead added to a team becomes one of its leads.' : 'The people in the teams you manage. Add or remove members and set leads on each team’s page.'}</p></div>
         <div class="inline-actions">${teamsViewSwitch(true)}${isBoss() ? '<button class="btn ghost" id="importPeople">Import from Excel/CSV</button><button class="btn" id="newUser">Add a person</button>' : ''}</div></div>
       <div class="filters">
         <input type="search" id="pSearch" class="search" placeholder="Search name or email" aria-label="Search people" value="${esc(q.get('q') || '')}">
@@ -1068,12 +1112,7 @@
       </div>
       ${list.length ? `<div class="card table-wrap"><table>
         <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Team</th><th>Status</th><th></th></tr></thead>
-        <tbody>${list.map(u => `<tr>
-          <td><a href="#/tasks?assignee=${u.id}&team=all">${esc(u.name)}</a></td><td>${esc(u.email)}</td><td>${roleCell(u, teams)}</td>
-          <td>${u.team_name ? `<a href="#/teams/${u.team_id}">${esc(u.team_name)}</a>` : '<span class="muted">No team</span>'}</td>
-          <td>${u.removed ? '<span class="muted">Removed</span>' : u.active ? 'Active' : '<span class="muted">Deactivated</span>'}</td>
-          <td><div class="inline-actions">${u.removed ? (me.role === 'admin' ? `<button class="btn ghost small" data-restore="${u.id}">Restore</button>` : '')
-            : `${isBoss() && canEditPerson(u) ? `<button class="btn ghost small" data-edit="${u.id}">Edit</button>` : ''}${canRemovePerson(u) ? `<button class="btn danger small" data-removep="${u.id}">Remove person</button>` : ''}`}</div></td></tr>`).join('')}</tbody></table></div>`
+        <tbody id="peopleRows">${list.map(personRow).join('')}</tbody></table></div>${paged ? moreBtn('people', list.length, res.total) : ''}`
         : '<div class="card empty">Nobody matches these filters.</div>'}`;
     wireSearch('pSearch', go);
     $('#pTeam').onchange = e => go({ team: e.target.value });
@@ -1081,9 +1120,15 @@
     $('#pStatus').onchange = e => go({ status: e.target.value });
     if ($('#newUser')) $('#newUser').onclick = () => personForm(null, teams);
     if ($('#importPeople')) $('#importPeople').onclick = importPeople;
-    app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => personForm(byId[b.dataset.edit], teams));
-    app.querySelectorAll('[data-removep]').forEach(b => b.onclick = () => removePerson(byId[b.dataset.removep]));
-    app.querySelectorAll('[data-restore]').forEach(b => b.onclick = () => restorePerson(byId[b.dataset.restore]));
+    const wirePeople = rows => rows.forEach(tr => {
+      tr.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => personForm(byId[b.dataset.edit], teams));
+      tr.querySelectorAll('[data-removep]').forEach(b => b.onclick = () => removePerson(byId[b.dataset.removep]));
+      tr.querySelectorAll('[data-restore]').forEach(b => b.onclick = () => restorePerson(byId[b.dataset.restore]));
+    });
+    const tbody = $('#peopleRows'); if (tbody) wirePeople([...tbody.children]);
+    const more = app.querySelector('[data-more="people"]');
+    if (more) wireMore(more, { idOf: u => u.id, seen: new Set(users.map(u => u.id)), load: off => api(peoplePath(off)).then(r => ({ rows: r.users, total: r.total })),
+      append: fresh => { const before = tbody.children.length; fresh.forEach(u => { byId[u.id] = u; }); tbody.insertAdjacentHTML('beforeend', fresh.map(personRow).join('')); wirePeople([...tbody.children].slice(before)); } });
   }
 
   // ---------- teams (everyone: company directory; managers and admins manage them) ----------
@@ -1244,24 +1289,32 @@
     const params = new URLSearchParams();
     for (const k of ['status', 'q']) if (q.get(k)) params.set(k, q.get(k));
     if (cur !== 'all') params.set(sent ? 'from_team' : 'team', cur);
-    const { requests } = landing && !q.get('q') ? { requests: [] } : await api('/requests?' + params);
-    const table = list => `<div class="card table-wrap"><table>
-        <thead><tr><th>Title</th><th>Requested by</th><th>${sent ? 'Sent to' : 'For team'}</th><th>Needed by</th><th>Status</th><th>Taken by</th></tr></thead>
-        <tbody>${list.map(r => `<tr><td><a href="#/requests/${r.id}">${esc(r.title)}</a></td>
+    // Pages (Scale): the list 100 at a time, the "All teams" view 30 per team; "Load more" fetches the rest.
+    const grouped = !landing && cur === 'all' && tabs.length > 0, pq = params.toString();
+    const withP = extra => { const u = new URLSearchParams(pq); for (const [k, v] of Object.entries(extra)) u.set(k, v); return '/requests?' + u; };
+    const noData = { requests: [], total: 0, stats: { total: 0, waiting: 0 } };
+    const data = landing && !q.get('q') ? noData : await api(withP(grouped ? { group: 'team', per_group: 30 } : { limit: 100 }));
+    const requests = data.requests || [], seen = new Set(requests.map(r => r.id));
+    const reqRows = list => list.map(r => `<tr><td><a href="#/requests/${r.id}">${esc(r.title)}</a></td>
           <td>${esc(r.requested_by_name)}${cur === 'all' || sent || !r.requester_team_name || String(r.requester_team_id) === cur ? '' : ` <span class="muted">· ${esc(r.requester_team_name)}</span>`}</td>
           <td>${r.team_name ? esc(r.team_name) : r.status === 'needs_team' ? '<span class="muted">Not decided yet</span>' : '<span class="muted">—</span>'}</td><td>${fmtDate(r.needed_by)}</td><td>${reqPill(r)}</td>
-          <td>${r.assignee_name ? esc(r.assignee_name) : '<span class="muted">—</span>'}</td></tr>`).join('')}</tbody></table></div>`;
-    const open = list => list.filter(r => ['needs_team', 'open'].includes(r.status)).length;
+          <td>${r.assignee_name ? esc(r.assignee_name) : '<span class="muted">—</span>'}</td></tr>`).join('');
+    const table = (list, key, total) => `<div class="card table-wrap"><table>
+        <thead><tr><th>Title</th><th>Requested by</th><th>${sent ? 'Sent to' : 'For team'}</th><th>Needed by</th><th>Status</th><th>Taken by</th></tr></thead>
+        <tbody data-list="${key}">${reqRows(list)}</tbody></table></div>${moreBtn(key, list.length, total)}`;
+    const wireReqMore = () => app.querySelectorAll('[data-more]').forEach(btn => { const key = btn.dataset.more, body = app.querySelector(`[data-list="${key}"]`);
+      wireMore(btn, { idOf: r => r.id, seen, load: off => api(withP({ limit: 50, offset: off, ...(key.startsWith('g:') ? { team: key.slice(2) } : {}) })).then(r => ({ rows: r.requests, total: r.total })),
+        append: rows => body.insertAdjacentHTML('beforeend', reqRows(rows)) }); });
     if (landing) return renderLanding({ page: 'requests', title: 'Document requests', tabs, q, go,
       sub: 'Ask another team for a document. Choose a team to see what it was asked for and what it sent, or open all teams.',
       placeholder: 'Search requests in all your teams', actions: '<button class="btn" id="newReq">New request</button>',
       body: c => `<p class="block-stats">${stat(c.incoming, 'incoming, waiting for someone', c.incoming ? 'warn' : '')}${stat(c.sent, 'sent, not finished')}${stat(c.delivered_week, 'delivered in 7 days')}</p>`,
-      results: requests.length ? table(requests) : '<div class="card empty">No requests match.</div>'
-    }).then(() => { $('#newReq').onclick = () => requestForm(); });
-    const body = !requests.length ? `<div class="card empty">${q.get('status') || q.get('q') ? 'No requests match these filters.' : cur === 'all' ? 'No document requests yet.' : sent ? 'This team hasn’t sent any requests.' : 'No requests for this team.'}</div>`
-      : cur === 'all' && tabs.length ? byTeam(requests, r => r.target_team_id, r => r.team_name, tabs, 'Not decided yet').map(g =>
-          groupHtml('requests:' + g.id, g.name, `(${g.rows.length}) · ${open(g.rows)} waiting for someone`, table(g.rows))).join('')
-      : table(requests);
+      results: requests.length ? table(requests, 'all', data.total) : '<div class="card empty">No requests match.</div>'
+    }).then(() => { $('#newReq').onclick = () => requestForm(); wireReqMore(); });
+    const body = !data.stats.total ? `<div class="card empty">${q.get('status') || q.get('q') ? 'No requests match these filters.' : cur === 'all' ? 'No document requests yet.' : sent ? 'This team hasn’t sent any requests.' : 'No requests for this team.'}</div>`
+      : grouped ? orderGroups(data.groups, tabs, 'Not decided yet').map(g =>
+          groupHtml('requests:' + g.id, g.name, `(${g.total}) · ${g.waiting} waiting for someone`, table(g.requests, 'g:' + g.id, g.total))).join('')
+      : table(requests, 'all', data.total);
     app.innerHTML = `
       <div class="page-head"><div><h1>Document requests</h1><p>Ask another team for a document. A member of that team takes it on, and you’re told when it’s ready.</p></div>
         <button class="btn" id="newReq">New request</button></div>
@@ -1273,7 +1326,7 @@
           <option value="active"${q.get('status') === 'active' ? ' selected' : ''}>Not finished</option>${options(RSTATUS, q.get('status'))}</select>
       </div>
       ${body}`;
-    wireTabs(go); wireGroups(); wireSearch('rSearch', go);
+    wireTabs(go); wireGroups(); wireSearch('rSearch', go); wireReqMore();
     app.querySelectorAll('[data-dir]').forEach(b => b.onclick = () => go({ dir: b.dataset.dir }));
     $('#fStatus').onchange = e => go({ status: e.target.value });
     $('#newReq').onclick = () => requestForm();
@@ -1485,7 +1538,10 @@
     const params = new URLSearchParams();
     for (const k of ['person', 'status', 'from', 'to']) if (q.get(k)) params.set(k, q.get(k));
     if (cur !== 'all') params.set('team', cur); // the team tab (the CSV follows it too)
-    const [{ rows }, { users }] = await Promise.all([api('/history?' + params), api('/users')]);
+    // Pages (Scale): 100 rows at a time; the header total comes from the server, and the CSV link still exports everything.
+    const histPath = extra => { const u = new URLSearchParams(params); for (const [k, v] of Object.entries(extra)) u.set(k, v); return '/history?' + u; };
+    const [data, { users }] = await Promise.all([api(histPath({ limit: 100 })), api('/users')]);
+    const rows = data.rows, seen = new Set(rows.map(r => r.type + '/' + r.id));
     const setQ = (k, v) => go({ [k]: v });
     const ALL = Object.assign({}, STATUS, { needs_team: 'Needs a team (request)', open: 'Open (request)', delivered: 'Delivered (request)', closed: 'Closed (request)', cancelled: 'Cancelled (request)', deleted: 'Deleted' });
     const d = v => v ? fmtDate(v) : '<span class="muted">—</span>';
@@ -1496,8 +1552,13 @@
         ${r.can_restore ? `<span class="inline-actions"><button class="btn ghost small" data-restore="${r.type}/${r.id}">Restore</button>
           <button class="btn danger small" data-purge="${r.type}/${r.id}">Delete permanently</button></span>` : ''}`
       : r.type === 'request' ? reqPill(r) : `<span class="pill st-${esc(r.status)}">${STATUS[r.status] || esc(r.status)}</span>`;
+    const histRow = r => `<tr>
+          <td>${r.status === 'deleted' ? esc(r.title) : `<a href="#/${r.type === 'request' ? 'requests' : 'tasks'}/${r.id}">${esc(r.title)}</a>`}</td><td>${r.type === 'request' ? 'Request' : 'Task'}</td><td>${pill(r)}</td>
+          <td>${esc(r.team_name || '—')}</td><td>${esc(r.assignee_name || '—')}</td><td>${esc(r.assigned_by_name || '—')}</td><td>${esc(r.requested_by_name || '—')}</td>
+          <td>${d(r.assigned_at)}</td><td>${d(r.submitted_at)}</td><td>${d(r.approved_at)}</td><td>${d(r.completed_at)}</td>
+          <td>${esc(r.approved_by_name || '—')}</td><td class="reasons">${esc(r.send_back_reasons || '')}</td></tr>`;
     app.innerHTML = `
-      <div class="page-head"><div><h1>History</h1><p>${rows.length} item${rows.length === 1 ? '' : 's'}. ${isBoss() ? 'All tasks and requests.' : me.role === 'lead' || isTM() ? 'Your teams’ tasks and requests, and anything you assigned.' : 'Your own tasks and the requests you made.'}</p></div>
+      <div class="page-head"><div><h1>History</h1><p>${data.total} item${data.total === 1 ? '' : 's'}. ${isBoss() ? 'All tasks and requests.' : me.role === 'lead' || isTM() ? 'Your teams’ tasks and requests, and anything you assigned.' : 'Your own tasks and the requests you made.'}</p></div>
         <a class="btn" id="csvBtn" href="/api/history?${new URLSearchParams([...params, ['format', 'csv']])}" download>Export to Excel</a></div>
       ${tabsHtml(tabs, cur)}
       <div class="filters">
@@ -1510,11 +1571,7 @@
       ${rows.length ? `<div class="card table-wrap"><table class="history">
         <thead><tr><th>Title</th><th>Type</th><th>Status</th><th>Team</th><th>Assigned to</th><th>Assigned by</th><th>Requested by</th>
           <th>Assigned</th><th>Submitted</th><th>Approved</th><th>Completed</th><th>Approved by</th><th>Send-back reasons</th></tr></thead>
-        <tbody>${rows.map(r => `<tr>
-          <td>${r.status === 'deleted' ? esc(r.title) : `<a href="#/${r.type === 'request' ? 'requests' : 'tasks'}/${r.id}">${esc(r.title)}</a>`}</td><td>${r.type === 'request' ? 'Request' : 'Task'}</td><td>${pill(r)}</td>
-          <td>${esc(r.team_name || '—')}</td><td>${esc(r.assignee_name || '—')}</td><td>${esc(r.assigned_by_name || '—')}</td><td>${esc(r.requested_by_name || '—')}</td>
-          <td>${d(r.assigned_at)}</td><td>${d(r.submitted_at)}</td><td>${d(r.approved_at)}</td><td>${d(r.completed_at)}</td>
-          <td>${esc(r.approved_by_name || '—')}</td><td class="reasons">${esc(r.send_back_reasons || '')}</td></tr>`).join('')}</tbody></table></div>`
+        <tbody id="histRows">${rows.map(histRow).join('')}</tbody></table></div>${moreBtn('hist', rows.length, data.total)}`
         : `<div class="card empty">Nothing matches these filters.</div>`}`;
     if ($('#hPerson')) $('#hPerson').onchange = e => setQ('person', e.target.value);
     wireTabs(go);
@@ -1523,14 +1580,20 @@
     $('#hTo').onchange = e => setQ('to', e.target.value);
     const path = v => { const [type, id] = v.split('/'); return `/${type === 'request' ? 'requests' : 'tasks'}/${id}`; };
     const title = v => rows.find(r => `${r.type}/${r.id}` === v).title;
-    app.querySelectorAll('[data-restore]').forEach(b => b.onclick = async () => {
-      try { await api(path(b.dataset.restore) + '/restore', { method: 'POST' }); toast('Restored'); router(); } catch (e) { toast(e.message); }
-    });
-    app.querySelectorAll('[data-purge]').forEach(b => b.onclick = async () => {
-      const v = b.dataset.purge;
-      if (!confirm(`Delete “${title(v)}” permanently? Its activity and attached files are removed for good. This can’t be undone.`)) return;
-      try { await api(path(v) + '/permanent', { method: 'DELETE' }); toast('Deleted permanently'); router(); } catch (e) { toast(e.message); }
-    });
+    const wireRowActions = scope => {
+      scope.querySelectorAll('[data-restore]').forEach(b => b.onclick = async () => {
+        try { await api(path(b.dataset.restore) + '/restore', { method: 'POST' }); toast('Restored'); router(); } catch (e) { toast(e.message); }
+      });
+      scope.querySelectorAll('[data-purge]').forEach(b => b.onclick = async () => {
+        const v = b.dataset.purge;
+        if (!confirm(`Delete “${title(v)}” permanently? Its activity and attached files are removed for good. This can’t be undone.`)) return;
+        try { await api(path(v) + '/permanent', { method: 'DELETE' }); toast('Deleted permanently'); router(); } catch (e) { toast(e.message); }
+      });
+    };
+    wireRowActions(app);
+    const more = app.querySelector('[data-more="hist"]');
+    if (more) wireMore(more, { idOf: r => r.type + '/' + r.id, seen, load: off => api(histPath({ limit: 100, offset: off })).then(r => ({ rows: r.rows, total: r.total })),
+      append: fresh => { const tb = $('#histRows'); const before = tb.children.length; tb.insertAdjacentHTML('beforeend', fresh.map(histRow).join('')); rows.push(...fresh); wireRowActions({ querySelectorAll: sel => [...tb.children].slice(before).flatMap(tr => [...tr.querySelectorAll(sel)]) }); } });
   }
 
 
@@ -1648,7 +1711,7 @@
   // ---------- chat ----------
   // #/chat and #/chat/:id. Live updates come from /api/stream (Server-Sent Events); while the stream is down the page
   // polls every 10 seconds. Messages are read when the conversation is open and the page is visible.
-  const chat = { id: null, conv: null, members: [], messages: [], more: false, loading: false, pending: [], list: [] };
+  const chat = { id: null, conv: null, members: [], messages: [], more: false, loading: false, pending: [], list: [], listMore: false };
   let chatUnread = 0, stream = null, chatPollTimer = null;
   const MAX_CHAT_FILES = 5;
   const chatPage = () => !!$('#chat');
@@ -1712,8 +1775,29 @@
       }
     }, 10000);
   }
+  // The chat list comes 50 at a time (Scale). A refresh (live event, the 10 s poll) fetches page 1 again and merges: the fresh
+  // rows first, then the chats already loaded with "Load older chats" that are older than the page's last row, so a refresh
+  // never throws away what the person scrolled to. Order: active before archived, latest activity, id (as the server sorts).
+  const chatBefore = (a, b) => a.archived !== b.archived ? !a.archived : a.activity_at !== b.activity_at ? a.activity_at > b.activity_at : a.id > b.id;
+  const chatCursor = c => `${c.archived ? 1 : 0}|${c.activity_at}|${c.id}`;
   async function refreshChatCount() {
-    try { const r = await api('/chat', { background: true }); setChatUnread(r.unread_total); if (chatPage()) { chat.list = r.conversations; renderChatList(); } } catch (e) { /* offline */ }
+    try {
+      const r = await api('/chat', { background: true }); setChatUnread(r.unread_total);
+      if (chatPage()) {
+        const last = r.conversations[r.conversations.length - 1];
+        const kept = r.more && last ? chat.list.filter(c => chatBefore(last, c) && !r.conversations.some(f => f.id === c.id)) : [];
+        chat.list = r.conversations.concat(kept); chat.listMore = kept.length ? chat.listMore : r.more; renderChatList();
+      }
+    } catch (e) { /* offline */ }
+  }
+  async function loadMoreChats() {
+    const last = chat.list[chat.list.length - 1], btn = $('#chatMore'); if (!last) return;
+    btn && (btn.disabled = true);
+    try {
+      const r = await api('/chat?before=' + encodeURIComponent(chatCursor(last)));
+      for (const c of r.conversations) if (!chat.list.some(x => x.id === c.id)) chat.list.push(c);
+      chat.listMore = r.more; renderChatList();
+    } catch (e) { toast(e.message); btn && (btn.disabled = false); }
   }
   const refreshChatList = refreshChatCount;
   function onChatMessage(d) {
@@ -1766,6 +1850,7 @@
         <span class="cl-bottom"><span class="cl-preview">${c.type === 'team' ? '<span class="cl-tag">Team</span>' : c.type === 'group' ? '<span class="cl-tag">Group</span>' : ''}${c.last ? `${c.type !== 'direct' || c.last.sender_name === 'You' ? esc(c.last.sender_name) + ': ' : ''}${c.last.deleted ? '<i>This message was deleted</i>' : esc(c.last.text)}` : '<span class="muted">No messages yet</span>'}</span>
           ${c.muted ? '<span title="Muted" aria-label="Muted">🔕</span>' : ''}${c.unread ? `<span class="pill accent cl-count" aria-label="${c.unread} unread">${c.unread > 99 ? '99+' : c.unread}</span>` : ''}</span></a></li>`).join('')
       : `<li class="empty">No chats yet. Start one with “New chat”.</li>`;
+    if (chat.listMore) { ul.insertAdjacentHTML('beforeend', `<li class="more-row"><button type="button" class="btn ghost small" id="chatMore">Load older chats</button></li>`); $('#chatMore').onclick = loadMoreChats; }
   }
   async function chatSearch(q) {
     const ul = $('#chatList');
