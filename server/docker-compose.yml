@@ -7,6 +7,9 @@ services:
     image: taskdesk-taskdesk
     user: "1000:1000"
     command: ["node", "keys.js"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     environment:
       SECRETS_DIR: /app/secrets
       DATA_DIR: /app/data
@@ -19,6 +22,13 @@ services:
     image: taskdesk-taskdesk
     container_name: taskdesk
     restart: unless-stopped
+    # Hardening (Security A2): runs as uid 1000 (Dockerfile USER node), read-only root filesystem (only data/ and a
+    # small /tmp are writable), no Linux capabilities, no privilege gain. Only port 3000 is published.
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     depends_on:
       keys:
         condition: service_completed_successfully
@@ -37,7 +47,7 @@ services:
       COOKIE_SECURE: "false"
     volumes:
       - ./data:/app/data
-      - ./updates:/app/updates
+      - ./updates:/app/updates:ro   # desktop app updates, served read-only
       - ./secrets:/app/secrets:ro   # master.key and backup.key, read-only (scripts/KEYS.md)
   # Virus scanner (Security A2): every upload is streamed to clamd (port 3310, only on the internal compose network,
   # not published) before it is kept. freshclam inside updates the signatures every 2 hours; they're kept in the
@@ -47,6 +57,10 @@ services:
     image: clamav/clamav:1.4
     container_name: taskdesk-clamav
     restart: unless-stopped
+    # Its start script needs root only to set up its folders and switch to the "clamav" user; everything else dropped.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
     environment:
       FRESHCLAM_CHECKS: "12"
       CLAMD_CONF_StreamMaxLength: 2000M

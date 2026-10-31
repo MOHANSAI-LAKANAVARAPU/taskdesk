@@ -48,7 +48,8 @@ CHECKED=$(docker exec "$CONTAINER" node -e "
   console.log(JSON.stringify({ integrity: h.integrity, fk: h.foreign_key_problems, counts, stored,
     plain: dbfile.isPlainSqlite(out), sha256: crypto.createHash('sha256').update(fs.readFileSync(out)).digest('hex') }));" "$IN") \
   || fail "the database copy inside the container failed"
-docker cp -q "$CONTAINER:$IN" "$TMP/taskdesk.db" || fail "could not copy the backup out of the container"
+# Streamed out with cat: /tmp is a tmpfs in the hardened container, which docker cp can't read.
+docker exec "$CONTAINER" cat "$IN" > "$TMP/taskdesk.db" || fail "could not copy the backup out of the container"
 docker exec "$CONTAINER" rm -f "$IN"
 
 # 2. Uploaded files (encrypted on disk), copied after the database: every file the copy refers to was already there.

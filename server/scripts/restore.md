@@ -49,7 +49,7 @@ In step 3, use `BACKUP=/tmp/taskdesk-restore-$DAY`. For an older plain backup us
 
 ## 3. Swap in the backup
 
-The files in `data/` belong to root. So the commands run inside the TaskDesk image, which can move them without `sudo`. The current data is moved to `data/before-restore-<date-time>/`; nothing is deleted.
+The commands run inside the TaskDesk image, as its `node` user (uid 1000, the owner of `data/` since 31 Oct 2026), so no `sudo` is needed. The current data is moved to `data/before-restore-<date-time>/`; nothing is deleted.
 
 ```bash
 cd ~/Downloads/TaskDesk/server
