@@ -4,3 +4,4 @@ data
 .env
 .env.bak-*
 owner-transfers.log
+secrets

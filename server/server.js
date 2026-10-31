@@ -5,6 +5,12 @@ const multer = require('multer');
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
+const keys = require('./keys');
+
+// master.key (Security A2): encrypts uploaded files and the database. Without it nothing can be read, so don't start.
+let MASTER_KEY;
+try { MASTER_KEY = keys.loadMasterKey(); console.log(`[keys] master.key loaded from ${keys.DIR}`); }
+catch (e) { console.error('[keys] ' + e.message); process.exit(1); }
 const db = require('./db');
 const mailer = require('./mailer');
 

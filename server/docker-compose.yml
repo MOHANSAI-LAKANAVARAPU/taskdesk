@@ -1,17 +1,37 @@
 name: taskdesk
 services:
+  # Creates server/secrets/master.key and backup.key on first run if they're missing (never overwrites them), then exits.
+  # Runs as the server folder's owner (uid 1000) so the keys stay readable for scripts/backup.sh and for copying to USB.
+  keys:
+    build: .
+    image: taskdesk-taskdesk
+    user: "1000:1000"
+    command: ["node", "keys.js"]
+    environment:
+      SECRETS_DIR: /app/secrets
+      DATA_DIR: /app/data
+    volumes:
+      - ./secrets:/app/secrets
+      - ./data:/app/data:ro   # only looked at: a missing master.key is refused when the data is already encrypted
+    restart: "no"
   taskdesk:
     build: .
+    image: taskdesk-taskdesk
     container_name: taskdesk
     restart: unless-stopped
+    depends_on:
+      keys:
+        condition: service_completed_successfully
     env_file:
       - .env   # ADMIN_*, SMTP_*, APP_URL (copy .env.example; never commit .env)
     ports:
       - "3000:3000"
     environment:
       TZ: Asia/Kolkata
+      SECRETS_DIR: /app/secrets
       # Set to "true" once the site is served over HTTPS
       COOKIE_SECURE: "false"
     volumes:
       - ./data:/app/data
       - ./updates:/app/updates
+      - ./secrets:/app/secrets:ro   # master.key and backup.key, read-only (scripts/KEYS.md)
