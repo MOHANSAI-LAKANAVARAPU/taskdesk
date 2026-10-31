@@ -1390,6 +1390,7 @@
     account_activated: 'Account activated', account_deactivated: 'Account deactivated', person_removed: 'Person removed', person_restored: 'Person restored',
     '2fa_enabled': 'Two-step verification turned on', '2fa_disabled': 'Two-step verification turned off', '2fa_recovery_codes_renewed': 'New recovery codes',
     '2fa_reset': 'Two-step verification reset by an admin',
+    virus_blocked: 'Upload blocked by the virus scanner',
     file_downloaded: 'File downloaded', history_exported: 'History exported (CSV)', audit_exported: 'Audit log exported (CSV)' };
   async function viewAudit() {
     if (me.role !== 'admin') { app.innerHTML = `<div class="empty">Only admins can see the audit log.</div>`; return; }

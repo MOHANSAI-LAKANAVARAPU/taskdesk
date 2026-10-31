@@ -18,6 +18,7 @@ try { db = require('./db'); } catch (e) { console.error('[db] ' + e.message); pr
 const mailer = require('./mailer');
 const filecrypt = require('./filecrypt');
 filecrypt.init(MASTER_KEY);
+const scanner = require('./scanner');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -280,16 +281,34 @@ function sniffFile(file) {
   try { return sniffBytes(filecrypt.readHead(file, 16)); } catch (e) { return 'application/octet-stream'; }
 }
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-// Uploads are encrypted while they arrive (Security A2), so no plain copy ever reaches the disk. The storage engine
-// gives multer: filename (random), path, size (plain bytes) and mime (from the first plain bytes).
+// Uploads are scanned for viruses and encrypted while they arrive (Security A2), so no plain copy ever reaches the disk
+// and nothing is kept unless ClamAV says it's clean (scanner.js). The storage engine gives multer: filename (random),
+// path, size (plain bytes) and mime (from the first plain bytes). An infected file, or a scanner that can't be
+// reached, fails the whole request (multer then removes the request's other files too).
+const VIRUS_MSG = 'This file was blocked by the virus scanner.';
+const SCANNER_DOWN_MSG = 'Files can’t be uploaded right now because the virus scanner isn’t running. Try again in a few minutes, or tell an admin.';
+const userError = (message, status) => Object.assign(new Error(message), { userMessage: true, status });
 const encryptedStorage = {
   _handleFile(req, file, cb) {
     const filename = crypto.randomBytes(16).toString('hex'), dest = path.join(UPLOAD_DIR, filename);
     let size = 0, head = Buffer.alloc(0);
     file.stream.on('data', d => { size += d.length; if (head.length < 16) head = Buffer.concat([head, d.subarray(0, 16 - head.length)]); });
-    pipeline(file.stream, filecrypt.encryptStream(), fs.createWriteStream(dest, { flags: 'wx', mode: 0o600 }))
-      .then(() => cb(null, { filename, path: dest, size, mime: sniffBytes(head) }))
-      .catch(err => fs.unlink(dest, () => cb(err)));
+    const scan = scanner.scan();
+    pipeline(file.stream, scan.stream, filecrypt.encryptStream(), fs.createWriteStream(dest, { flags: 'wx', mode: 0o600 }))
+      .then(() => scan.verdict)
+      .then(v => {
+        if (v.clean) return cb(null, { filename, path: dest, size, mime: sniffBytes(head) });
+        const name = cleanFileName(file.originalname);
+        console.log(`[scan] blocked "${name}" from user ${req.user && req.user.id}: ${v.signature}`);
+        audit(req, 'virus_blocked', { target: { type: 'file', name }, details: `${v.signature}; ${size} bytes; ${req.method} ${req.originalUrl}` });
+        fs.unlink(dest, () => cb(userError(VIRUS_MSG, 422)));
+      })
+      .catch(err => {
+        if (err.code === 'SCANNER_DOWN') console.error(`[scan] upload refused: ${err.message}`);
+        const e = err.code === 'SCANNER_DOWN' ? userError(SCANNER_DOWN_MSG, 503)
+          : err.code === 'SCAN_TOO_BIG' ? userError('This file is too large for the virus scanner.', 400) : err;
+        fs.unlink(dest, () => cb(e));
+      });
   },
   _removeFile(req, file, cb) { fs.unlink(file.path, () => cb(null)); }
 };
@@ -314,7 +333,7 @@ function withUploads(req, res, next) {
     const msg = err.code === 'LIMIT_FILE_SIZE' ? `Each file must be ${MAX_FILE_MB} MB or smaller.`
       : err.code === 'LIMIT_FILE_COUNT' ? 'You can attach up to 5 files at a time.'
       : err.userMessage ? err.message : 'The upload failed. Try again.';
-    bad(res, msg);
+    bad(res, msg, err.userMessage && err.status || 400);
   });
 }
 function discardUploads(req) {
@@ -2590,7 +2609,7 @@ const AUDIT_ACTIONS = ['sign_in', 'sign_in_failed', 'account_locked', 'signed_ou
   'password_reset', 'password_set_by_manager', 'welcome_resent', 'person_added', 'person_edited', 'role_changed', 'team_changed', 'lead_changed',
   'managed_teams_changed', 'team_leads_changed', 'team_managers_changed', 'team_deleted', 'protection_changed', 'account_activated',
   'account_deactivated', 'person_removed', 'person_restored', '2fa_enabled', '2fa_disabled', '2fa_recovery_codes_renewed', '2fa_reset',
-  'file_downloaded', 'history_exported', 'audit_exported'];
+  'virus_blocked', 'file_downloaded', 'history_exported', 'audit_exported'];
 function auditWhere(q) {
   const where = [], params = [];
   if (DATE_RE.test(String(q.from || ''))) { where.push(`date(at, 'localtime') >= ?`); params.push(q.from); }
@@ -2743,3 +2762,5 @@ app.use('/api', (req, res) => bad(res, 'Not found.', 404));
 app.get('*', (req, res) => { noCache(res); res.sendFile(path.join(__dirname, 'public', 'index.html')); });
 
 app.listen(PORT, () => console.log(`TaskDesk running on http://localhost:${PORT}`));
+// The virus scanner can take a few minutes to load its signatures after a start; until then uploads are refused.
+scanner.ping().then(up => console.log(up ? `[scan] ClamAV ready at ${scanner.HOST}:${scanner.PORT}` : `[scan] ClamAV not reachable yet at ${scanner.HOST}:${scanner.PORT}; uploads are refused until it is`));

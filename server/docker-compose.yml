@@ -22,6 +22,8 @@ services:
     depends_on:
       keys:
         condition: service_completed_successfully
+      clamav:
+        condition: service_started   # it needs a few minutes to load; until then uploads are refused (scanner.js)
     env_file:
       - .env   # ADMIN_*, SMTP_*, APP_URL (copy .env.example; never commit .env)
     ports:
@@ -29,9 +31,30 @@ services:
     environment:
       TZ: Asia/Kolkata
       SECRETS_DIR: /app/secrets
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
       # Set to "true" once the site is served over HTTPS
       COOKIE_SECURE: "false"
     volumes:
       - ./data:/app/data
       - ./updates:/app/updates
       - ./secrets:/app/secrets:ro   # master.key and backup.key, read-only (scripts/KEYS.md)
+  # Virus scanner (Security A2): every upload is streamed to clamd (port 3310, only on the internal compose network,
+  # not published) before it is kept. freshclam inside updates the signatures every 2 hours; they're kept in the
+  # clamav-db volume. Limits are raised so files up to MAX_UPLOAD_MB (max 2000 MB here) are really scanned, and
+  # anything over a limit is reported as infected instead of passing unscanned (AlertExceedsMax).
+  clamav:
+    image: clamav/clamav:1.4
+    container_name: taskdesk-clamav
+    restart: unless-stopped
+    environment:
+      FRESHCLAM_CHECKS: "12"
+      CLAMD_CONF_StreamMaxLength: 2000M
+      CLAMD_CONF_MaxFileSize: 2000M
+      CLAMD_CONF_MaxScanSize: 4000M
+      CLAMD_CONF_AlertExceedsMax: "yes"
+    volumes:
+      - clamav-db:/var/lib/clamav
+
+volumes:
+  clamav-db:
