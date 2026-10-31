@@ -42,7 +42,7 @@ app.use(cookieParser());
 //   password" and set-password links have no session and are exempt from the token (the Origin check still applies).
 // The desktop app's own calls are all GETs (summary, stream, version), so it needs nothing.
 const csrfFor = sid => crypto.createHmac('sha256', String(sid)).update('taskdesk-csrf').digest('base64url');
-const CSRF_EXEMPT = new Set(['/api/login', '/api/password/forgot', '/api/password/set']);
+const CSRF_EXEMPT = new Set(['/api/login', '/api/login/code', '/api/password/forgot', '/api/password/set']);
 app.use('/api', (req, res, next) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
   const origin = req.get('Origin');
@@ -392,7 +392,7 @@ const isBackground = req => BACKGROUND_PATHS.has(req.path) || req.get('X-Backgro
 function auth(req, res, next) {
   const token = req.cookies.sid;
   if (!token) return bad(res, 'Please sign in.', 401);
-  const row = db.prepare(`SELECT u.*, s.last_active_at AS s_active,
+  const row = db.prepare(`SELECT u.*, s.last_active_at AS s_active, s.needs_2fa_setup AS s_setup,
       s.last_active_at IS NOT NULL AND s.last_active_at < datetime('now', ?) AS s_idle,
       s.last_active_at IS NULL OR s.last_active_at < datetime('now', '-60 seconds') AS s_touch
     FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires_at > datetime('now') AND u.active = 1`).get(`-${IDLE_HOURS} hours`, token);
@@ -403,10 +403,14 @@ function auth(req, res, next) {
   }
   // Older sessions without a value get one on their first request, even a background one.
   if (row.s_touch && (!isBackground(req) || !row.s_active)) db.prepare(`UPDATE sessions SET last_active_at = datetime('now') WHERE token = ?`).run(token);
-  const { s_active, s_idle, s_touch, ...user } = row;
+  const { s_active, s_idle, s_touch, s_setup, ...user } = row;
+  // An admin/manager signed in without two-step verification: only the setup (and sign out) until it's on.
+  if (s_setup && needsTwoStep(user) && !user.totp_enabled_at && !SETUP_PATHS.has(req.path))
+    return res.status(403).json({ error: 'Set up two-step verification first.', code: '2fa_setup' });
   req.user = user;
   next();
 }
+const SETUP_PATHS = new Set(['/api/me', '/api/me/2fa', '/api/me/2fa/setup', '/api/me/2fa/enable']);
 function requireBoss(req, res, next) { return isBoss(req.user) ? next() : bad(res, 'Only managers and admins can do this.', 403); }
 function requireAdmin(req, res, next) { return req.user.role === 'admin' ? next() : bad(res, 'Only admins can do this.', 403); }
 
@@ -426,14 +430,56 @@ app.post('/api/login', (req, res) => {
     }
     return bad(res, 'Email or password is incorrect.', 401);
   }
-  audit(req, 'sign_in', { actor: user, target: personTarget(user) });
+  // Two-step verification on: the password was right, now the code (POST /api/login/code with this ticket).
+  // Failures there count towards the same lockout, so they're only cleared once the code is right.
+  if (user.totp_enabled_at) {
+    const ticket = crypto.randomBytes(32).toString('base64url');
+    db.prepare(`DELETE FROM login_challenges WHERE expires_at < datetime('now')`).run();
+    db.prepare(`INSERT INTO login_challenges (token_hash, user_id, expires_at) VALUES (?,?,datetime('now','+5 minutes'))`).run(hashToken(ticket), user.id);
+    return res.json({ need_code: true, ticket });
+  }
+  // Admins and managers without it: signed in, but the session can only set it up (auth()).
+  const setup = needsTwoStep(user);
+  audit(req, 'sign_in', { actor: user, target: personTarget(user), details: setup ? 'password only; asked to set up two-step verification' : '' });
+  startSession(req, res, user, key, setup);
+});
+function startSession(req, res, user, key, setup) {
   loginAttempts.delete(req.ip);
   clearLoginFailures(key);
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare(`INSERT INTO sessions (token,user_id,expires_at,last_active_at) VALUES (?,?,datetime('now', ?),datetime('now'))`).run(token, user.id, `+${SESSION_DAYS} days`);
+  db.prepare(`INSERT INTO sessions (token,user_id,expires_at,last_active_at,needs_2fa_setup) VALUES (?,?,datetime('now', ?),datetime('now'),?)`).run(token, user.id, `+${SESSION_DAYS} days`, setup ? 1 : 0);
   db.prepare(`DELETE FROM sessions WHERE expires_at < datetime('now')`).run();
   res.cookie('sid', token, { httpOnly: true, sameSite: 'strict', secure: COOKIE_SECURE, maxAge: SESSION_DAYS * 864e5 });
-  res.json({ user: publicUser(user), upload_max_mb: MAX_FILE_MB, csrf_token: csrfFor(token) });
+  res.json({ user: publicUser(user), upload_max_mb: MAX_FILE_MB, csrf_token: csrfFor(token), must_setup_2fa: !!setup });
+}
+// Second step: the 6-digit code from the app, or a recovery code. 5 tries per ticket (5 minutes); every wrong code also
+// counts towards the account lockout and the per-IP limit.
+const CODE_WRONG = 'That code isn’t right. Enter the newest code from your authenticator app, or a recovery code.';
+app.post('/api/login/code', (req, res) => {
+  const ch = db.prepare(`SELECT c.token_hash, c.attempts, u.* FROM login_challenges c JOIN users u ON u.id = c.user_id
+    WHERE c.token_hash = ? AND c.expires_at > datetime('now')`).get(hashToken(String(req.body.ticket || '')));
+  const expired = 'This sign-in has expired. Enter your password again.';
+  if (!ch) return bad(res, expired, 410);
+  const { token_hash, attempts, ...user } = ch, key = loginKey(user.email);
+  const failed = reason => audit(req, 'sign_in_failed', { actor: null, target: personTarget(user), details: `${key} (${reason})` });
+  if (rateLimited(req.ip)) { failed('too many attempts from this address'); return bad(res, 'Too many sign-in attempts. Try again in 15 minutes.', 429); }
+  if (isLocked(key)) { failed('account locked'); return bad(res, LOCKED_MSG, 429); }
+  if (!user.active || user.removed_at || !user.totp_enabled_at) { db.prepare('DELETE FROM login_challenges WHERE token_hash = ?').run(token_hash); return bad(res, expired, 410); }
+  const how = useSecondFactor(user, req.body.code);
+  if (!how) {
+    failed('wrong two-step code');
+    if (attempts + 1 >= 5) db.prepare('DELETE FROM login_challenges WHERE token_hash = ?').run(token_hash);
+    else db.prepare('UPDATE login_challenges SET attempts = attempts + 1 WHERE token_hash = ?').run(token_hash);
+    if (recordLoginFailure(key)) {
+      audit(req, 'account_locked', { actor: null, target: personTarget(user), details: `${key}: ${LOCK_FAILS} failed sign-ins within ${LOCK_MINUTES} minutes; locked for ${LOCK_MINUTES} minutes` });
+      return bad(res, LOCKED_MSG, 429);
+    }
+    return attempts + 1 >= 5 ? bad(res, 'Too many wrong codes. Enter your password again.', 410) : bad(res, CODE_WRONG, 401);
+  }
+  db.prepare('DELETE FROM login_challenges WHERE token_hash = ?').run(token_hash);
+  const left = how === 'recovery' ? recoveryLeft(user.id) : null;
+  audit(req, 'sign_in', { actor: user, target: personTarget(user), details: how === 'recovery' ? `with a recovery code (${left} left)` : 'with a two-step code' });
+  startSession(req, res, user, key, false);
 });
 
 // ---------- password rules ----------
@@ -464,7 +510,8 @@ app.post('/api/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), upload_max_mb: MAX_FILE_MB, csrf_token: csrfFor(req.cookies.sid) }));
+app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), upload_max_mb: MAX_FILE_MB, csrf_token: csrfFor(req.cookies.sid),
+  must_setup_2fa: needsTwoStep(req.user) && !req.user.totp_enabled_at && !!db.prepare('SELECT needs_2fa_setup FROM sessions WHERE token = ?').get(req.cookies.sid)?.needs_2fa_setup }));
 
 // Account page: how many other sessions (browsers, the desktop app) are signed in, and "Sign out all other devices".
 const otherSessions = req => db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND token != ? AND expires_at > datetime('now')
@@ -486,6 +533,127 @@ app.post('/api/me/password', auth, (req, res) => {
   audit(req, 'password_changed', { target: personTarget(req.user), details: 'changed on the Account page; other sessions ended' });
   res.json({ ok: true });
 });
+
+// ---------- two-step verification (Security A2) ----------
+// TOTP (RFC 6238: HMAC-SHA1, 6 digits, 30 seconds, one step either side for clock drift), any authenticator app.
+// Optional for everyone; required for admins and managers, who are asked to set it up at their next sign-in (their
+// session can then only reach the setup, see auth()). The secret is stored encrypted with a key derived from
+// master.key; the 10 one-time recovery codes only as SHA-256. A code (or step) works once (totp_last_step).
+const TWO_STEP_KEY = keys.derive(MASTER_KEY, 'totp secrets');
+const needsTwoStep = u => isBoss(u);
+function sealSecret(text) {
+  const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', TWO_STEP_KEY, iv);
+  const ct = Buffer.concat([c.update(text, 'utf8'), c.final()]);
+  return ['v1', iv.toString('base64'), ct.toString('base64'), c.getAuthTag().toString('base64')].join('.');
+}
+function openSecret(sealed) {
+  const [v, iv, ct, tag] = String(sealed || '').split('.');
+  if (v !== 'v1') throw new Error('unknown secret format');
+  const d = crypto.createDecipheriv('aes-256-gcm', TWO_STEP_KEY, Buffer.from(iv, 'base64'));
+  d.setAuthTag(Buffer.from(tag, 'base64'));
+  return Buffer.concat([d.update(Buffer.from(ct, 'base64')), d.final()]).toString('utf8');
+}
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const base32 = buf => { let bits = '', out = ''; for (const b of buf) bits += b.toString(2).padStart(8, '0'); for (let i = 0; i < bits.length; i += 5) out += B32[parseInt(bits.slice(i, i + 5).padEnd(5, '0'), 2)]; return out; };
+const unbase32 = s => { let bits = ''; for (const ch of s.replace(/[\s=]/g, '').toUpperCase()) { const i = B32.indexOf(ch); if (i < 0) throw new Error('bad base32'); bits += i.toString(2).padStart(5, '0'); } return Buffer.from((bits.match(/.{8}/g) || []).map(b => parseInt(b, 2))); };
+function totpAt(secret, step) {
+  const msg = Buffer.alloc(8); msg.writeBigUInt64BE(BigInt(step));
+  const h = crypto.createHmac('sha1', unbase32(secret)).update(msg).digest(), o = h[h.length - 1] & 15;
+  return String((h.readUInt32BE(o) & 0x7fffffff) % 1e6).padStart(6, '0');
+}
+// The matching step (now, or one step before/after), or null. Steps up to lastStep are refused (each code works once).
+function totpMatch(secret, code, lastStep) {
+  const now = Math.floor(Date.now() / 30e3), want = Buffer.from(String(code));
+  for (const step of [now, now - 1, now + 1]) {
+    if (lastStep != null && step <= lastStep) continue;
+    const got = Buffer.from(totpAt(secret, step));
+    if (got.length === want.length && crypto.timingSafeEqual(got, want)) return step;
+  }
+  return null;
+}
+// QR code as an SVG path (no text from the user inside; the page puts it in as is).
+function qrSvg(text) {
+  const qr = require('qrcode-generator')(0, 'M'); qr.addData(text); qr.make();
+  const n = qr.getModuleCount(); let d = '';
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) d += `M${c + 4} ${r + 4}h1v1h-1z`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${n + 8} ${n + 8}" width="200" height="200" shape-rendering="crispEdges" role="img" aria-label="QR code for your authenticator app"><rect width="100%" height="100%" fill="#fff"/><path d="${d}" fill="#000"/></svg>`;
+}
+const RECOVERY_COUNT = 10;
+const normRecovery = c => String(c || '').toLowerCase().replace(/[^0-9a-z]/g, '');
+function newRecoveryCodes(userId) {
+  const codes = Array.from({ length: RECOVERY_COUNT }, () => { const h = crypto.randomBytes(5).toString('hex'); return h.slice(0, 5) + '-' + h.slice(5); });
+  db.transaction(() => {
+    db.prepare('DELETE FROM recovery_codes WHERE user_id = ?').run(userId);
+    const ins = db.prepare('INSERT INTO recovery_codes (user_id, code_hash) VALUES (?,?)');
+    for (const c of codes) ins.run(userId, hashToken(normRecovery(c)));
+  })();
+  return codes;
+}
+const recoveryLeft = userId => db.prepare('SELECT COUNT(*) AS n FROM recovery_codes WHERE user_id = ? AND used_at IS NULL').get(userId).n;
+// Checks a 6-digit code or a recovery code for this person and uses it up. Returns 'code', 'recovery' or null.
+function useSecondFactor(user, input) {
+  const raw = String(input || '').trim();
+  if (/^\d{6}$/.test(raw.replace(/\s/g, ''))) {
+    let secret; try { secret = openSecret(user.totp_secret); } catch (e) { return null; }
+    const step = totpMatch(secret, raw.replace(/\s/g, ''), user.totp_last_step);
+    if (step === null) return null;
+    // Only if no one used this step in the meantime (two sign-ins racing with the same code).
+    return db.prepare('UPDATE users SET totp_last_step = ? WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)').run(step, user.id, step).changes ? 'code' : null;
+  }
+  const norm = normRecovery(raw);
+  if (norm.length !== 10) return null;
+  return db.prepare(`UPDATE recovery_codes SET used_at = datetime('now') WHERE user_id = ? AND code_hash = ? AND used_at IS NULL`).run(user.id, hashToken(norm)).changes ? 'recovery' : null;
+}
+const twoStepState = u => ({ enabled: !!u.totp_enabled_at, required: needsTwoStep(u), recovery_left: u.totp_enabled_at ? recoveryLeft(u.id) : 0 });
+
+app.get('/api/me/2fa', auth, (req, res) => res.json(twoStepState(req.user)));
+// Start (or restart) setting up: a new secret, kept as "pending" until a code from the app confirms it.
+app.post('/api/me/2fa/setup', auth, (req, res) => {
+  if (req.user.totp_enabled_at) return bad(res, 'Two-step verification is already on.', 409);
+  const secret = base32(crypto.randomBytes(20));
+  db.prepare('UPDATE users SET totp_pending = ? WHERE id = ?').run(sealSecret(secret), req.user.id);
+  const uri = `otpauth://totp/${encodeURIComponent('TaskDesk:' + req.user.email)}?secret=${secret}&issuer=TaskDesk&algorithm=SHA1&digits=6&period=30`;
+  res.json({ secret: secret.match(/.{1,4}/g).join(' '), qr_svg: qrSvg(uri) });
+});
+// Confirm with a code from the app: turns it on, returns the 10 recovery codes (shown once), and frees a setup-only session.
+app.post('/api/me/2fa/enable', auth, (req, res) => {
+  if (req.user.totp_enabled_at) return bad(res, 'Two-step verification is already on.', 409);
+  if (!req.user.totp_pending) return bad(res, 'Start the setup again.', 409);
+  let secret; try { secret = openSecret(req.user.totp_pending); } catch (e) { return bad(res, 'Start the setup again.', 409); }
+  const step = totpMatch(secret, String(req.body.code || '').replace(/\s/g, ''), null);
+  if (step === null) return bad(res, 'That code isn’t right. Check the time on your phone and enter the newest code.');
+  db.transaction(() => {
+    db.prepare(`UPDATE users SET totp_secret = totp_pending, totp_pending = NULL, totp_enabled_at = datetime('now'), totp_last_step = ? WHERE id = ?`).run(step, req.user.id);
+    db.prepare('UPDATE sessions SET needs_2fa_setup = 0 WHERE user_id = ?').run(req.user.id);
+  })();
+  const codes = newRecoveryCodes(req.user.id);
+  audit(req, '2fa_enabled', { target: personTarget(req.user), details: `two-step verification turned on; ${RECOVERY_COUNT} recovery codes made` });
+  res.json({ ok: true, recovery_codes: codes });
+});
+// New recovery codes (the old ones stop working). Needs the password.
+app.post('/api/me/2fa/recovery-codes', auth, (req, res) => {
+  if (!req.user.totp_enabled_at) return bad(res, 'Two-step verification is off.', 409);
+  if (!bcrypt.compareSync(String(req.body.password || ''), req.user.password_hash)) return bad(res, 'Password is incorrect.');
+  const codes = newRecoveryCodes(req.user.id);
+  audit(req, '2fa_recovery_codes_renewed', { target: personTarget(req.user), details: `${RECOVERY_COUNT} new recovery codes; the old ones stop working` });
+  res.json({ ok: true, recovery_codes: codes });
+});
+// Turn it off (not for admins and managers, who must keep it). Needs the password.
+app.post('/api/me/2fa/disable', auth, (req, res) => {
+  if (needsTwoStep(req.user)) return bad(res, 'Admins and managers must keep two-step verification on.', 403);
+  if (!req.user.totp_enabled_at) return bad(res, 'Two-step verification is already off.', 409);
+  if (!bcrypt.compareSync(String(req.body.password || ''), req.user.password_hash)) return bad(res, 'Password is incorrect.');
+  clearTwoStep(req.user.id);
+  audit(req, '2fa_disabled', { target: personTarget(req.user), details: 'turned off on the Account page' });
+  res.json({ ok: true });
+});
+function clearTwoStep(userId) {
+  db.transaction(() => {
+    db.prepare('UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = ?').run(userId);
+    db.prepare('DELETE FROM recovery_codes WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM login_challenges WHERE user_id = ?').run(userId);
+  })();
+}
 
 // ---------- email: password links, settings, preferences ----------
 // One-time "Set your password" links. Only the SHA-256 of the token is stored; the token travels after the # in the link,
@@ -709,7 +877,8 @@ app.get('/api/users', auth, (req, res) => {
   else if (u.role === 'lead' || isTM(u)) rows = db.prepare(`SELECT * FROM users WHERE removed_at IS NULL AND (id = ? OR id IN ${LED_MEMBERS}
     OR id IN (SELECT user_id FROM team_powers WHERE team_id IN ${MANAGED_TEAMS})) ORDER BY active DESC, name`).all(u.id, u.id, u.id);
   else rows = [u];
-  res.json({ users: rows.map(publicUser) });
+  // Admins also see who has two-step verification on (person form: "Reset two-step verification").
+  res.json({ users: rows.map(r => u.role === 'admin' ? { ...publicUser(r), two_step: !!r.totp_enabled_at } : publicUser(r)) });
 });
 
 app.post('/api/users', auth, requireBoss, (req, res) => {
@@ -770,6 +939,19 @@ app.post('/api/users/:id/welcome', auth, ownerFirst('resend the welcome email (a
   sendWelcome(target, req.user);
   audit(req, 'welcome_resent', { target: personTarget(target), details: 'new “Set your password” link emailed; earlier links stop working' });
   res.json({ ok: true, email: target.email });
+});
+
+// Reset someone's two-step verification (lost phone and no recovery codes): admins only, never their own (Account
+// page) and never the owner's. Ends the person's sessions; admins and managers are asked to set it up again at sign-in.
+app.delete('/api/users/:id/2fa', auth, ownerFirst('reset two-step verification'), requireAdmin, (req, res) => {
+  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
+  if (!target) return bad(res, 'User not found.', 404);
+  if (target.id === req.user.id) return bad(res, 'Use your Account page to change your own two-step verification.', 400);
+  if (!target.totp_enabled_at && !target.totp_pending) return bad(res, 'Two-step verification is already off for this person.', 409);
+  clearTwoStep(target.id);
+  const ended = db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id).changes;
+  audit(req, '2fa_reset', { target: personTarget(target), details: `two-step verification reset by ${req.user.name}; ${ended} session${ended === 1 ? '' : 's'} ended` });
+  res.json({ ok: true });
 });
 
 // Field names for refusal records.
@@ -2386,7 +2568,8 @@ app.get('/api/history', auth, (req, res) => {
 const AUDIT_ACTIONS = ['sign_in', 'sign_in_failed', 'account_locked', 'signed_out_other_devices', 'password_changed', 'password_reset_requested',
   'password_reset', 'password_set_by_manager', 'welcome_resent', 'person_added', 'person_edited', 'role_changed', 'team_changed', 'lead_changed',
   'managed_teams_changed', 'team_leads_changed', 'team_managers_changed', 'team_deleted', 'protection_changed', 'account_activated',
-  'account_deactivated', 'person_removed', 'person_restored', 'file_downloaded', 'history_exported', 'audit_exported'];
+  'account_deactivated', 'person_removed', 'person_restored', '2fa_enabled', '2fa_disabled', '2fa_recovery_codes_renewed', '2fa_reset',
+  'file_downloaded', 'history_exported', 'audit_exported'];
 function auditWhere(q) {
   const where = [], params = [];
   if (DATE_RE.test(String(q.from || ''))) { where.push(`date(at, 'localtime') >= ?`); params.push(q.from); }

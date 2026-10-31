@@ -111,6 +111,24 @@ Other rules: a user cannot deactivate themself; only admins can create admins or
 - Account page → "Signed-in devices": `GET /api/me/sessions` counts other live sessions (other browsers; the desktop app is one), and "Sign out all other devices" (`POST /api/me/sessions/sign-out-others`) ends them.
 - A password change ends the other sessions (Account page) or all of them (a manager setting it, set-password links).
 
+**Two-step verification (Security A2)** (TOTP, RFC 6238: HMAC-SHA1, 6 digits, 30 s, ±1 step; any authenticator app). Backup `../backups/taskdesk-before-security-a2-2fa-2026-10-31.*`.
+- **Who:** optional for everyone; **required for admins and managers** (`needsTwoStep` = `isBoss`).
+  - An admin/manager who signs in without it gets a session with `sessions.needs_2fa_setup = 1`. `auth()` lets that session reach only `/api/me` and `/api/me/2fa[/setup|/enable]` (plus logout); everything else, including the desktop app's summary and stream, gets 403 `{ code: '2fa_setup' }`.
+  - The page shows a setup screen with no menu (`viewTwoStepRequired`) until it's done; then the same session works fully.
+  - Existing sessions keep working until the next sign-in.
+- **Sign-in:** a right password with 2FA on returns `{ need_code, ticket }` and no cookie. `POST /api/login/code {ticket, code}` (CSRF-exempt, no session) takes the 6-digit code or a recovery code.
+  - The ticket is stored as SHA-256 in `login_challenges`, lasts 5 minutes and allows 5 tries.
+  - Every wrong code counts towards the account lockout and the per-IP limit; failures are cleared only when the code is right.
+  - Each code works once (`users.totp_last_step`).
+- **Setup:** `POST /api/me/2fa/setup` makes a new secret, stored in `totp_pending`, and returns the QR code (a server-made SVG path via `qrcode-generator`, no user text in it) and the key for typing by hand. `POST /api/me/2fa/enable {code}` confirms it, turns it on and returns **10 recovery codes**, shown once.
+- **Storage:** the secret is encrypted with AES-256-GCM using `keys.derive(master, 'totp secrets')` (`v1.iv.ct.tag`). Recovery codes are stored only as SHA-256 in `recovery_codes`; each works once.
+- **Account page, "Two-step verification" card:** turn on, "New recovery codes" (needs the password; old codes stop working), and "Turn off" (needs the password; not for admins/managers).
+- **Admins reset another person's** (`DELETE /api/users/:id/2fa`, "Reset two-step verification" in the person form; `two_step` in `GET /api/users` for admins only):
+  - never their own, never the owner's (`ownerFirst`);
+  - it ends that person's sessions;
+  - it is recorded as `2fa_reset`.
+- **Desktop app:** signs in through the web page in its window, so the code step and the setup work there unchanged.
+
 **Security headers (Security A1)** on every response (first middleware in server.js; `x-powered-by` off):
 - `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`.
   - No inline scripts, no inline event handlers, no `<style>` blocks; keep it that way (put code in app.js, styles in styles.css).
@@ -134,6 +152,7 @@ Other rules: a user cannot deactivate themself; only admins can create admins or
   - passwords and sessions: `password_changed`, `password_reset_requested`, `password_reset` (set with a link), `password_set_by_manager`, `welcome_resent`, `signed_out_other_devices`;
   - people: `person_added`, `person_edited` (name/email), `role_changed`, `team_changed` (person form and team page), `lead_changed`, `managed_teams_changed`, `account_activated`/`account_deactivated`, `protection_changed`, `person_removed`, `person_restored`;
   - teams: `team_leads_changed`, `team_managers_changed`, `team_deleted`;
+  - two-step verification: `2fa_enabled`, `2fa_disabled`, `2fa_recovery_codes_renewed`, `2fa_reset` (sign-ins note "with a two-step code" / "with a recovery code (n left)" / "asked to set up"; a wrong code is `sign_in_failed` "wrong two-step code");
   - files and exports: `file_downloaded` (real downloads only, not inline image previews), `history_exported` (History CSV), `audit_exported`.
 - **"Audit log" page** (`#/audit`, menu item for admins only; `GET /api/audit`, admins only): newest first, 200 per page ("Load more", `before=<id>`); filters `from`/`to` (local dates), `action`, `q` (who, target, details, IP). `?format=csv` exports up to 50,000 matching rows, and the export is itself recorded.
 - **Tests must not write to the live audit log,** since entries can't be removed. Run audit tests on a copy of the database with a second server (`DATA_DIR=<copy> PORT=3001 …`).
@@ -299,6 +318,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - **account_events**: id, user_id → users (cascade), actor_id → users (SET NULL; empty for server events), action (`owner_transfer`, `owner_refused`, `protected_refused`, `protection_on`, `protection_off`), detail ("<who> tried to …", "Owner changed from A to B …"), created_at. A person's account activity, index on user_id. Read with `GET /api/users/:id/events`.
 - **login_failures**: email (lowercased), at. One row per failed sign-in; rows older than a day are dropped. **login_locks**: email (PK), locked_until. Account lockout (Security A1, backup `../backups/taskdesk-before-security-a1-2026-10-31.*`).
 - **audit_log** (Security A1): id, at (UTC), actor_id, actor_name, ip, action, target_type, target_id, target_name, details. Append-only (triggers `audit_log_no_update` / `audit_log_no_delete`); no foreign keys. Indexes on at, action, actor_id.
+- **users.totp_secret / totp_pending / totp_enabled_at / totp_last_step**, **sessions.needs_2fa_setup**, **recovery_codes** (id, user_id → users cascade, code_hash, used_at), **login_challenges** (token_hash PK, user_id → users cascade, expires_at, attempts): two-step verification (Security A2, added with `ALTER TABLE` / `CREATE TABLE IF NOT EXISTS`).
 - **app_settings**: key (PK), value. `owner_user_id` = the owner at the last start (empty = nobody), used to notice and record a change of owner.
 - **password_tokens**: id, user_id → users (cascade), token_hash (SHA-256, unique), purpose (welcome|reset), created_by → users (SET NULL), created_at, expires_at, used_at. "Set your password" links; the token itself is never stored.
 - **sessions**: token (PK), user_id → users (cascade), expires_at, last_active_at (idle sign-out; added with `ALTER TABLE` in Security A1, older rows empty until their next request)
@@ -326,6 +346,9 @@ All except login require the session cookie (`auth`). Errors are `{ error: "..."
 | Method & path | Access | Purpose |
 |---|---|---|
 | POST `/api/login` | public | Sign in (rate limited), sets `sid` cookie |
+| POST `/api/login/code` | public (ticket from `/api/login`) | Second step: `{ticket, code}` (6-digit or recovery code), sets `sid` |
+| GET `/api/me/2fa`, POST `/api/me/2fa/setup` / `enable` / `recovery-codes` / `disable` | signed in | Two-step verification state / start / confirm (returns recovery codes) / new codes (password) / turn off (password; not admins/managers) |
+| DELETE `/api/users/:id/2fa` | admin (not themself, not the owner) | Reset someone's two-step verification; ends their sessions |
 | POST `/api/logout` | any | End session |
 | GET `/api/me` | signed in | Current user |
 | POST `/api/me/password` | signed in | Change own password (`current`, `next` ≥ 8 chars) |

@@ -398,3 +398,10 @@ details.group[open] > summary::before{transform:rotate(90deg)}
 .dash-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:20px;align-items:start}
 @media (min-width:1500px){.dash-grid:has(> .emp-card){grid-template-columns:minmax(640px,1.2fr) minmax(0,1fr) minmax(0,1fr)}}
 @media (max-width:1499px){.dash-grid > .emp-card{grid-column:1 / -1}}
+/* Two-step verification setup (Security A2) */
+.steps{margin:0 0 4px;padding-left:20px;font-size:.9375rem}
+.steps li+li{margin-top:14px}
+.qr-box{margin:10px 0;line-height:0}
+.qr-box svg{width:200px;height:200px;border:1px solid var(--line);border-radius:8px}
+.secret-key{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9375rem;letter-spacing:.04em;word-break:break-all;margin:8px 0 4px}
+.codes{list-style:none;padding:0;margin:10px 0 14px;display:grid;grid-template-columns:repeat(2,minmax(0,max-content));gap:6px 24px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9375rem}

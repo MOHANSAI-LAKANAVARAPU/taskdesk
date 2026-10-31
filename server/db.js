@@ -365,6 +365,31 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
     CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
     CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
     CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;`);
+  // Two-step verification (Security A2). users.totp_secret / totp_pending: the authenticator secret (confirmed / being
+  // set up), encrypted with a key derived from master.key; totp_enabled_at: when it was turned on; totp_last_step: the
+  // last 30-second step used, so a code works only once. recovery_codes: SHA-256 of the 10 one-time codes.
+  // login_challenges: the step between password and code (SHA-256 of a random ticket, 5 minutes).
+  // sessions.needs_2fa_setup: an admin/manager signed in without 2-step verification; the session can only set it up.
+  {
+    const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+    for (const [c, def] of [['totp_secret', 'TEXT'], ['totp_pending', 'TEXT'], ['totp_enabled_at', 'TEXT'], ['totp_last_step', 'INTEGER']])
+      if (!cols.includes(c)) db.exec(`ALTER TABLE users ADD COLUMN ${c} ${def}`);
+    if (!db.prepare('PRAGMA table_info(sessions)').all().some(c => c.name === 'needs_2fa_setup'))
+      db.exec('ALTER TABLE sessions ADD COLUMN needs_2fa_setup INTEGER NOT NULL DEFAULT 0');
+    db.exec(`CREATE TABLE IF NOT EXISTS recovery_codes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        code_hash TEXT NOT NULL,
+        used_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON recovery_codes(user_id);
+      CREATE TABLE IF NOT EXISTS login_challenges (
+        token_hash TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0
+      );`);
+  }
 })();
 
 // ---- Roles: users.role has no CHECK constraint any more (server.js validates it on every write) ----

@@ -44,7 +44,7 @@
 
   // CSRF token for changes (POST/PUT/PATCH/DELETE), from /api/me and /api/login. A 403 "csrf" (e.g. the server
   // restarted or the session changed) fetches a fresh one and retries once.
-  let csrf = '';
+  let csrf = '', mustSetup2fa = false;
   async function api(path, opts = {}) {
     const method = opts.method || 'GET';
     const res = await fetch('/api' + path, {
@@ -60,7 +60,8 @@
     if (res.status === 403 && data.code === 'csrf' && !opts.retried) {
       try { const m = await (await fetch('/api/me', { credentials: 'same-origin' })).json(); if (m.csrf_token) { csrf = m.csrf_token; return api(path, { ...opts, retried: true }); } } catch (e) { /* fall through */ }
     }
-    if (res.status === 401 && path !== '/login') { me = null; location.hash = '#/login'; }
+    if (res.status === 401 && !path.startsWith('/login')) { me = null; location.hash = '#/login'; }
+    if (res.status === 403 && data.code === '2fa_setup') { mustSetup2fa = true; location.hash = '#/2fa-setup'; }
     if (!res.ok) throw new Error(data.error || 'Something went wrong. Try again.');
     return data;
   }
@@ -141,8 +142,11 @@
       return page === 'login' ? viewLogin() : page === 'forgot' ? viewForgot() : viewSetPassword();
     }
     if (!me) {
-      try { const r = await api('/me'); me = r.user; uploadMb = r.upload_max_mb || uploadMb; csrf = r.csrf_token || ''; } catch (e) { location.hash = '#/login'; return; }
+      try { const r = await api('/me'); me = r.user; uploadMb = r.upload_max_mb || uploadMb; csrf = r.csrf_token || ''; mustSetup2fa = !!r.must_setup_2fa; } catch (e) { location.hash = '#/login'; return; }
     }
+    // Admins and managers who signed in without two-step verification set it up before anything else.
+    if (mustSetup2fa) { $('#topbar').hidden = true; return viewTwoStepRequired(); }
+    if (page === '2fa-setup') return location.replace('#/');
     // The old "My team" page (and People for non-managers) is now the Teams page.
     if (route === 'my-team') return location.replace('#/teams');
     // People is part of the Teams page now ("All people", managers/admins); old links still work.
@@ -190,10 +194,82 @@
       const fd = new FormData(e.target);
       try {
         const r = await api('/login', { method: 'POST', body: { email: fd.get('email'), password: fd.get('password') } });
-        me = r.user; uploadMb = r.upload_max_mb || uploadMb; csrf = r.csrf_token || '';
-        location.hash = '#/';
+        if (r.need_code) return viewLoginCode(r.ticket);
+        signedIn(r);
       } catch (err) { $('#loginErr').textContent = err.message; }
     };
+  }
+  function signedIn(r) {
+    me = r.user; uploadMb = r.upload_max_mb || uploadMb; csrf = r.csrf_token || ''; mustSetup2fa = !!r.must_setup_2fa;
+    if (location.hash === '#/' || location.hash === '') router(); else location.hash = '#/';
+  }
+  // Second step of signing in: the 6-digit code from the authenticator app, or one of the recovery codes.
+  function viewLoginCode(ticket) {
+    app.innerHTML = loginCard('Two-step verification', `
+        <p class="muted" style="margin:-6px 0 14px;font-size:.9375rem">Enter the 6-digit code from your authenticator app.</p>
+        <label class="f"><span id="codeLabel">Code</span><input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="20" required autofocus></label>
+        <p class="err" id="codeErr"></p>
+        <button class="btn" style="width:100%">Continue</button>
+        <p style="font-size:.875rem;margin-top:12px"><a href="#" id="useRecovery">Lost your phone? Use a recovery code</a></p>`, 'codeForm');
+    $('#codeForm [name=code]').focus();
+    $('#useRecovery').onclick = e => {
+      e.preventDefault();
+      $('#codeLabel').textContent = 'Recovery code (like abcde-12345)';
+      const i = $('#codeForm [name=code]'); i.inputMode = 'text'; i.autocomplete = 'off'; i.focus();
+      e.target.parentElement.remove();
+    };
+    $('#codeForm').onsubmit = async e => {
+      e.preventDefault();
+      const btn = e.target.querySelector('button'); btn.disabled = true;
+      try { signedIn(await api('/login/code', { method: 'POST', body: { ticket, code: new FormData(e.target).get('code') } })); }
+      catch (err) {
+        $('#codeErr').textContent = err.message; btn.disabled = false;
+        if (/password again|expired/.test(err.message)) setTimeout(() => { if ($('#codeForm')) viewLogin(); }, 2500);
+      }
+    };
+  }
+  // Setting up two-step verification inside `box`: QR code (or the key typed by hand), then a code from the app to
+  // confirm, then the 10 recovery codes (shown once). onDone runs after "I've saved them".
+  async function twoStepSetup(box, onDone) {
+    const st = await api('/me/2fa/setup', { method: 'POST' });
+    box.innerHTML = `
+      <ol class="steps">
+        <li>Open an authenticator app on your phone (Google Authenticator, Microsoft Authenticator, Authy…) and add an account by scanning this code:
+          <div class="qr-box">${st.qr_svg}</div>
+          <details><summary>Can’t scan it? Type this key instead</summary><p class="secret-key">${esc(st.secret)}</p><p class="muted" style="font-size:.8125rem">Account: TaskDesk, time-based.</p></details></li>
+        <li>Enter the 6-digit code the app shows:
+          <form id="tsConfirm" class="inline-actions" style="margin-top:8px"><input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required style="max-width:140px" aria-label="6-digit code">
+            <button class="btn">Turn on</button></form>
+          <p class="err" id="tsErr"></p></li>
+      </ol>`;
+    box.querySelector('#tsConfirm').onsubmit = async e => {
+      e.preventDefault();
+      try { const r = await api('/me/2fa/enable', { method: 'POST', body: { code: new FormData(e.target).get('code') } }); showRecoveryCodes(box, r.recovery_codes, onDone); }
+      catch (err) { box.querySelector('#tsErr').textContent = err.message; }
+    };
+  }
+  function showRecoveryCodes(box, codes, onDone) {
+    box.innerHTML = `
+      <p class="ok-note" role="status" style="margin:0 0 12px">Two-step verification is on.</p>
+      <p><strong>Save these recovery codes</strong> somewhere safe (print them, or keep them in a password manager). Each one signs you in once if you lose your phone. They won’t be shown again.</p>
+      <ul class="codes">${codes.map(c => `<li>${esc(c)}</li>`).join('')}</ul>
+      <div class="inline-actions"><button class="btn ghost" type="button" id="copyCodes">Copy</button><button class="btn" type="button" id="savedCodes">I’ve saved them</button></div>`;
+    box.querySelector('#copyCodes').onclick = () => navigator.clipboard.writeText(codes.join('\n')).then(() => toast('Recovery codes copied'), () => toast('Couldn’t copy; write them down instead'));
+    box.querySelector('#savedCodes').onclick = onDone;
+  }
+  // Admins and managers: required at sign-in before anything else.
+  async function viewTwoStepRequired() {
+    app.innerHTML = `<div class="login"><section class="card login-card">
+        <img class="login-banner" src="/branding/hifocus-banner.png" alt="Hi-Focus – Enhancing your sixth sense" width="1600" height="820">
+        <div class="brand"><span class="brand-mark" aria-hidden="true"></span>TaskDesk</div>
+        <h1 style="font-size:1.25rem;margin-bottom:16px">Set up two-step verification</h1>
+        <p class="muted" style="margin:-6px 0 14px;font-size:.9375rem">Hi ${esc(me.name)}. As ${me.role === 'admin' ? 'an admin' : 'a manager'}, you need a code from your phone as well as your password to sign in. This takes about a minute.</p>
+        <div id="tsBox"><p class="muted">Loading…</p></div>
+      </section>
+      <p style="font-size:.875rem;margin-top:14px"><a href="#" id="tsSignOut">Sign out</a></p></div>`;
+    $('#tsSignOut').onclick = e => { e.preventDefault(); mustSetup2fa = false; $('#logoutBtn').onclick(); };
+    try { await twoStepSetup($('#tsBox'), () => { mustSetup2fa = false; location.hash = '#/'; router(); }); }
+    catch (err) { $('#tsBox').innerHTML = `<p class="err">${esc(err.message)}</p>`; }
   }
 
   // The card used by the signed-out pages (banner, brand, heading, body).
@@ -829,6 +905,7 @@
       ${!u && emailOn ? `<label class="check-row"><input type="checkbox" name="send_welcome" id="sendWelcome" checked> Send a welcome email with a “Set your password” link (valid 48 hours)</label>` : ''}
       <label class="f" id="pwField"${!u && emailOn ? ' hidden' : ''}><span>${u ? 'New password (leave empty to keep current)' : 'Temporary password'}</span><input name="password" type="text" minlength="10" autocomplete="new-password" ${u || emailOn ? '' : 'required'}></label>
       ${u && emailOn && u.active && !u.removed && canEditPerson(u) ? `<p style="margin:-6px 0 12px;font-size:.875rem"><button type="button" class="btn ghost small" id="resendWelcome">Resend welcome email</button> <span class="muted">A new “Set your password” link to ${esc(u.email)}; earlier links stop working.</span></p>` : ''}
+      ${u && u.two_step && me.role === 'admin' && u.id !== me.id && !u.locked ? `<p style="margin:-6px 0 12px;font-size:.875rem"><button type="button" class="btn ghost small" id="reset2fa">Reset two-step verification</button> <span class="muted">For a lost phone. Signs them out; they set it up again.</span></p>` : ''}
       ${u && u.id !== me.id && !u.protected && !u.locked ? `<label class="f" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="active" style="width:auto" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
       ${ownSelf ? '<p class="note-box">Role and email are fixed for this account.</p>' : ''}
       ${prot ? '<p class="note-box">🔒 Protected: this account can’t be removed, deactivated or given a lower role.</p>' : ''}
@@ -867,6 +944,13 @@
       rw.disabled = true;
       try { const r = await api(`/users/${u.id}/welcome`, { method: 'POST' }); toast(`Welcome email sent to ${r.email}`); }
       catch (err) { $('#mErr').textContent = err.message; } finally { rw.disabled = false; }
+    };
+    const r2 = $('#reset2fa');
+    if (r2) r2.onclick = async () => {
+      if (!confirm(`Reset two-step verification for ${u.name}? They’ll be signed out everywhere${['admin', 'manager'].includes(u.role) ? ' and asked to set it up again at their next sign-in' : ' and can sign in with their password only'}.`)) return;
+      r2.disabled = true;
+      try { await api(`/users/${u.id}/2fa`, { method: 'DELETE' }); u.two_step = false; r2.parentElement.remove(); toast(`Two-step verification reset for ${u.name}`); }
+      catch (err) { $('#mErr').textContent = err.message; r2.disabled = false; }
     };
     const rb = $('#removePersonBtn'); if (rb) rb.onclick = () => { modal.close(); removePerson(u); };
     const hist = $('#acctHist');
@@ -1304,6 +1388,8 @@
     role_changed: 'Role changed', team_changed: 'Team changed', lead_changed: 'Lead changed', managed_teams_changed: 'Managed teams changed',
     team_leads_changed: 'Team leads changed', team_managers_changed: 'Team managers changed', team_deleted: 'Team deleted', protection_changed: 'Protection changed',
     account_activated: 'Account activated', account_deactivated: 'Account deactivated', person_removed: 'Person removed', person_restored: 'Person restored',
+    '2fa_enabled': 'Two-step verification turned on', '2fa_disabled': 'Two-step verification turned off', '2fa_recovery_codes_renewed': 'New recovery codes',
+    '2fa_reset': 'Two-step verification reset by an admin',
     file_downloaded: 'File downloaded', history_exported: 'History exported (CSV)', audit_exported: 'Audit log exported (CSV)' };
   async function viewAudit() {
     if (me.role !== 'admin') { app.innerHTML = `<div class="empty">Only admins can see the audit log.</div>`; return; }
@@ -1417,6 +1503,7 @@
           <p id="devicesText">Checking…</p>
           <button class="btn ghost" type="button" id="signOutOthers" hidden>Sign out all other devices</button>
         </section>
+        <section class="card" id="twoStepCard"><h2>Two-step verification</h2><p class="muted">Checking…</p></section>
         <form class="card" id="prefsForm">
           <h2>Email notifications</h2>
           <p class="muted" style="font-size:.875rem;margin-top:-4px">Short emails to ${esc(me.email)} with a button to open the item. All are off until you turn them on.</p>
@@ -1435,6 +1522,7 @@
       } catch (e) { $('#devicesText').textContent = e.message; }
     }
     showDevices();
+    showTwoStep();
     $('#signOutOthers').onclick = async () => {
       if (!confirm('Sign out everywhere else? Other browsers and the desktop app will ask you to sign in again.')) return;
       try { const r = await api('/me/sessions/sign-out-others', { method: 'POST' }); toast(`Signed out ${r.signed_out} other ${r.signed_out === 1 ? 'session' : 'sessions'}`); showDevices(); } catch (e) { toast(e.message); }
@@ -1451,6 +1539,36 @@
       try { await api('/me/email-prefs', { method: 'PUT', body }); toast('Email notifications saved'); } catch (err) { toast(err.message); }
     };
     if (me.role === 'admin') renderEmailSettings(await api('/email/status'));
+  }
+  // Account page: two-step verification on/off, new recovery codes. Required (no "Turn off") for admins and managers.
+  async function showTwoStep() {
+    const box = $('#twoStepCard'); if (!box) return;
+    const st = await api('/me/2fa');
+    const pwPrompt = (id, label) => `<form id="${id}" class="inline-actions" style="margin-top:10px" hidden><input type="password" name="password" required autocomplete="current-password" placeholder="Your password" aria-label="Your password" style="max-width:220px"><button class="btn">${label}</button></form>`;
+    box.innerHTML = `<h2>Two-step verification</h2>
+      <p class="muted" style="font-size:.875rem;margin-top:-4px">Signing in also needs a 6-digit code from an app on your phone, so a stolen password isn’t enough.${st.required ? ' Required for admins and managers.' : ''}</p>
+      ${st.enabled ? `<p><strong>On.</strong> ${st.recovery_left} of 10 recovery codes left.</p>
+        <div class="inline-actions"><button class="btn ghost" type="button" id="tsNewCodes">New recovery codes</button>${st.required ? '' : '<button class="btn ghost" type="button" id="tsOff">Turn off</button>'}</div>
+        ${pwPrompt('tsNewCodesForm', 'Make new codes')}${st.required ? '' : pwPrompt('tsOffForm', 'Turn off')}<p class="err" id="tsAccErr"></p>`
+      : `<p>Off.</p><div id="tsBox"><button class="btn" type="button" id="tsOn">Turn on</button></div>`}`;
+    const err = m => { $('#tsAccErr').textContent = m; };
+    if (!st.enabled) $('#tsOn').onclick = () => twoStepSetup($('#tsBox'), showTwoStep).catch(e => toast(e.message));
+    else {
+      $('#tsNewCodes').onclick = () => { $('#tsNewCodesForm').hidden = false; $('#tsNewCodesForm input').focus(); };
+      $('#tsNewCodesForm').onsubmit = async e => {
+        e.preventDefault();
+        try { const r = await api('/me/2fa/recovery-codes', { method: 'POST', body: { password: new FormData(e.target).get('password') } }); const b = $('#twoStepCard'); b.innerHTML = '<h2>Two-step verification</h2><div></div>'; showRecoveryCodes(b.lastChild, r.recovery_codes, showTwoStep); }
+        catch (x) { err(x.message); }
+      };
+      if (!st.required) {
+        $('#tsOff').onclick = () => { $('#tsOffForm').hidden = false; $('#tsOffForm input').focus(); };
+        $('#tsOffForm').onsubmit = async e => {
+          e.preventDefault();
+          try { await api('/me/2fa/disable', { method: 'POST', body: { password: new FormData(e.target).get('password') } }); toast('Two-step verification turned off'); showTwoStep(); }
+          catch (x) { err(x.message); }
+        };
+      }
+    }
   }
   // Admins: what the server uses (never the password), the last error, and "Send test email" with the exact result.
   function renderEmailSettings(st, result) {
