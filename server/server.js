@@ -15,6 +15,18 @@ const SESSION_DAYS = 30;
 const UPLOAD_DIR = path.join(process.env.DATA_DIR || path.join(__dirname, 'data'), 'uploads');
 
 app.set('trust proxy', 1);
+// Security headers on every response (Security A1). The CSP allows only this server's own script, styles, images and
+// connections. No inline scripts and no <style> blocks; only style="…" attributes are allowed (style-src-attr), as the
+// page templates use them for small layout tweaks (they can't run code or use selectors). File downloads set their
+// own stricter CSP (default-src 'none'; sandbox) in /api/files/:id.
+app.disable('x-powered-by');
+const CSP = ["default-src 'self'", "script-src 'self'", "style-src 'self'", "style-src-attr 'unsafe-inline'", "img-src 'self'",
+  "font-src 'self'", "connect-src 'self'", "object-src 'none'", "base-uri 'none'", "form-action 'self'", "frame-ancestors 'none'"].join('; ');
+app.use((req, res, next) => {
+  res.set({ 'Content-Security-Policy': CSP, 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()' });
+  next();
+});
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
 // Pages, script and styles must be revalidated on every load so browsers and the desktop app never run stale code
@@ -371,7 +383,7 @@ app.post('/api/login', (req, res) => {
   const token = crypto.randomBytes(32).toString('hex');
   db.prepare(`INSERT INTO sessions (token,user_id,expires_at,last_active_at) VALUES (?,?,datetime('now', ?),datetime('now'))`).run(token, user.id, `+${SESSION_DAYS} days`);
   db.prepare(`DELETE FROM sessions WHERE expires_at < datetime('now')`).run();
-  res.cookie('sid', token, { httpOnly: true, sameSite: 'lax', secure: COOKIE_SECURE, maxAge: SESSION_DAYS * 864e5 });
+  res.cookie('sid', token, { httpOnly: true, sameSite: 'strict', secure: COOKIE_SECURE, maxAge: SESSION_DAYS * 864e5 });
   res.json({ user: publicUser(user), upload_max_mb: MAX_FILE_MB });
 });
 
@@ -399,7 +411,7 @@ function passwordProblem(pw, email) {
 
 app.post('/api/logout', (req, res) => {
   if (req.cookies.sid) db.prepare('DELETE FROM sessions WHERE token = ?').run(req.cookies.sid);
-  res.clearCookie('sid');
+  res.clearCookie('sid', { httpOnly: true, sameSite: 'strict', secure: COOKIE_SECURE });
   res.json({ ok: true });
 });
 

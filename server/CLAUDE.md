@@ -100,6 +100,14 @@ Other rules: a user cannot deactivate themself; only admins can create admins or
 - Account page → "Signed-in devices": `GET /api/me/sessions` counts other live sessions (other browsers; the desktop app is one), and "Sign out all other devices" (`POST /api/me/sessions/sign-out-others`) ends them.
 - A password change ends the other sessions (Account page) or all of them (a manager setting it, set-password links).
 
+**Security headers (Security A1)** on every response (first middleware in server.js; `x-powered-by` off):
+- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`.
+  - No inline scripts, no inline event handlers, no `<style>` blocks; keep it that way (put code in app.js, styles in styles.css).
+  - The page templates' `style="…"` attributes are the one inline thing allowed (`style-src-attr`). They can't run code or use selectors. Moving them into classes would let it go.
+  - `/api/files/:id` overrides the CSP with `default-src 'none'; sandbox`.
+- `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`.
+- **The `sid` cookie is `HttpOnly; SameSite=Strict`** (plus `Secure` with `COOKIE_SECURE=true`). Links from emails still open signed in: the page itself loads without the cookie, and its own API calls are same-site. The desktop app sends the cookie itself, so SameSite doesn't affect it.
+
 **Owner and protected accounts** (backup `../backups/taskdesk-before-owner-2026-10-29.*`):
 
 The owner:
