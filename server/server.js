@@ -39,6 +39,7 @@ app.use((req, res, next) => {
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()' });
   next();
 });
+app.use('/api/users/import/commit', express.json({ limit: '2mb' })); // up to 2000 rows; every other route keeps 200 KB
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
 // CSRF (Security A1). Every POST/PUT/PATCH/DELETE to /api:
@@ -710,7 +711,7 @@ function liveToken(token) {
   return db.prepare(`SELECT pt.id, pt.purpose, pt.user_id, u.name, u.email FROM password_tokens pt JOIN users u ON u.id = pt.user_id
     WHERE pt.token_hash = ? AND pt.used_at IS NULL AND pt.expires_at > datetime('now') AND u.active = 1 AND u.removed_at IS NULL`).get(hashToken(token));
 }
-function sendWelcome(user, by) {
+function sendWelcome(user, by, onResult) {
   const url = issueToken(user, 'welcome', by && by.id);
   return mailer.queue(user.email, 'Welcome to TaskDesk', mailer.layout({
     heading: `Welcome to TaskDesk, ${user.name}`,
@@ -718,7 +719,7 @@ function sendWelcome(user, by) {
       'Choose your password to get started. The link works once and expires in 48 hours.'],
     button: { label: 'Set your password', url },
     after: ['If the link has expired, ask your manager to resend it, or use "Forgot password?" on the sign-in page.']
-  }));
+  }), onResult);
 }
 // Simple in-memory counters: { key → {n, reset} }; true when over the limit.
 const limits = new Map();
@@ -781,14 +782,15 @@ app.post('/api/password/set', (req, res) => {
 });
 
 // Email settings (admins): what is configured (never the password), the last error, and a test email to themself.
-app.get('/api/email/status', auth, requireAdmin, (req, res) => res.json(mailer.status()));
+const emailStatus = () => ({ ...mailer.status(), welcome: welcomeStatus() }); // + the welcome emails still to go out (bulk import)
+app.get('/api/email/status', auth, requireAdmin, (req, res) => res.json(emailStatus()));
 app.post('/api/email/test', auth, requireAdmin, async (req, res) => {
   const error = await mailer.sendNow(req.user.email, 'TaskDesk test email', mailer.layout({
     heading: 'Email is working',
     lines: [`Hi ${req.user.name}, this is a test email from TaskDesk. If you can read it, TaskDesk can send email.`],
     button: { label: 'Open TaskDesk', url: mailer.link('') }
   }));
-  res.json(error ? { ok: false, error, status: mailer.status() } : { ok: true, to: req.user.email, status: mailer.status() });
+  res.json(error ? { ok: false, error, status: emailStatus() } : { ok: true, to: req.user.email, status: emailStatus() });
 });
 
 // Optional notification emails (all off by default). "Still unassigned" only for people who lead a team.
@@ -916,6 +918,15 @@ app.get('/api/users', auth, (req, res) => {
   res.json({ users: rows.map(r => u.role === 'admin' ? { ...publicUser(r), two_step: !!r.totp_enabled_at } : publicUser(r)) });
 });
 
+// Creates one person (the row, the audit entry, auto-lead, managed teams). The caller has already validated everything and
+// calls syncTeamChats() afterwards (once, for a whole import). Used by POST /api/users and the bulk import.
+function insertPerson(f, req) {
+  const r = db.prepare('INSERT INTO users (name,email,password_hash,role,lead_id,team_id) VALUES (?,?,?,?,?,?)').run(f.name, f.email, f.hash, f.role, f.lead_id || null, f.team_id || null);
+  audit(req, 'person_added', { target: { type: 'person', id: r.lastInsertRowid, name: f.name }, details: `${f.email}; role ${f.role}; team ${teamLabel(f.team_id)}${f.managedIds ? `; manages ${f.managedIds.map(teamLabel).join(', ')}` : ''}; ${f.how}` });
+  const became_lead = autoLead(r.lastInsertRowid, req.user.id);
+  if (f.managedIds) setManagedTeams(r.lastInsertRowid, f.managedIds, req.user.id);
+  return { id: r.lastInsertRowid, became_lead };
+}
 app.post('/api/users', auth, requireBoss, (req, res) => {
   const name = str(req.body.name, 120), email = str(req.body.email, 200), role = req.body.role;
   const password = typeof req.body.password === 'string' ? req.body.password : '';
@@ -933,13 +944,11 @@ app.post('/api/users', auth, requireBoss, (req, res) => {
   if (!welcome) { const problem = passwordProblem(password, email); if (problem) return bad(res, problem); }
   if (lead_id && !db.prepare(`SELECT 1 FROM users WHERE id = ? AND role IN ('lead','manager','admin')`).get(lead_id)) return bad(res, 'Choose a valid team lead.');
   if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return bad(res, 'A user with this email already exists.');
-  const r = db.prepare('INSERT INTO users (name,email,password_hash,role,lead_id,team_id) VALUES (?,?,?,?,?,?)')
-    .run(name, email, bcrypt.hashSync(welcome ? crypto.randomBytes(32).toString('hex') : password, 10), role, lead_id, team_id);
-  audit(req, 'person_added', { target: { type: 'person', id: r.lastInsertRowid, name }, details: `${email}; role ${role}; team ${teamLabel(team_id)}${managed.ids ? `; manages ${managed.ids.map(teamLabel).join(', ')}` : ''}; ${welcome ? 'welcome email' : 'password set by ' + req.user.name}` });
-  const became_lead = autoLead(r.lastInsertRowid, req.user.id);
-  if (managed.ids) setManagedTeams(r.lastInsertRowid, managed.ids, req.user.id);
+  const made = insertPerson({ name, email, role, lead_id, team_id, hash: bcrypt.hashSync(welcome ? crypto.randomBytes(32).toString('hex') : password, 10), managedIds: managed.ids,
+    how: welcome ? 'welcome email' : 'password set by ' + req.user.name }, req);
+  const became_lead = made.became_lead;
   syncTeamChats();
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(r.lastInsertRowid);
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(made.id);
   const welcome_sent = welcome && sendWelcome(user, req.user);
   res.json({ user: publicUser(user), became_lead, welcome_sent });
 });
@@ -961,6 +970,168 @@ function setManagedTeams(userId, ids, by) {
     for (const id of ids) add.run(id, userId, by);
   })();
 }
+
+// ---------- bulk import of people (Scale) ----------
+// Admins and managers: Teams > All people > "Import from Excel/CSV". Two steps. preview reads the file (kept in memory,
+// never stored, never virus-scanned because it is only parsed) and reports every row's problems without writing anything;
+// commit receives the same rows, checks them all again (nothing from the browser is trusted), and in one transaction
+// creates the missing teams (only if "Create missing teams" is ticked) and the people. Import only ever creates people:
+// an email that already has an account is skipped, never edited. Every new person is put in welcome_queue, and the welcome
+// emails go out gradually (see drainWelcome).
+const importfile = require('./importfile');
+const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: importfile.MAX_BYTES, files: 1, fields: 4, parts: 6 } });
+const IMPORT_ROLES = { employee: 'employee', lead: 'lead', 'team lead': 'lead', 'team manager': 'team_manager', manager: 'manager', 'company manager': 'manager' };
+const IMPORT_ROLE_HELP = 'Use employee, lead, team_manager or manager.';
+const EMAIL_SHAPE = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
+const UNUSABLE_HASH = () => '!unset-' + crypto.randomBytes(16).toString('hex'); // not a bcrypt hash: no password matches it, until a link sets one
+
+// The rows as they would be imported: { rows: [{ line, name, email, team, role, ok, problems, warnings, team_new }], new_teams }.
+function planImport(rawRows, { createTeams }) {
+  const accounts = new Map(), removedMail = new Set();
+  for (const u of db.prepare('SELECT id, name, email, protected, removed_at, original_email FROM users').all()) {
+    if (u.removed_at) { if (u.original_email) removedMail.add(u.original_email.toLowerCase()); } else accounts.set(u.email.toLowerCase(), u);
+  }
+  const teams = new Map(db.prepare('SELECT id, name FROM teams').all().map(t => [t.name.toLowerCase(), t]));
+  const seen = new Map(), newTeams = new Map();
+  const rows = rawRows.map((r, i) => {
+    const o = { line: Number(r && r.line) || i + 2, name: str(r && r.name, 1000), email: str(r && r.email, 500), team: str(r && r.team, 1000), role: str(r && r.role, 200) };
+    const problems = [], warnings = [];
+    if (!o.name) problems.push('Name is missing.'); else if (o.name.length > 120) problems.push('Name is longer than 120 characters.');
+    const low = o.email.toLowerCase();
+    if (!o.email) problems.push('Email is missing.');
+    else if (!EMAIL_SHAPE.test(o.email) || o.email.length > 200) problems.push(`“${o.email.slice(0, 60)}” isn’t a valid email address.`);
+    else if (/@example\.com$/i.test(o.email)) problems.push('This is an example row from the template. Delete it or use a real email.');
+    else {
+      if (seen.has(low)) problems.push(`Same email as row ${seen.get(low)} of this file.`); else seen.set(low, o.line);
+      const have = accounts.get(low);
+      if (have) problems.push(have.protected || isOwner(have) ? 'This account can’t be changed by an import.' : `Already has an account (${have.name}).`);
+      else if (removedMail.has(low)) warnings.push('This email belonged to a removed person. A new account is made.');
+    }
+    const roleKey = o.role.toLowerCase().replace(/[_\-\s]+/g, ' ').trim();
+    if (!roleKey) { o.role = 'employee'; warnings.push('No role given: employee.'); }
+    else if (roleKey === 'admin') problems.push('Admins can’t be imported. Add them one by one.');
+    else if (IMPORT_ROLES[roleKey]) o.role = IMPORT_ROLES[roleKey];
+    else problems.push(`Unknown role “${o.role.slice(0, 40)}”. ${IMPORT_ROLE_HELP}`);
+    if (o.team) {
+      if (o.team.length > 120) problems.push('Team name is longer than 120 characters.');
+      else if (teams.has(o.team.toLowerCase())) { o.team = teams.get(o.team.toLowerCase()).name; o.team_id = teams.get(o.team.toLowerCase()).id; }
+      else if (createTeams) { o.team_new = true; if (!newTeams.has(o.team.toLowerCase())) newTeams.set(o.team.toLowerCase(), o.team); else o.team = newTeams.get(o.team.toLowerCase()); }
+      else problems.push(`Unknown team “${o.team.slice(0, 40)}”. Tick “Create missing teams”, or fix the name.`);
+    }
+    if (o.role === 'team_manager' && !o.team) problems.push('A team manager needs a team (the team they manage).');
+    if (o.role === 'lead' && !o.team) warnings.push('A lead without a team doesn’t lead anyone yet.');
+    return { ...o, ok: !problems.length, problems, warnings };
+  });
+  // Only teams that an importable row needs are created.
+  const need = new Map();
+  for (const r of rows) if (r.ok && r.team_new) need.set(r.team.toLowerCase(), r.team);
+  return { rows, new_teams: [...need.values()] };
+}
+const importCounts = rows => ({ total: rows.length, ok: rows.filter(r => r.ok).length, problems: rows.filter(r => !r.ok).length, warnings: rows.filter(r => r.ok && r.warnings.length).length });
+
+app.get('/api/users/import/template', auth, requireBoss, (req, res) => {
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.attachment('taskdesk-people-template.csv');
+  res.send('﻿name,email,team,role\r\nAsha Rao,asha.rao@example.com,R&D,employee\r\nVikram Shah,vikram.shah@example.com,Testing,lead\r\n');
+});
+app.post('/api/users/import/preview', auth, requireBoss, (req, res) => {
+  importUpload.single('file')(req, res, err => {
+    if (err) return bad(res, err.code === 'LIMIT_FILE_SIZE' ? `The file is too big (the most is ${importfile.MAX_BYTES / 1024 / 1024} MB).` : 'The upload failed. Try again.');
+    if (!req.file) return bad(res, 'Choose an Excel (.xlsx) or CSV file.');
+    let parsed;
+    try { parsed = importfile.parsePeople(req.file.buffer, req.file.originalname); }
+    catch (e) { return e.userMessage ? bad(res, e.message) : (console.error('[import] could not read the file:', e.message), bad(res, 'This file couldn’t be read. Save it as .xlsx or CSV and try again.')); }
+    const plan = planImport(parsed.rows, { createTeams: req.body.create_missing_teams === '1' || req.body.create_missing_teams === 'true' });
+    res.json({ file_name: (req.file.originalname || '').slice(0, 200), email_enabled: mailer.enabled(), columns: parsed.columns, counts: importCounts(plan.rows), new_teams: plan.new_teams, rows: plan.rows });
+  });
+});
+app.post('/api/users/import/commit', auth, requireBoss, (req, res) => {
+  if (!mailer.enabled()) return bad(res, 'Email isn’t set up, so welcome emails can’t be sent. Set it up first.');
+  const raw = Array.isArray(req.body.rows) ? req.body.rows : null;
+  if (!raw || !raw.length) return bad(res, 'There is nothing to import.');
+  if (raw.length > importfile.MAX_ROWS) return bad(res, `Too many rows (the most is ${importfile.MAX_ROWS} people per import).`);
+  const plan = planImport(raw, { createTeams: !!req.body.create_missing_teams });
+  const good = plan.rows.filter(r => r.ok);
+  if (!good.length) return bad(res, 'No row can be imported. Fix the problems and preview again.');
+  const fileName = str(req.body.file_name, 200);
+  const made = db.transaction(() => {
+    const teamIds = new Map();
+    for (const name of plan.new_teams) {
+      const t = db.prepare('INSERT INTO teams (name) VALUES (?)').run(name).lastInsertRowid;
+      teamIds.set(name.toLowerCase(), t);
+      audit(req, 'team_created', { target: { type: 'team', id: t, name }, details: `created by the import of ${fileName || 'a file'}` });
+    }
+    const queue = db.prepare('INSERT INTO welcome_queue (user_id, queued_by) VALUES (?,?)');
+    const ids = [];
+    for (const r of good) {
+      const team_id = r.team ? (r.team_id || teamIds.get(r.team.toLowerCase())) : null;
+      const p = insertPerson({ name: r.name, email: r.email, role: r.role, team_id, hash: UNUSABLE_HASH(), managedIds: r.role === 'team_manager' ? [team_id] : null,
+        how: `imported from ${fileName || 'a file'}; welcome email queued` }, req);
+      queue.run(p.id, req.user.id);
+      ids.push(p.id);
+    }
+    return { ids, teams: plan.new_teams.length };
+  })();
+  syncTeamChats(); // once for the whole import
+  const skipped = plan.rows.length - good.length;
+  audit(req, 'people_imported', { details: `${fileName || 'file'}: ${made.ids.length} people created, ${skipped} rows skipped, ${made.teams} teams created; ${made.ids.length} welcome emails queued` });
+  console.log(`[import] ${req.user.name} imported ${made.ids.length} people (${skipped} rows skipped, ${made.teams} teams created)`);
+  setImmediate(drainWelcome);
+  res.json({ created: made.ids.length, skipped, teams_created: made.teams, eta: welcomeEta(made.ids.length) });
+});
+
+// Welcome emails for imported people go out gradually, so the mail provider's limits are respected (EMAIL_PER_MINUTE
+// paces every email; EMAIL_WELCOME_PER_DAY, default 400, 0 = no cap, limits welcome emails in any 24 hours). A few at a
+// time are handed to the mail queue; the set-password link is made at that moment (its 48 hours start when it is sent).
+// The list lives in the database, so a restart loses nothing. After a failed send (3 tries) it waits 30 minutes and tries
+// again, up to 5 times; a provider "limit reached" answer pauses all email for an hour (mailer.js).
+const WELCOME_PER_DAY = (n => Number.isFinite(n) && n >= 0 ? Math.round(n) : 400)(process.env.EMAIL_WELCOME_PER_DAY === undefined || process.env.EMAIL_WELCOME_PER_DAY === '' ? NaN : Number(process.env.EMAIL_WELCOME_PER_DAY));
+const WELCOME_INFLIGHT = 3, WELCOME_TRIES = 5;
+const WELCOME_RETRY_SQL = process.env.EMAIL_DRY_RUN === '1' && process.env.EMAIL_TEST_SPEED === '1' ? '+2 seconds' : '+30 minutes'; // (the test switch is in mailer.js)
+const WQ_OPEN = 'sent_at IS NULL AND failed_at IS NULL';
+function welcomeEta(n) {
+  const perMin = mailer.status().per_minute;
+  return WELCOME_PER_DAY && n > WELCOME_PER_DAY ? `about ${Math.ceil(n / WELCOME_PER_DAY)} days (at most ${WELCOME_PER_DAY} a day)` : `about ${Math.max(1, Math.ceil(n / perMin))} ${Math.max(1, Math.ceil(n / perMin)) === 1 ? 'minute' : 'minutes'} (${perMin} a minute)`;
+}
+function welcomeStatus() {
+  const c = sql => db.prepare(sql).get().n;
+  return { waiting: c(`SELECT COUNT(*) n FROM welcome_queue WHERE ${WQ_OPEN}`), sent_24h: c(`SELECT COUNT(*) n FROM welcome_queue WHERE sent_at > datetime('now','-24 hours')`),
+    failed: c('SELECT COUNT(*) n FROM welcome_queue WHERE failed_at IS NOT NULL'), per_day: WELCOME_PER_DAY };
+}
+let draining = false;
+function drainWelcome() {
+  if (draining || !mailer.enabled()) return;
+  draining = true;
+  try {
+    if (mailer.status().paused_until) return;
+    const inflight = db.prepare(`SELECT COUNT(*) n FROM welcome_queue WHERE handed_at IS NOT NULL AND ${WQ_OPEN}`).get().n;
+    let budget = WELCOME_INFLIGHT - inflight;
+    if (WELCOME_PER_DAY) budget = Math.min(budget, WELCOME_PER_DAY - db.prepare(`SELECT COUNT(*) n FROM welcome_queue WHERE sent_at > datetime('now','-24 hours')`).get().n - inflight);
+    if (budget <= 0) return;
+    const rows = db.prepare(`SELECT w.user_id, w.queued_by FROM welcome_queue w WHERE w.handed_at IS NULL AND ${WQ_OPEN} AND w.next_at <= datetime('now')
+      ORDER BY w.queued_at, w.user_id LIMIT ?`).all(budget);
+    for (const w of rows) {
+      const user = db.prepare('SELECT * FROM users WHERE id = ?').get(w.user_id);
+      // Gone, deactivated, or they already have a password (set another way): nothing to send.
+      if (!user || !user.active || user.removed_at || !String(user.password_hash).startsWith('!')) { db.prepare('DELETE FROM welcome_queue WHERE user_id = ?').run(w.user_id); continue; }
+      db.prepare(`UPDATE welcome_queue SET handed_at = datetime('now') WHERE user_id = ?`).run(w.user_id);
+      const by = w.queued_by ? db.prepare('SELECT id, name FROM users WHERE id = ?').get(w.queued_by) : null;
+      sendWelcome(user, by, result => {
+        setImmediate(drainWelcome); // one slot is free again: refill at once, so the pace is the mail pace, not the 10 s timer
+        if (result.ok) return db.prepare(`UPDATE welcome_queue SET sent_at = datetime('now'), last_error = NULL WHERE user_id = ?`).run(w.user_id);
+        const tries = db.prepare('SELECT attempts FROM welcome_queue WHERE user_id = ?').get(w.user_id);
+        if (!tries) return;
+        if (tries.attempts + 1 >= WELCOME_TRIES) db.prepare(`UPDATE welcome_queue SET failed_at = datetime('now'), attempts = attempts + 1, last_error = ? WHERE user_id = ?`).run(String(result.error).slice(0, 300), w.user_id);
+        else db.prepare(`UPDATE welcome_queue SET handed_at = NULL, attempts = attempts + 1, next_at = datetime('now','${WELCOME_RETRY_SQL}'), last_error = ? WHERE user_id = ?`).run(String(result.error).slice(0, 300), w.user_id);
+      });
+    }
+  } catch (e) { console.error('[welcome] drain failed:', e.message); }
+  finally { draining = false; }
+}
+// A restart loses the mail queue (it is in memory): anything handed over but not sent goes back in line.
+db.prepare(`UPDATE welcome_queue SET handed_at = NULL WHERE handed_at IS NOT NULL AND ${WQ_OPEN}`).run();
+setInterval(drainWelcome, 10e3).unref();
+setTimeout(drainWelcome, 3e3).unref();
 
 // Resend the welcome email: a new "Set your password" link (48 h); earlier links stop working. Same rule as editing the person.
 app.post('/api/users/:id/welcome', auth, ownerFirst('resend the welcome email (a new password link)'), requireBoss, (req, res) => {
@@ -2609,7 +2780,7 @@ const AUDIT_ACTIONS = ['sign_in', 'sign_in_failed', 'account_locked', 'signed_ou
   'password_reset', 'password_set_by_manager', 'welcome_resent', 'person_added', 'person_edited', 'role_changed', 'team_changed', 'lead_changed',
   'managed_teams_changed', 'team_leads_changed', 'team_managers_changed', 'team_deleted', 'protection_changed', 'account_activated',
   'account_deactivated', 'person_removed', 'person_restored', '2fa_enabled', '2fa_disabled', '2fa_recovery_codes_renewed', '2fa_reset',
-  'virus_blocked', 'file_downloaded', 'history_exported', 'audit_exported'];
+  'people_imported', 'team_created', 'virus_blocked', 'file_downloaded', 'history_exported', 'audit_exported'];
 function auditWhere(q) {
   const where = [], params = [];
   if (DATE_RE.test(String(q.from || ''))) { where.push(`date(at, 'localtime') >= ?`); params.push(q.from); }

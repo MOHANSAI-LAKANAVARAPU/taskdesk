@@ -405,3 +405,8 @@ details.group[open] > summary::before{transform:rotate(90deg)}
 .qr-box svg{width:200px;height:200px;border:1px solid var(--line);border-radius:8px}
 .secret-key{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9375rem;letter-spacing:.04em;word-break:break-all;margin:8px 0 4px}
 .codes{list-style:none;padding:0;margin:10px 0 14px;display:grid;grid-template-columns:repeat(2,minmax(0,max-content));gap:6px 24px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9375rem}
+/* Bulk import of people (Scale) */
+dialog.wide{width:min(1000px,calc(100% - 24px))}
+.import-table{font-size:.8125rem}
+.import-table th,.import-table td{padding:6px 8px;vertical-align:top}
+.import-table tr[hidden]{display:none}

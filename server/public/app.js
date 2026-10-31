@@ -968,6 +968,57 @@
   const canRemovePerson = u => !!u && me.role === 'admin' && u.id !== me.id && !u.removed && !u.protected && !u.locked;
   // "Remove person": the server counts their records first. None → the account is deleted; otherwise it is kept for
   // History, marked "(removed)", signed out, taken out of teams, lead roles and group/team chats, and its email freed.
+  // Bulk import (admins and managers): choose a file -> preview with the problems per row -> import. Nothing is created
+  // before the second button. The server re-checks every row when importing.
+  function importPeople() {
+    const step = (html, onSubmit) => {
+      modalForm.innerHTML = html + '<p class="err" id="mErr"></p>';
+      modalForm.onsubmit = async e => {
+        if (e.submitter && e.submitter.value === 'cancel') return;
+        e.preventDefault();
+        const btn = modalForm.querySelector('[type=submit]:not([value=cancel])'); btn && (btn.disabled = true);
+        try { await onSubmit(new FormData(modalForm)); } catch (err) { $('#mErr').textContent = err.message; } finally { btn && (btn.disabled = false); }
+      };
+    };
+    const chooseFile = () => step(`<h2 style="font-size:1.25rem">Import people from Excel or CSV</h2>
+      <p>One row per person, with the columns <b>name, email, team, role</b>. Role is employee, lead, team_manager or manager (a team manager manages the team in their row; no role means employee).
+        <a href="/api/users/import/template" download>Download the template</a>.</p>
+      <label class="f"><span>File (.xlsx or .csv, up to 2 MB, 2000 people)</span><input type="file" name="file" accept=".xlsx,.csv,text/csv" required></label>
+      <label class="check-row"><input type="checkbox" name="create_missing_teams"> Create missing teams</label>
+      <p class="muted" style="font-size:.875rem">Nothing is created yet: you see a preview first. People who already have an account are skipped. Everyone new gets a welcome email with a link to set their password, sent gradually.</p>
+      ${modalActions('Preview')}`, async fd => {
+      const f = modalForm.querySelector('[name=file]').files[0];
+      if (!f) throw new Error('Choose a file.');
+      const body = new FormData(); body.append('file', f); body.append('create_missing_teams', fd.get('create_missing_teams') ? '1' : '0');
+      showPreview(await api('/users/import/preview', { method: 'POST', body }), !!fd.get('create_missing_teams'));
+    });
+    const showPreview = (d, createTeams) => {
+      const c = d.counts, bad = c.problems > 0;
+      const status = r => r.ok ? `<span style="color:var(--s-done)">✓ Ready</span>${r.warnings.map(w => `<br><span class="muted">${esc(w)}</span>`).join('')}` : r.problems.map(p => `<span class="err-inline">✗ ${esc(p)}</span>`).join('<br>');
+      step(`<h2 style="font-size:1.25rem">Preview: ${esc(d.file_name || 'file')}</h2>
+        ${d.email_enabled ? '' : '<p class="err-note">Email isn’t set up on the server, so people can’t be imported (they need a welcome email).</p>'}
+        <p><b>${c.ok}</b> of ${c.total} rows are ready to import${bad ? `, <b class="err-inline">${c.problems}</b> have problems and will be skipped` : ''}.${d.new_teams.length ? ` New teams: <b>${d.new_teams.map(esc).join(', ')}</b>.` : ''}</p>
+        ${bad ? '<label class="check-row"><input type="checkbox" id="onlyBad" checked> Show only the rows with problems</label>' : ''}
+        <div class="card table-wrap" style="max-height:45vh;overflow:auto;margin-bottom:12px"><table class="import-table"><thead><tr><th>Row</th><th>Name</th><th>Email</th><th>Team</th><th>Role</th><th>Check</th></tr></thead>
+          <tbody>${d.rows.map(r => `<tr data-ok="${r.ok ? 1 : 0}"><td>${r.line}</td><td>${esc(r.name)}</td><td>${esc(r.email)}</td><td>${esc(r.team)}${r.team_new ? ' <span class="muted">(new)</span>' : ''}</td><td>${esc(r.role)}</td><td>${status(r)}</td></tr>`).join('')}</tbody></table></div>
+        <div class="modal-actions"><button class="btn ghost" type="button" id="impBack">Back</button><button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+          <button class="btn" type="submit"${c.ok && d.email_enabled ? '' : ' disabled'}>Import ${c.ok} ${c.ok === 1 ? 'person' : 'people'}</button></div>`, async () => {
+        const r = await api('/users/import/commit', { method: 'POST', body: { create_missing_teams: createTeams, file_name: d.file_name,
+          rows: d.rows.map(({ line, name, email, team, role }) => ({ line, name, email, team, role })) } });
+        step(`<h2 style="font-size:1.25rem">Import finished</h2>
+          <p class="ok-note" role="status" style="margin-top:0">${r.created} ${r.created === 1 ? 'person was' : 'people were'} created${r.teams_created ? ` and ${r.teams_created} ${r.teams_created === 1 ? 'team' : 'teams'}` : ''}${r.skipped ? `; ${r.skipped} ${r.skipped === 1 ? 'row was' : 'rows were'} skipped` : ''}.</p>
+          <p>Welcome emails go out gradually, ${esc(r.eta)}. Each link works for 48 hours from the moment it is sent. Admins can follow the progress under Your account → Email settings.</p>
+          <div class="modal-actions"><button class="btn" type="submit">Done</button></div>`, async () => { modal.close(); router(); });
+      });
+      const filter = () => { const only = $('#onlyBad') && $('#onlyBad').checked; modalForm.querySelectorAll('tbody tr').forEach(tr => { tr.hidden = !!only && tr.dataset.ok === '1'; }); };
+      if ($('#onlyBad')) { $('#onlyBad').onchange = filter; filter(); }
+      $('#impBack').onclick = chooseFile;
+    };
+    modal.classList.add('wide');
+    modal.addEventListener('close', () => modal.classList.remove('wide'), { once: true });
+    chooseFile();
+    modal.showModal();
+  }
   async function removePerson(u) {
     let r;
     try { r = await api(`/users/${u.id}/removal`); } catch (e) { toast(e.message); return; }
@@ -1006,7 +1057,7 @@
       && (!text || u.name.toLowerCase().includes(text) || u.email.toLowerCase().includes(text)));
     app.innerHTML = `
       <div class="page-head"><div><h1>${isBoss() ? 'All people' : 'People in your teams'}</h1><p>${list.length} of ${users.length} people. ${isBoss() ? 'Add people and choose their team. A team lead added to a team becomes one of its leads.' : 'The people in the teams you manage. Add or remove members and set leads on each team’s page.'}</p></div>
-        <div class="inline-actions">${teamsViewSwitch(true)}${isBoss() ? '<button class="btn" id="newUser">Add a person</button>' : ''}</div></div>
+        <div class="inline-actions">${teamsViewSwitch(true)}${isBoss() ? '<button class="btn ghost" id="importPeople">Import from Excel/CSV</button><button class="btn" id="newUser">Add a person</button>' : ''}</div></div>
       <div class="filters">
         <input type="search" id="pSearch" class="search" placeholder="Search name or email" aria-label="Search people" value="${esc(q.get('q') || '')}">
         <select id="pTeam" aria-label="Filter by team"><option value="">All teams</option>${isBoss() ? `<option value="none"${team === 'none' ? ' selected' : ''}>No team</option>` : ''}
@@ -1029,6 +1080,7 @@
     $('#pRole').onchange = e => go({ role: e.target.value });
     $('#pStatus').onchange = e => go({ status: e.target.value });
     if ($('#newUser')) $('#newUser').onclick = () => personForm(null, teams);
+    if ($('#importPeople')) $('#importPeople').onclick = importPeople;
     app.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => personForm(byId[b.dataset.edit], teams));
     app.querySelectorAll('[data-removep]').forEach(b => b.onclick = () => removePerson(byId[b.dataset.removep]));
     app.querySelectorAll('[data-restore]').forEach(b => b.onclick = () => restorePerson(byId[b.dataset.restore]));
@@ -1390,7 +1442,7 @@
     account_activated: 'Account activated', account_deactivated: 'Account deactivated', person_removed: 'Person removed', person_restored: 'Person restored',
     '2fa_enabled': 'Two-step verification turned on', '2fa_disabled': 'Two-step verification turned off', '2fa_recovery_codes_renewed': 'New recovery codes',
     '2fa_reset': 'Two-step verification reset by an admin',
-    virus_blocked: 'Upload blocked by the virus scanner',
+    virus_blocked: 'Upload blocked by the virus scanner', people_imported: 'People imported (Excel/CSV)', team_created: 'Team created',
     file_downloaded: 'File downloaded', history_exported: 'History exported (CSV)', audit_exported: 'Audit log exported (CSV)' };
   async function viewAudit() {
     if (me.role !== 'admin') { app.innerHTML = `<div class="empty">Only admins can see the audit log.</div>`; return; }
@@ -1581,6 +1633,8 @@
       <table class="kv">${row('Server', esc(`${st.host || '—'}:${st.port || '—'}`) + (st.ssl ? ' (SSL)' : ''))}${row('Sign-in', esc(st.user || '—'))}
         ${row('App password', st.password_set ? 'Set' : '<span class="warn-text">Missing</span>')}${row('Sender', esc(st.from))}${row('Links open', esc(st.app_url || '—'))}
         ${row('Sent since start', `${st.sent}${st.waiting ? ` · ${st.waiting} waiting` : ''}${st.failed ? ` · ${st.failed} failed` : ''}`)}
+        ${row('Pace', `${st.per_minute} a minute${st.paused_until ? ` · <span class="warn-text" style="margin:0">paused until ${esc(fmtDateTime(st.paused_until))} (the mail server said a limit was reached)</span>` : ''}`)}
+        ${st.welcome && (st.welcome.waiting || st.welcome.failed || st.welcome.sent_24h) ? row('Welcome emails (import)', `${st.welcome.waiting} waiting · ${st.welcome.sent_24h} sent in the last 24 hours${st.welcome.per_day ? ` (at most ${st.welcome.per_day} a day)` : ''}${st.welcome.failed ? ` · <span class="err-inline">${st.welcome.failed} failed</span> (resend from the person’s Edit form)` : ''}`) : ''}
         ${row('Last error', st.last_error ? `<span class="err-inline">${esc(st.last_error.reason)}</span><br><span class="muted">${fmtDateTime(st.last_error.at)} · to ${esc(st.last_error.to)} · “${esc(st.last_error.subject)}”</span>` : '<span class="muted">None</span>')}</table>
       <div class="inline-actions" style="margin-top:12px"><button class="btn" id="testEmail"${st.configured ? '' : ' disabled'}>Send test email to ${esc(me.email)}</button></div>
       ${result ? `<p class="${result.ok ? 'ok-note' : 'err-note'}" role="status" id="testResult">${result.ok ? `Sent to ${esc(result.to)}. Check your inbox.` : `Not sent: ${esc(result.error)}`}</p>` : ''}`;

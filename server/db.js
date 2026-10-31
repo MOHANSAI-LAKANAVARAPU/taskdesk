@@ -370,6 +370,10 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   // set up), encrypted with a key derived from master.key; totp_enabled_at: when it was turned on; totp_last_step: the
   // last 30-second step used, so a code works only once. recovery_codes: SHA-256 of the 10 one-time codes.
   // login_challenges: the step between password and code (SHA-256 of a random ticket, 5 minutes).
+  // welcome_queue (Scale: bulk import): people added by an import whose welcome email hasn't gone out yet. A drain loop in
+  // server.js hands a few at a time to the mail queue at the configured rate; the set-password link is made at that
+  // moment, so its 48 hours start when it is sent. handed_at = given to the mail queue, sent_at = delivered,
+  // failed_at = gave up after 5 tries. Survives restarts.
   // sessions.needs_2fa_setup: an admin/manager signed in without 2-step verification; the session can only set it up.
   {
     const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
@@ -384,6 +388,18 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
         used_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON recovery_codes(user_id);
+      CREATE TABLE IF NOT EXISTS welcome_queue (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        queued_by INTEGER,
+        queued_at TEXT NOT NULL DEFAULT (datetime('now')),
+        next_at TEXT NOT NULL DEFAULT (datetime('now')),
+        handed_at TEXT,
+        sent_at TEXT,
+        failed_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_welcome_queue_todo ON welcome_queue(sent_at, failed_at, next_at);
       CREATE TABLE IF NOT EXISTS login_challenges (
         token_hash TEXT PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
