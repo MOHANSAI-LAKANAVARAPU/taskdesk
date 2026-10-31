@@ -1,6 +1,7 @@
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
+const { pipeline } = require('stream/promises');
 const multer = require('multer');
 const express = require('express');
 const cookieParser = require('cookie-parser');
@@ -13,6 +14,8 @@ try { MASTER_KEY = keys.loadMasterKey(); console.log(`[keys] master.key loaded f
 catch (e) { console.error('[keys] ' + e.message); process.exit(1); }
 const db = require('./db');
 const mailer = require('./mailer');
+const filecrypt = require('./filecrypt');
+filecrypt.init(MASTER_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -270,15 +273,26 @@ function sniffBytes(b) {
   if (b.length >= 5 && b.slice(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
   return 'application/octet-stream';
 }
+// Stored files are encrypted (filecrypt.js): the type is read from the decrypted first bytes.
 function sniffFile(file) {
-  let fd;
-  try { fd = fs.openSync(file, 'r'); const b = Buffer.alloc(16); return sniffBytes(b.slice(0, fs.readSync(fd, b, 0, 16, 0))); }
-  catch (e) { return 'application/octet-stream'; }
-  finally { if (fd !== undefined) fs.closeSync(fd); }
+  try { return sniffBytes(filecrypt.readHead(file, 16)); } catch (e) { return 'application/octet-stream'; }
 }
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// Uploads are encrypted while they arrive (Security A2), so no plain copy ever reaches the disk. The storage engine
+// gives multer: filename (random), path, size (plain bytes) and mime (from the first plain bytes).
+const encryptedStorage = {
+  _handleFile(req, file, cb) {
+    const filename = crypto.randomBytes(16).toString('hex'), dest = path.join(UPLOAD_DIR, filename);
+    let size = 0, head = Buffer.alloc(0);
+    file.stream.on('data', d => { size += d.length; if (head.length < 16) head = Buffer.concat([head, d.subarray(0, 16 - head.length)]); });
+    pipeline(file.stream, filecrypt.encryptStream(), fs.createWriteStream(dest, { flags: 'wx', mode: 0o600 }))
+      .then(() => cb(null, { filename, path: dest, size, mime: sniffBytes(head) }))
+      .catch(err => fs.unlink(dest, () => cb(err)));
+  },
+  _removeFile(req, file, cb) { fs.unlink(file.path, () => cb(null)); }
+};
 const upload = multer({
-  storage: multer.diskStorage({ destination: UPLOAD_DIR, filename: (req, file, cb) => cb(null, crypto.randomBytes(16).toString('hex')) }),
+  storage: encryptedStorage,
   limits: { fileSize: MAX_FILE_MB * 1024 * 1024, files: 5, fields: 20, fieldSize: 64 * 1024, parts: 30 }
 });
 function cleanFileName(name) {
@@ -313,7 +327,7 @@ function saveUploads(req, link) {
     VALUES (?,?,?,?,?,?,?,?,?)`);
   for (const f of req.files || []) {
     const name = cleanFileName(f.originalname);
-    ins.run(name, f.filename, f.size, sniffFile(f.path),
+    ins.run(name, f.filename, f.size, f.mime,
       req.user.id, link.task_id || null, link.update_id || null, link.request_id || null, link.message_id || null);
   }
 }
@@ -323,7 +337,7 @@ function saveSharedUploads(req, links) {
   const ins = db.prepare('INSERT INTO files (original_name, stored_name, size, mime, uploaded_by) VALUES (?,?,?,?,?)');
   const link = db.prepare('INSERT INTO task_files (file_id, task_id, update_id) VALUES (?,?,?)');
   for (const f of req.files || []) {
-    const id = ins.run(cleanFileName(f.originalname), f.filename, f.size, sniffFile(f.path), req.user.id).lastInsertRowid;
+    const id = ins.run(cleanFileName(f.originalname), f.filename, f.size, f.mime, req.user.id).lastInsertRowid;
     for (const l of links) link.run(id, l.task_id, l.update_id);
   }
 }
@@ -2477,15 +2491,20 @@ app.get('/api/files/:id', auth, (req, res) => {
   const type = sniffFile(file);
   inline = inline && IMAGE_MIME.includes(type);
   res.set({ 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store', 'Content-Security-Policy': "default-src 'none'; sandbox" });
-  if (inline) {
-    res.set({ 'Cache-Control': 'private, max-age=86400' });
-    res.type(type);
-    return res.sendFile(file, err => { if (err && !res.headersSent) bad(res, 'File not found.', 404); });
+  if (!fs.existsSync(file)) return bad(res, 'File not found.', 404);
+  if (inline) res.set({ 'Cache-Control': 'private, max-age=86400' });
+  else {
+    res.attachment(f.original_name);
+    audit(req, 'file_downloaded', { target: { type: 'file', id: f.id, name: f.original_name },
+      details: f.message_id ? `chat message #${f.message_id}` : f.task_id ? `task #${f.task_id}` : f.request_id ? `request #${f.request_id}` : 'shared assignment file' });
   }
-  audit(req, 'file_downloaded', { target: { type: 'file', id: f.id, name: f.original_name },
-    details: f.message_id ? `chat message #${f.message_id}` : f.task_id ? `task #${f.task_id}` : f.request_id ? `request #${f.request_id}` : 'shared assignment file' });
-  res.download(file, f.original_name, { headers: { 'Content-Type': type } }, err => {
-    if (err && !res.headersSent) bad(res, 'File not found.', 404);
+  res.type(type);
+  res.set('Content-Length', String(f.size)); // the plain size, checked against every file when they were encrypted
+  // Decrypted on the fly (filecrypt.js). If the file is damaged the transfer stops with an error rather than finishing.
+  pipeline(fs.createReadStream(file), filecrypt.decryptStream(), res).catch(err => {
+    if (err.code === 'ERR_STREAM_PREMATURE_CLOSE') return; // the browser stopped the download
+    console.error(`[files] file ${f.id} could not be sent: ${err.message}`);
+    if (!res.headersSent) bad(res, 'This file can’t be read.', 500); else res.destroy();
   });
 });
 
