@@ -108,6 +108,14 @@ Other rules: a user cannot deactivate themself; only admins can create admins or
 - `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`.
 - **The `sid` cookie is `HttpOnly; SameSite=Strict`** (plus `Secure` with `COOKIE_SECURE=true`). Links from emails still open signed in: the page itself loads without the cookie, and its own API calls are same-site. The desktop app sends the cookie itself, so SameSite doesn't affect it.
 
+**CSRF (Security A1).** Every POST/PUT/PATCH/DELETE to `/api`:
+- is refused (403 "Cross-site request refused.") when the browser's `Origin` header names another site;
+- with a session cookie, needs the header `X-CSRF-Token` = `csrfFor(sid)`, an HMAC of the session token. No storage; it changes with every sign-in. Without it: 403 `{ code: 'csrf' }` "This page is out of date…".
+- The page gets the token from `/api/me` and `/api/login` (`csrf_token`). `api()` sends it on every change, and on a `csrf` 403 refetches `/api/me` and retries once.
+- **Exempt from the token** (no session): `/api/login`, `/api/password/forgot`, `/api/password/set`. The Origin check still blocks sign-in from another site's page.
+- **The desktop app:** its own calls are GETs only (`/api/me`, `/api/version`, `/api/my-summary`, `/api/stream`), and its window runs the web app, so it needed no change.
+- **New code that changes something** must go through `api()` or send the header.
+
 **Owner and protected accounts** (backup `../backups/taskdesk-before-owner-2026-10-29.*`):
 
 The owner:

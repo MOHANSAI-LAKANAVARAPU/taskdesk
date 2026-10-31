@@ -29,6 +29,26 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
+// CSRF (Security A1). Every POST/PUT/PATCH/DELETE to /api:
+// - is refused when the browser's Origin header names another site;
+// - with a session cookie, must carry X-CSRF-Token = csrfFor(session token), which the page gets from /api/me and
+//   /api/login (the web app, also inside the desktop app's window, sends it on every change). Sign-in, "Forgot
+//   password" and set-password links have no session and are exempt from the token (the Origin check still applies).
+// The desktop app's own calls are all GETs (summary, stream, version), so it needs nothing.
+const csrfFor = sid => crypto.createHmac('sha256', String(sid)).update('taskdesk-csrf').digest('base64url');
+const CSRF_EXEMPT = new Set(['/api/login', '/api/password/forgot', '/api/password/set']);
+app.use('/api', (req, res, next) => {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  const origin = req.get('Origin');
+  if (origin) { let host = null; try { host = new URL(origin).host; } catch (e) { /* "null" or junk */ }
+    if (host !== req.get('host')) return res.status(403).json({ error: 'Cross-site request refused.' }); }
+  const sid = req.cookies.sid;
+  if (!sid || CSRF_EXEMPT.has(req.baseUrl + req.path)) return next();
+  const want = Buffer.from(csrfFor(sid)), got = Buffer.from(String(req.get('X-CSRF-Token') || ''));
+  if (got.length !== want.length || !crypto.timingSafeEqual(got, want))
+    return res.status(403).json({ error: 'This page is out of date. Reload it and try again.', code: 'csrf' });
+  next();
+});
 // Pages, script and styles must be revalidated on every load so browsers and the desktop app never run stale code
 // after a server update (ETags keep it cheap: unchanged files answer 304).
 const noCache = res => res.set('Cache-Control', 'no-cache');
@@ -384,7 +404,7 @@ app.post('/api/login', (req, res) => {
   db.prepare(`INSERT INTO sessions (token,user_id,expires_at,last_active_at) VALUES (?,?,datetime('now', ?),datetime('now'))`).run(token, user.id, `+${SESSION_DAYS} days`);
   db.prepare(`DELETE FROM sessions WHERE expires_at < datetime('now')`).run();
   res.cookie('sid', token, { httpOnly: true, sameSite: 'strict', secure: COOKIE_SECURE, maxAge: SESSION_DAYS * 864e5 });
-  res.json({ user: publicUser(user), upload_max_mb: MAX_FILE_MB });
+  res.json({ user: publicUser(user), upload_max_mb: MAX_FILE_MB, csrf_token: csrfFor(token) });
 });
 
 // ---------- password rules ----------
@@ -415,7 +435,7 @@ app.post('/api/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), upload_max_mb: MAX_FILE_MB }));
+app.get('/api/me', auth, (req, res) => res.json({ user: publicUser(req.user), upload_max_mb: MAX_FILE_MB, csrf_token: csrfFor(req.cookies.sid) }));
 
 // Account page: how many other sessions (browsers, the desktop app) are signed in, and "Sign out all other devices".
 const otherSessions = req => db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND token != ? AND expires_at > datetime('now')

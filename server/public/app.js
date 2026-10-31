@@ -42,16 +42,24 @@
     return fd;
   }
 
+  // CSRF token for changes (POST/PUT/PATCH/DELETE), from /api/me and /api/login. A 403 "csrf" (e.g. the server
+  // restarted or the session changed) fetches a fresh one and retries once.
+  let csrf = '';
   async function api(path, opts = {}) {
+    const method = opts.method || 'GET';
     const res = await fetch('/api' + path, {
-      method: opts.method || 'GET',
+      method,
       // background: refreshes the person didn't ask for (they don't count as activity for the 8-hour idle sign-out)
-      headers: { ...(opts.body && !(opts.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...(opts.background ? { 'X-Background': '1' } : {}) },
+      headers: { ...(opts.body && !(opts.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...(opts.background ? { 'X-Background': '1' } : {}),
+        ...(method !== 'GET' ? { 'X-CSRF-Token': csrf } : {}) },
       body: opts.body instanceof FormData ? opts.body : opts.body ? JSON.stringify(opts.body) : undefined,
       credentials: 'same-origin'
     });
     let data = {};
     try { data = await res.json(); } catch (e) { /* empty */ }
+    if (res.status === 403 && data.code === 'csrf' && !opts.retried) {
+      try { const m = await (await fetch('/api/me', { credentials: 'same-origin' })).json(); if (m.csrf_token) { csrf = m.csrf_token; return api(path, { ...opts, retried: true }); } } catch (e) { /* fall through */ }
+    }
     if (res.status === 401 && path !== '/login') { me = null; location.hash = '#/login'; }
     if (!res.ok) throw new Error(data.error || 'Something went wrong. Try again.');
     return data;
@@ -132,7 +140,7 @@
       return page === 'login' ? viewLogin() : page === 'forgot' ? viewForgot() : viewSetPassword();
     }
     if (!me) {
-      try { const r = await api('/me'); me = r.user; uploadMb = r.upload_max_mb || uploadMb; } catch (e) { location.hash = '#/login'; return; }
+      try { const r = await api('/me'); me = r.user; uploadMb = r.upload_max_mb || uploadMb; csrf = r.csrf_token || ''; } catch (e) { location.hash = '#/login'; return; }
     }
     // The old "My team" page (and People for non-managers) is now the Teams page.
     if (route === 'my-team') return location.replace('#/teams');
@@ -180,7 +188,7 @@
       const fd = new FormData(e.target);
       try {
         const r = await api('/login', { method: 'POST', body: { email: fd.get('email'), password: fd.get('password') } });
-        me = r.user; uploadMb = r.upload_max_mb || uploadMb;
+        me = r.user; uploadMb = r.upload_max_mb || uploadMb; csrf = r.csrf_token || '';
         location.hash = '#/';
       } catch (err) { $('#loginErr').textContent = err.message; }
     };
