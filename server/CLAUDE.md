@@ -88,6 +88,11 @@ Other rules: a user cannot deactivate themself; only admins can create admins or
 - Not a common password: `common-passwords.txt` holds the top 1000 of the SecLists "10k most common" list, plus its 51 entries of 10+ characters, since the length rule already stops every top-1000 one. Also refused: such a password with digits or symbols around it (`password123!`, `2024monkey!!`), the same one twice (`dragondragon`), and one repeated character.
 - It can't contain the person's email name: the part before `@` (and before `+`) if it has 3+ characters, or a 4+ character piece of it split at `.`, `_` or `-`.
 
+**Sign-in lockout (Security A1).** 8 failed sign-ins for one email within 15 minutes lock it for 15 minutes. While locked, even the right password gets 429 "Too many attempts. Try again in 15 minutes or use Forgot password."
+- It is stored in the database (`login_failures`, `login_locks`, keyed by the lowercased email, also for unknown emails, so nothing reveals whether an account exists), so a restart doesn't unlock.
+- A successful sign-in clears the failures; using a set-password link (welcome / Forgot password) lifts the lock.
+- The older per-IP limit (in memory: more than 10 attempts from one address in 15 minutes → "Too many sign-in attempts…") is checked first and unchanged.
+
 **Owner and protected accounts** (backup `../backups/taskdesk-before-owner-2026-10-29.*`):
 
 The owner:
@@ -246,6 +251,7 @@ Task status values: `assigned` (shown as "Not started"), `in_progress`, `submitt
 - **users.email_assigned / email_approval / email_ready / email_unassigned / email_notes** (0/1, default 0): the notification emails the person turned on (added with `ALTER TABLE`, backups `../backups/taskdesk-before-email-2026-10-28.*` and, for `email_notes`, `../backups/taskdesk-before-note-notifications-2026-10-29.*`).
 - **users.protected** (0/1, default 0): protected account (see "Owner and protected accounts"); added with `ALTER TABLE`, which set it once for deepith@hifocuscctv.com.
 - **account_events**: id, user_id → users (cascade), actor_id → users (SET NULL; empty for server events), action (`owner_transfer`, `owner_refused`, `protected_refused`, `protection_on`, `protection_off`), detail ("<who> tried to …", "Owner changed from A to B …"), created_at. A person's account activity, index on user_id. Read with `GET /api/users/:id/events`.
+- **login_failures**: email (lowercased), at. One row per failed sign-in; rows older than a day are dropped. **login_locks**: email (PK), locked_until. Account lockout (Security A1, backup `../backups/taskdesk-before-security-a1-2026-10-31.*`).
 - **app_settings**: key (PK), value. `owner_user_id` = the owner at the last start (empty = nobody), used to notice and record a change of owner.
 - **password_tokens**: id, user_id → users (cascade), token_hash (SHA-256, unique), purpose (welcome|reset), created_by → users (SET NULL), created_at, expires_at, used_at. "Set your password" links; the token itself is never stored.
 - **sessions**: token (PK), user_id → users (cascade), expires_at

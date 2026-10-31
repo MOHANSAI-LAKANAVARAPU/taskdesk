@@ -338,6 +338,10 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
     db.exec('ALTER TABLE conversation_members ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0');
   if (!db.prepare('PRAGMA table_info(messages)').all().some(c => c.name === 'system'))
     db.exec('ALTER TABLE messages ADD COLUMN system INTEGER NOT NULL DEFAULT 0');
+  // Sign-in lockout (Security A1): failed sign-ins per email (lowercased, also for unknown emails) and current locks.
+  db.exec(`CREATE TABLE IF NOT EXISTS login_failures (email TEXT NOT NULL, at TEXT NOT NULL DEFAULT (datetime('now')));
+    CREATE INDEX IF NOT EXISTS idx_login_failures_email ON login_failures(email, at);
+    CREATE TABLE IF NOT EXISTS login_locks (email TEXT PRIMARY KEY, locked_until TEXT NOT NULL);`);
 })();
 
 // ---- Roles: users.role has no CHECK constraint any more (server.js validates it on every write) ----

@@ -304,6 +304,31 @@ function rateLimited(ip) {
   return rec.n > 10;
 }
 
+// Account lockout: 8 failed sign-ins for one email within 15 minutes lock it for 15 minutes (even the right password
+// is refused). Kept in the database (login_failures, login_locks), so a restart doesn't unlock. A successful sign-in
+// clears the failures; a set-password link (welcome / Forgot password) also lifts the lock. The per-IP limit above
+// still applies first.
+const LOCK_FAILS = 8, LOCK_MINUTES = 15;
+const LOCKED_MSG = 'Too many attempts. Try again in 15 minutes or use Forgot password.';
+const loginKey = email => String(email || '').trim().toLowerCase().slice(0, 200);
+const isLocked = key => !!db.prepare(`SELECT 1 FROM login_locks WHERE email = ? AND locked_until > datetime('now')`).get(key);
+function recordLoginFailure(key) { // returns true when this failure locks the account
+  return db.transaction(() => {
+    db.prepare('INSERT INTO login_failures (email) VALUES (?)').run(key);
+    const n = db.prepare(`SELECT COUNT(*) AS n FROM login_failures WHERE email = ? AND at > datetime('now', ?)`).get(key, `-${LOCK_MINUTES} minutes`).n;
+    db.prepare(`DELETE FROM login_failures WHERE at < datetime('now', '-1 day')`).run(); // keep the table small
+    if (n < LOCK_FAILS) return false;
+    db.prepare(`INSERT INTO login_locks (email, locked_until) VALUES (?, datetime('now', ?)) ON CONFLICT(email) DO UPDATE SET locked_until = excluded.locked_until`)
+      .run(key, `+${LOCK_MINUTES} minutes`);
+    db.prepare('DELETE FROM login_failures WHERE email = ?').run(key);
+    return true;
+  })();
+}
+function clearLoginFailures(key, unlock) {
+  db.prepare('DELETE FROM login_failures WHERE email = ?').run(key);
+  if (unlock) db.prepare('DELETE FROM login_locks WHERE email = ?').run(key);
+}
+
 function auth(req, res, next) {
   const token = req.cookies.sid;
   if (!token) return bad(res, 'Please sign in.', 401);
@@ -319,9 +344,15 @@ function requireAdmin(req, res, next) { return req.user.role === 'admin' ? next(
 app.post('/api/login', (req, res) => {
   if (rateLimited(req.ip)) return bad(res, 'Too many sign-in attempts. Try again in 15 minutes.', 429);
   const email = str(req.body.email, 200), password = typeof req.body.password === 'string' ? req.body.password : '';
+  const key = loginKey(email);
+  if (isLocked(key)) return bad(res, LOCKED_MSG, 429);
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-  if (!user || !user.active || !bcrypt.compareSync(password, user.password_hash)) return bad(res, 'Email or password is incorrect.', 401);
+  if (!user || !user.active || !bcrypt.compareSync(password, user.password_hash)) {
+    if (recordLoginFailure(key)) { console.log(`[login] account locked for ${LOCK_MINUTES} minutes after ${LOCK_FAILS} failed sign-ins`); return bad(res, LOCKED_MSG, 429); }
+    return bad(res, 'Email or password is incorrect.', 401);
+  }
   loginAttempts.delete(req.ip);
+  clearLoginFailures(key);
   const token = crypto.randomBytes(32).toString('hex');
   db.prepare(`INSERT INTO sessions (token,user_id,expires_at) VALUES (?,?,datetime('now', ?))`).run(token, user.id, `+${SESSION_DAYS} days`);
   db.prepare(`DELETE FROM sessions WHERE expires_at < datetime('now')`).run();
@@ -449,6 +480,7 @@ app.post('/api/password/set', (req, res) => {
     db.prepare(`UPDATE password_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL`).run(t.user_id);
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), t.user_id);
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(t.user_id);
+    clearLoginFailures(loginKey(t.email), true); // a new password lifts a lockout
     return true;
   })();
   if (!ok) return bad(res, DEAD_LINK, 410);
