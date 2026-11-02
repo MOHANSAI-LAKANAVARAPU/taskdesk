@@ -19,6 +19,13 @@ const mailer = require('./mailer');
 const filecrypt = require('./filecrypt');
 filecrypt.init(MASTER_KEY);
 const scanner = require('./scanner');
+const passwords = require('./passwords'); // bcrypt in worker threads, so a sign-in rush doesn't freeze the server (Scale)
+// Async route handlers: an error becomes a clean 500 (an unhandled promise rejection would stop the process).
+const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(e => {
+  if (e && e.code === 'BUSY') return res.status(503).json({ error: e.message });
+  console.error(`[error] ${req.method} ${req.path}:`, e && e.stack || e);
+  if (!res.headersSent) res.status(500).json({ error: 'Something went wrong. Try again.' });
+});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -386,6 +393,29 @@ const personLabel = id => id ? ((db.prepare('SELECT name FROM users WHERE id = ?
 
 // ---------- auth ----------
 const loginAttempts = new Map();
+// Sign-in is async since the password check moved to worker threads (Scale), so two things keep the limits honest:
+// - attempts on the SAME account run one at a time (serialPerKey), so each sees the previous result and the 8-failure lockout
+//   can't be skipped by sending many guesses at once;
+// - the per-address limit counts FAILED attempts only (10 failures from one address within 15 minutes, a successful sign-in
+//   from it starts the count again, as before), plus at most LOGIN_INFLIGHT_MAX sign-ins from one address being checked at
+//   the same moment. A whole office signing in at 9:00 isn't blocked; a flood of guesses is.
+// LOGIN_IP_LIMIT (default 10) can be raised if everybody reaches the server through one address (a proxy or NAT that
+// doesn't pass the client's address on).
+const LOGIN_IP_LIMIT = (n => Number.isFinite(n) && n >= 1 ? Math.round(n) : 10)(Number(process.env.LOGIN_IP_LIMIT));
+const LOGIN_INFLIGHT_MAX = 100, loginInflight = new Map(), loginChains = new Map();
+function ipBlocked(ip) { const r = loginAttempts.get(ip); return !!r && Date.now() <= r.reset && r.n > LOGIN_IP_LIMIT; }
+function ipNoteFailure(ip) {
+  const now = Date.now(), r = loginAttempts.get(ip) || { n: 0, reset: now + 15 * 60e3 };
+  if (now > r.reset) { r.n = 0; r.reset = now + 15 * 60e3; }
+  r.n++; loginAttempts.set(ip, r);
+}
+function serialPerKey(key, fn) {
+  const run = (loginChains.get(key) || Promise.resolve()).then(fn, fn);
+  const tail = run.catch(() => {}); loginChains.set(key, tail);
+  tail.then(() => { if (loginChains.get(key) === tail) loginChains.delete(key); });
+  return run;
+}
+setInterval(() => { const now = Date.now(); for (const [ip, r] of loginAttempts) if (now > r.reset) loginAttempts.delete(ip); }, 10 * 60e3).unref();
 function rateLimited(ip) {
   const now = Date.now();
   const rec = loginAttempts.get(ip) || { n: 0, reset: now + 15 * 60e3 };
@@ -450,15 +480,23 @@ const SETUP_PATHS = new Set(['/api/me', '/api/me/2fa', '/api/me/2fa/setup', '/ap
 function requireBoss(req, res, next) { return isBoss(req.user) ? next() : bad(res, 'Only managers and admins can do this.', 403); }
 function requireAdmin(req, res, next) { return req.user.role === 'admin' ? next() : bad(res, 'Only admins can do this.', 403); }
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', ah(async (req, res) => {
   const email = str(req.body.email, 200), password = typeof req.body.password === 'string' ? req.body.password : '';
   const key = loginKey(email);
   const failed = (reason, user) => audit(req, 'sign_in_failed', { actor: null, target: user ? personTarget(user) : null, details: `${key} (${reason})` });
-  if (rateLimited(req.ip)) { failed('too many attempts from this address'); return bad(res, 'Too many sign-in attempts. Try again in 15 minutes.', 429); }
+  const ip = req.ip;
+  if (ipBlocked(ip) || (loginInflight.get(ip) || 0) >= LOGIN_INFLIGHT_MAX) { failed('too many attempts from this address'); return bad(res, 'Too many sign-in attempts. Try again in 15 minutes.', 429); }
+  loginInflight.set(ip, (loginInflight.get(ip) || 0) + 1);
+  try { return await serialPerKey(key, () => loginAttempt(req, res, { email, password, key, failed })); }
+  finally { const left = (loginInflight.get(ip) || 1) - 1; if (left) loginInflight.set(ip, left); else loginInflight.delete(ip); }
+}));
+// The checks of one sign-in attempt (run one at a time per account, see serialPerKey).
+async function loginAttempt(req, res, { email, password, key, failed }) {
   if (isLocked(key)) { failed('account locked'); return bad(res, LOCKED_MSG, 429); }
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-  if (!user || !user.active || !bcrypt.compareSync(password, user.password_hash)) {
+  if (!user || !user.active || !(await passwords.compare(password, user.password_hash))) {
     failed(!user ? 'unknown email' : !user.active ? 'account deactivated' : 'wrong password', user);
+    ipNoteFailure(req.ip);
     if (recordLoginFailure(key)) {
       console.log(`[login] account locked for ${LOCK_MINUTES} minutes after ${LOCK_FAILS} failed sign-ins`);
       audit(req, 'account_locked', { actor: null, target: user ? personTarget(user) : null, details: `${key}: ${LOCK_FAILS} failed sign-ins within ${LOCK_MINUTES} minutes; locked for ${LOCK_MINUTES} minutes` });
@@ -478,7 +516,7 @@ app.post('/api/login', (req, res) => {
   const setup = needsTwoStep(user);
   audit(req, 'sign_in', { actor: user, target: personTarget(user), details: setup ? 'password only; asked to set up two-step verification' : '' });
   startSession(req, res, user, key, setup);
-});
+}
 function startSession(req, res, user, key, setup) {
   loginAttempts.delete(req.ip);
   clearLoginFailures(key);
@@ -559,16 +597,17 @@ app.post('/api/me/sessions/sign-out-others', auth, (req, res) => {
   res.json({ ok: true, signed_out: n });
 });
 
-app.post('/api/me/password', auth, (req, res) => {
+app.post('/api/me/password', auth, ah(async (req, res) => {
   const { current, next: nextPw } = req.body;
-  if (!bcrypt.compareSync(String(current || ''), req.user.password_hash)) return bad(res, 'Current password is incorrect.');
+  if (!(await passwords.compare(String(current || ''), req.user.password_hash))) return bad(res, 'Current password is incorrect.');
   const problem = passwordProblem(nextPw, req.user.email);
   if (problem) return bad(res, problem);
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(nextPw, 10), req.user.id);
+  const newHash = await passwords.hash(nextPw);
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, req.user.id);
   db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').run(req.user.id, req.cookies.sid);
   audit(req, 'password_changed', { target: personTarget(req.user), details: 'changed on the Account page; other sessions ended' });
   res.json({ ok: true });
-});
+}));
 
 // ---------- two-step verification (Security A2) ----------
 // TOTP (RFC 6238: HMAC-SHA1, 6 digits, 30 seconds, one step either side for clock drift), any authenticator app.
@@ -667,22 +706,22 @@ app.post('/api/me/2fa/enable', auth, (req, res) => {
   res.json({ ok: true, recovery_codes: codes });
 });
 // New recovery codes (the old ones stop working). Needs the password.
-app.post('/api/me/2fa/recovery-codes', auth, (req, res) => {
+app.post('/api/me/2fa/recovery-codes', auth, ah(async (req, res) => {
   if (!req.user.totp_enabled_at) return bad(res, 'Two-step verification is off.', 409);
-  if (!bcrypt.compareSync(String(req.body.password || ''), req.user.password_hash)) return bad(res, 'Password is incorrect.');
+  if (!(await passwords.compare(String(req.body.password || ''), req.user.password_hash))) return bad(res, 'Password is incorrect.');
   const codes = newRecoveryCodes(req.user.id);
   audit(req, '2fa_recovery_codes_renewed', { target: personTarget(req.user), details: `${RECOVERY_COUNT} new recovery codes; the old ones stop working` });
   res.json({ ok: true, recovery_codes: codes });
-});
+}));
 // Turn it off (not for admins and managers, who must keep it). Needs the password.
-app.post('/api/me/2fa/disable', auth, (req, res) => {
+app.post('/api/me/2fa/disable', auth, ah(async (req, res) => {
   if (needsTwoStep(req.user)) return bad(res, 'Admins and managers must keep two-step verification on.', 403);
   if (!req.user.totp_enabled_at) return bad(res, 'Two-step verification is already off.', 409);
-  if (!bcrypt.compareSync(String(req.body.password || ''), req.user.password_hash)) return bad(res, 'Password is incorrect.');
+  if (!(await passwords.compare(String(req.body.password || ''), req.user.password_hash))) return bad(res, 'Password is incorrect.');
   clearTwoStep(req.user.id);
   audit(req, '2fa_disabled', { target: personTarget(req.user), details: 'turned off on the Account page' });
   res.json({ ok: true });
-});
+}));
 function clearTwoStep(userId) {
   db.transaction(() => {
     db.prepare('UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = ?').run(userId);
@@ -760,17 +799,18 @@ app.get('/api/password/check', (req, res) => {
   res.json({ ok: true, purpose: t.purpose, name: t.name });
 });
 // Set the password with a link: single use; ends all of the person's sessions and cancels their other links.
-app.post('/api/password/set', (req, res) => {
+app.post('/api/password/set', ah(async (req, res) => {
   if (overLimit('pwlink-ip:' + req.ip, 60, 15 * 60e3)) return bad(res, 'Too many attempts. Try again in 15 minutes.', 429);
   const password = typeof req.body.password === 'string' ? req.body.password : '';
   const t = liveToken(req.body.token);
   if (!t) return bad(res, DEAD_LINK, 410);
   const problem = passwordProblem(password, t.email);
   if (problem) return bad(res, problem);
+  const newHash = await passwords.hash(password); // off the main thread; the link is only used up (single use) in the transaction below
   const ok = db.transaction(() => {
     if (!db.prepare(`UPDATE password_tokens SET used_at = datetime('now') WHERE id = ? AND used_at IS NULL`).run(t.id).changes) return false;
     db.prepare(`UPDATE password_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL`).run(t.user_id);
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), t.user_id);
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, t.user_id);
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(t.user_id);
     clearLoginFailures(loginKey(t.email), true); // a new password lifts a lockout
     return true;
@@ -779,7 +819,7 @@ app.post('/api/password/set', (req, res) => {
   console.log(`[password] ${t.purpose} link used by user ${t.user_id}; sessions ended`);
   audit(req, 'password_reset', { actor: null, target: { type: 'person', id: t.user_id, name: t.name }, details: `set with a ${t.purpose === 'welcome' ? 'welcome' : 'Forgot password'} link; all sessions ended` });
   res.json({ ok: true });
-});
+}));
 
 // Email settings (admins): what is configured (never the password), the last error, and a test email to themself.
 const emailStatus = () => ({ ...mailer.status(), welcome: welcomeStatus() }); // + the welcome emails still to go out (bulk import)
@@ -961,7 +1001,7 @@ app.post('/api/users', auth, requireBoss, (req, res) => {
   if (!welcome) { const problem = passwordProblem(password, email); if (problem) return bad(res, problem); }
   if (lead_id && !db.prepare(`SELECT 1 FROM users WHERE id = ? AND role IN ('lead','manager','admin')`).get(lead_id)) return bad(res, 'Choose a valid team lead.');
   if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) return bad(res, 'A user with this email already exists.');
-  const made = insertPerson({ name, email, role, lead_id, team_id, hash: bcrypt.hashSync(welcome ? crypto.randomBytes(32).toString('hex') : password, 10), managedIds: managed.ids,
+  const made = insertPerson({ name, email, role, lead_id, team_id, hash: welcome ? UNUSABLE_HASH() : bcrypt.hashSync(password, 10), managedIds: managed.ids,
     how: welcome ? 'welcome email' : 'password set by ' + req.user.name }, req);
   const became_lead = made.became_lead;
   syncTeamChats();
@@ -2829,6 +2869,11 @@ function historyRows(u, q) {
 // (type, id, created_at) of every matching row, newest first, which is cheap; then the full rows, with their
 // per-row look-ups (submitted/approved dates, send-back reasons), for just the page. Returns { rows, total }.
 function historyPage(u, q, limit, offset) {
+  const k = historyKeys(u, q, limit, offset);
+  return { rows: historyRowsFor(u, k.keys), total: k.total };
+}
+// Step 1: the keys (and the total) of the matching rows, newest first. limit = null: all of them (the CSV export).
+function historyKeys(u, q, limit, offset) {
   const person = Number(q.person), team = Number(q.team);
   const f = { task: [], req: [] }, p = { task: [], req: [] };
   if (person) { f.task.push('(t.assignee_id = ? OR t.assigned_by = ?)'); p.task.push(person, person); f.req.push('(t.assignee_id = ? OR t.assigned_by = ? OR r.requested_by = ?)'); p.req.push(person, person, person); }
@@ -2846,14 +2891,18 @@ function historyPage(u, q, limit, offset) {
   const tp = [...ts.params, ...p.task], rp = [...rs.params, ...p.req];
   const total = db.prepare(`SELECT (SELECT COUNT(*) ${T}) + (SELECT COUNT(*) ${R}) AS n`).get(...tp, ...rp).n;
   const keys = db.prepare(`SELECT type, id FROM (SELECT 'task' AS type, t.id AS id, t.created_at AS created_at ${T} UNION ALL SELECT 'request', r.id, r.created_at ${R})
-    ORDER BY created_at DESC, type, id DESC LIMIT ? OFFSET ?`).all(...tp, ...rp, limit, offset);
+    ORDER BY created_at DESC, type, id DESC${limit === null ? '' : ' LIMIT ? OFFSET ?'}`).all(...tp, ...rp, ...(limit === null ? [] : [limit, offset]));
+  return { keys, total };
+}
+// Step 2: the full rows (with their per-row look-ups) for some keys, in the order of the keys.
+function historyRowsFor(u, keys) {
   const ids = type => keys.filter(k => k.type === type).map(k => k.id);
   const tIds = ids('task'), rIds = ids('request');
   const rows = historyFixups(u, [
     ...(tIds.length ? db.prepare(`${HIST_TASK_SELECT} WHERE t.id IN (${tIds.map(() => '?').join(',')})`).all(...tIds) : []),
     ...(rIds.length ? db.prepare(`${HIST_REQ_SELECT} WHERE r.id IN (${rIds.map(() => '?').join(',')})`).all(...rIds) : [])]);
   const at = new Map(rows.map(r => [r.type + '/' + r.id, r]));
-  return { rows: keys.map(k => at.get(k.type + '/' + k.id)), total };
+  return keys.map(k => at.get(k.type + '/' + k.id)).filter(Boolean); // (a row removed meanwhile is left out)
 }
 const STATUS_LABEL = { assigned: 'Not started', in_progress: 'In progress', submitted: 'Waiting for approval', completed: 'Completed',
   needs_team: 'Needs a team', open: 'Open', delivered: 'Delivered', closed: 'Closed', cancelled: 'Cancelled', deleted: 'Deleted' };
@@ -2869,25 +2918,33 @@ function csvCell(v) {
   if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // stop Excel treating text as a formula
   return /[",\r\n;]/.test(s) || s !== s.trim() ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
-app.get('/api/history', auth, (req, res) => {
+app.get('/api/history', auth, ah(async (req, res) => {
   // The page asks for ?limit= (a page at a time); the CSV and old callers get every matching row.
   if (req.query.format !== 'csv' && req.query.limit !== undefined) {
     const { limit, offset } = pageOf(req, 100), h = historyPage(req.user, req.query, limit, offset);
     return res.json({ rows: h.rows, total: h.total, more: offset + h.rows.length < h.total });
   }
-  const rows = historyRows(req.user, req.query);
-  if (req.query.format !== 'csv') return res.json({ rows });
+  if (req.query.format !== 'csv') return res.json({ rows: historyRows(req.user, req.query) });
   const cols = [['Title', r => r.title], ['Type', r => r.type === 'request' ? 'Request' : 'Task'], ['Status', r => STATUS_LABEL[r.status] || r.status],
     ['Team', r => r.team_name], ['Assigned to', r => r.assignee_name], ['Assigned by', r => r.assigned_by_name], ['Requested by', r => r.requested_by_name],
     ['Assigned date', r => localTime(r.assigned_at)], ['Submitted date', r => localTime(r.submitted_at)], ['Approved date', r => localTime(r.approved_at)],
     ['Completed date', r => localTime(r.completed_at)], ['Approved by', r => r.approved_by_name], ['Send-back reasons', r => r.send_back_reasons],
     ['Deleted', r => r.deleted_at ? `Deleted by ${r.deleted_by_name || 'unknown'} on ${localTime(r.deleted_at)}` : '']];
-  const lines = [cols.map(c => csvCell(c[0])).join(',')].concat(rows.map(r => cols.map(c => csvCell(c[1](r))).join(',')));
-  audit(req, 'history_exported', { details: `${rows.length} rows; filters ${JSON.stringify(Object.fromEntries(Object.entries(req.query).filter(([k]) => k !== 'format')))}` });
+  // The CSV is built and sent in batches of 500 rows, giving other requests a turn in between (Scale): one big export of
+  // 36,000 rows used to hold the whole server for about a second. The rows are the same as before (newest first).
+  const keys = historyKeys(req.user, req.query, null, 0);
+  audit(req, 'history_exported', { details: `${keys.total} rows; filters ${JSON.stringify(Object.fromEntries(Object.entries(req.query).filter(([k]) => k !== 'format')))}` });
   res.set('Content-Type', 'text/csv; charset=utf-8');
   res.attachment(`taskdesk-history-${new Date().toISOString().slice(0, 10)}.csv`);
-  res.send('﻿' + lines.join('\r\n') + '\r\n');
-});
+  res.write('﻿' + cols.map(c => csvCell(c[0])).join(',') + '\r\n');
+  for (let i = 0; i < keys.keys.length; i += 500) {
+    const rows = historyRowsFor(req.user, keys.keys.slice(i, i + 500));
+    if (rows.length) res.write(rows.map(r => cols.map(c => csvCell(c[1](r))).join(',')).join('\r\n') + '\r\n');
+    await new Promise(r => setImmediate(r));
+    if (res.destroyed) return; // the person closed the download
+  }
+  res.end();
+}));
 
 // ---------- audit log page (admins only; read and export, nothing else) ----------
 // Filters: from / to (YYYY-MM-DD, local dates), action, q (text in who, target, details or IP). Newest first, 200 per

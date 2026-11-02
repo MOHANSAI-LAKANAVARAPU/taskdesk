@@ -370,6 +370,15 @@ CREATE INDEX IF NOT EXISTS idx_updates_task ON task_updates(task_id);
   // set up), encrypted with a key derived from master.key; totp_enabled_at: when it was turned on; totp_last_step: the
   // last 30-second step used, so a code works only once. recovery_codes: SHA-256 of the 10 one-time codes.
   // login_challenges: the step between password and code (SHA-256 of a random ticket, 5 minutes).
+  // Scale: /api/my-summary (the desktop app, once a minute per person) asks for notes and files added in the last 3 days. With
+  // no index on the date it read all of task_updates (36 of the 37 ms the call took on 65,000 rows). This small partial
+  // index covers exactly those rows (only updates with a note or files).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_updates_notes ON task_updates(created_at) WHERE note_kind IS NOT NULL`);
+  // Same call, second query: "tasks waiting for my approval" (reviewScope) starts from status = 'submitted'. With no index
+  // on the status it walked every user and then every task (13 ms for each person on every poll, 35,000 tasks). This partial
+  // index holds only the submitted tasks, in the order the query wants them (1.3 ms). Also used by the Tasks "waiting for my
+  // approval" filter and the dashboard's approvals.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_submitted ON tasks(submitted_at) WHERE status = 'submitted'`);
   // welcome_queue (Scale: bulk import): people added by an import whose welcome email hasn't gone out yet. A drain loop in
   // server.js hands a few at a time to the mail queue at the configured rate; the set-password link is made at that
   // moment, so its 48 hours start when it is sent. handed_at = given to the mail queue, sent_at = delivered,
