@@ -1,7 +1,7 @@
 {
   "name": "taskdesk-desktop",
   "productName": "TaskDesk",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "description": "TaskDesk desktop app: shows your assigned tasks and opens the TaskDesk dashboard",
   "main": "main.js",
   "author": {
@@ -14,8 +14,8 @@
   },
   "scripts": {
     "start": "electron .",
-    "dist:linux": "electron-builder --linux AppImage",
-    "dist:win": "electron-builder --win nsis",
+    "dist:linux": "node scripts/build.js linux",
+    "dist:win": "node scripts/build.js win",
     "release": "node scripts/release.js"
   },
   "build": {
@@ -28,7 +28,8 @@
       "setup.html",
       "offline.html",
       "assets/**",
-      "package.json"
+      "package.json",
+      "serverurl.js"
     ],
     "directories": {
       "output": "dist",

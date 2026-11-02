@@ -25,7 +25,7 @@ button:disabled{opacity:.6;cursor:wait}
 <p>Enter the TaskDesk address your manager gave you. You only need to do this once.</p>
 <form id="f">
   <label for="url">Server address</label>
-  <input id="url" placeholder="http://192.168.1.222:3000" spellcheck="false" autocomplete="off">
+  <input id="url" placeholder="http://192.168.1.222:3000 or https://tasks.yourcompany.com" spellcheck="false" autocomplete="off">
   <div class="err" id="err"></div>
   <button id="go">Connect</button>
 </form>
@@ -35,9 +35,9 @@ const url=document.getElementById('url'), err=document.getElementById('err'), go
 window.td.getConfig().then(c=>{ url.value=c.server||''; url.focus(); url.select(); });
 document.getElementById('f').onsubmit=async e=>{
   e.preventDefault(); err.textContent=''; go.disabled=true; go.textContent='Connecting…';
-  let v=url.value.trim(); if(v && !/^https?:\/\//i.test(v)) v='http://'+v;
-  const r=await window.td.testServer(v);
-  if(r.ok){ await window.td.saveServer(v); }
+  // The program decides what the address means (an IP or name without http:// or https://, a trailing /, …) and answers with the exact address.
+  const r=await window.td.testServer(url.value);
+  if(r.ok){ await window.td.saveServer(r.url); }
   else { err.textContent=r.error; go.disabled=false; go.textContent='Connect'; }
 };
 </script>

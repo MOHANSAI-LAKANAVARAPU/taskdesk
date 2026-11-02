@@ -4,8 +4,13 @@ const fs = require('fs');
 const os = require('os');
 const pkg = require('./package.json');
 const { autoUpdater } = require('electron-updater');
+const { normalizeServer, serverFromArgv } = require('./serverurl');
 
+// The address the setup window offers (taskdesk.defaultServer in package.json, or TASKDESK_SERVER when the installer was built:
+// scripts/build.js). PRESET_SERVER is only set when an installer was built for one server on purpose (TASKDESK_SERVER set):
+// a laptop with no address yet then uses it without asking (silent installs, see README "Silent install").
 const DEFAULT_SERVER = (pkg.taskdesk && pkg.taskdesk.defaultServer) || '';
+const PRESET_SERVER = (pkg.taskdesk && pkg.taskdesk.presetServer) || '';
 const POLL_MS = 60 * 1000;
 const WIDGET_SIZE = 104;
 const ICON = path.join(__dirname, 'assets', 'icon.png');
@@ -35,7 +40,12 @@ setupLog();
 console.log(`TaskDesk ${pkg.version} starting (${process.platform}, packaged=${app.isPackaged}, session=${process.env.XDG_SESSION_TYPE || '-'}, args=${process.argv.slice(1).join(' ')})`);
 
 if (!app.requestSingleInstanceLock()) { console.log('Another TaskDesk is already running; exiting.'); app.quit(); }
-else { app.on('second-instance', () => { createWidget(); openDashboard(); }); }
+else { app.on('second-instance', (e, argv) => {
+  // Started again with --server=<address> while running (IT re-pointing a laptop): switch to it and reload.
+  const n = serverFromArgv(argv) ? normalizeServer(serverFromArgv(argv)) : null;
+  if (n && n.url && n.url !== cfg.server) { applyServer(n.url); if (mainWin && !mainWin.isDestroyed()) mainWin.loadURL(cfg.server); schedulePoll(500); }
+  createWidget(); openDashboard();
+}); }
 
 // ---------- config ----------
 let cfgPath;
@@ -49,7 +59,14 @@ function saveConfig() {
   try { fs.mkdirSync(path.dirname(cfgPath), { recursive: true }); fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2)); }
   catch (e) { console.error('Could not save config', e); }
 }
-const cleanUrl = u => String(u || '').trim().replace(/\/+$/, '');
+const cleanUrl = u => normalizeServer(u).url || '';
+// Use this server from now on. Another server means another person's tasks: forget what was "already announced".
+function applyServer(url) {
+  const changed = url !== cfg.server;
+  cfg.server = url;
+  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; cfg.knownRequestIds = null; cfg.knownReadyIds = null; cfg.knownNeedsTeamIds = null; cfg.knownReminderIds = null; cfg.knownAskIds = null; cfg.knownWithdrawnIds = null; cfg.knownNoteIds = null; }
+  saveConfig();
+}
 
 // ---------- windows ----------
 let mainWin = null, widgetWin = null, setupWin = null, tray = null, quitting = false;
@@ -248,23 +265,27 @@ ipcMain.on('widget-menu', () => {
 
 // ---------- setup / offline IPC ----------
 ipcMain.handle('get-config', () => ({ server: cfg.server || DEFAULT_SERVER }));
-ipcMain.handle('test-server', async (e, url) => {
-  url = cleanUrl(url);
-  if (!/^https?:\/\/[^\s/]+/i.test(url)) return { ok: false, error: 'Enter an address that starts with http:// or https://' };
+ipcMain.handle('test-server', async (e, text) => {
+  // The person types whatever they were given (an IP, a name, http:// or https://); serverurl.js decides what it means and the
+  // answer carries the exact address to save.
+  const n = normalizeServer(text);
+  if (n.error) return { ok: false, error: n.error };
+  const url = n.url;
   try {
     const r = await fetch(url + '/api/me', { signal: AbortSignal.timeout(6000) });
     const type = r.headers.get('content-type') || '';
-    if ((r.status === 200 || r.status === 401) && type.includes('json')) return { ok: true };
+    if ((r.status === 200 || r.status === 401) && type.includes('json')) return { ok: true, url };
     return { ok: false, error: 'Something answered at this address, but it isn’t TaskDesk.' };
   } catch (err) {
-    return { ok: false, error: 'Can’t reach this address. Check that you’re on the office network and the address is correct.' };
+    const cert = /cert|ssl|tls/i.test(`${err && err.cause && err.cause.code || ''} ${err && err.cause && err.cause.message || ''} ${err && err.message || ''}`);
+    return { ok: false, error: cert ? 'The address answered, but its security certificate isn’t trusted on this computer. Ask IT.'
+      : 'Can’t reach this address. Check that you’re on the office network and the address is correct.' };
   }
 });
-ipcMain.handle('save-server', (e, url) => {
-  const changed = cleanUrl(url) !== cfg.server;
-  cfg.server = cleanUrl(url);
-  if (changed) { cfg.knownUser = null; cfg.knownTaskIds = []; cfg.knownStatuses = null; cfg.knownApprovalIds = null; cfg.knownRequestIds = null; cfg.knownReadyIds = null; cfg.knownNeedsTeamIds = null; cfg.knownReminderIds = null; cfg.knownAskIds = null; cfg.knownWithdrawnIds = null; }
-  saveConfig();
+ipcMain.handle('save-server', (e, text) => {
+  const n = normalizeServer(text);
+  if (n.error) return false;
+  applyServer(n.url);
   if (setupWin) setupWin.destroy();
   startApp(true);
   return true;
@@ -636,6 +657,12 @@ function startApp(openWindow) {
 
 app.whenReady().then(() => {
   loadConfig();
+  // An address given on the command line (--server=https://tasks.example.com, for IT: README "Silent install") is saved and used.
+  // With no address at all yet, an installer built for one server (TASKDESK_SERVER) uses that one without asking.
+  // Anything else (an address a person chose in setup, a config.json IT put there) is left as it is.
+  const argText = serverFromArgv(process.argv);
+  if (argText) { const n = normalizeServer(argText); if (n.url) applyServer(n.url); else console.error('[config] ignored --server: ' + n.error); }
+  else if (!cfg.server && PRESET_SERVER) { const n = normalizeServer(PRESET_SERVER); if (n.url) applyServer(n.url); }
   Menu.setApplicationMenu(null);
   // Real shutdown / restart / logout: let everything close.
   powerMonitor.on('shutdown', () => { quitting = true; });
