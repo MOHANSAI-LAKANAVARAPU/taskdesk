@@ -71,7 +71,7 @@ app.use(cookieParser());
 //   password" and set-password links have no session and are exempt from the token (the Origin check still applies).
 // The desktop app's own calls are all GETs (summary, stream, version), so it needs nothing.
 const csrfFor = sid => crypto.createHmac('sha256', String(sid)).update('taskdesk-csrf').digest('base64url');
-const CSRF_EXEMPT = new Set(['/api/login', '/api/login/code', '/api/password/forgot', '/api/password/set']);
+const CSRF_EXEMPT = new Set(['/api/login', '/api/login/code', '/api/password/forgot', '/api/password/check', '/api/password/set']);
 app.use('/api', (req, res, next) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
   const origin = req.get('Origin');
@@ -769,7 +769,7 @@ function issueToken(user, purpose, byId) {
     db.prepare(`INSERT INTO password_tokens (user_id, token_hash, purpose, created_by, expires_at) VALUES (?,?,?,?,datetime('now', ?))`)
       .run(user.id, hashToken(token), purpose, byId || null, `+${TOKEN_HOURS[purpose]} hours`);
   })();
-  return mailer.link(`set-password?token=${token}`);
+  return mailer.tokenLink(token); // …/#token=<token>: in the fragment, never in a query string
 }
 // A token that can still be used (not used, not expired, person active and not removed), with its person.
 function liveToken(token) {
@@ -819,9 +819,10 @@ app.post('/api/password/forgot', (req, res) => {
   answer();
 });
 const DEAD_LINK = 'This link has expired or was already used. Ask for a new one with "Forgot password?".';
-app.get('/api/password/check', (req, res) => {
+// The token travels only in a POST body (never in a URL, so no access log, proxy log or WAF log can hold it).
+app.post('/api/password/check', (req, res) => {
   if (overLimit('pwlink-ip:' + req.ip, 60, 15 * 60e3)) return bad(res, 'Too many attempts. Try again in 15 minutes.', 429);
-  const t = liveToken(req.query.token);
+  const t = liveToken(req.body && req.body.token);
   if (!t) return bad(res, DEAD_LINK, 410);
   res.json({ ok: true, purpose: t.purpose, name: t.name });
 });

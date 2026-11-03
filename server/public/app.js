@@ -134,7 +134,8 @@
   $('#logoutBtn').onclick = async () => { closeStream(); await api('/logout', { method: 'POST' }).catch(() => {}); me = null; setChatUnread(0); location.hash = '#/login'; };
 
   async function router() {
-    const route = location.hash.replace(/^#\/?/, '');
+    let route = location.hash.replace(/^#\/?/, '');
+    if (/^token=/.test(route)) route = 'set-password'; // the link from an email: #token=… (the token stays in the fragment, see viewSetPassword)
     // Signed-out pages: sign in, "Forgot password?" and the "Set your password" link from an email.
     const page = route.split('?')[0];
     if (page === 'login' || page === 'forgot' || page === 'set-password') {
@@ -299,17 +300,20 @@
       } catch (err) { $('#fErr').textContent = err.message; btn.disabled = false; }
     };
   }
-  // The link from a welcome or reset email: #/set-password?token=… The token is taken off the address bar once read.
+  // The link from a welcome or reset email is APP_URL/#token=… (older emails: #/set-password?token=…, still accepted). The token
+  // lives in the fragment, which is never sent to a server; the page reads it from location.hash, takes it off the address bar at
+  // once (history.replaceState) and sends it only in a POST body (check, then set).
   let pwToken = '';
   async function viewSetPassword() {
-    const t = new URLSearchParams(location.hash.split('?')[1] || '').get('token');
+    const h = location.hash;
+    const t = /^#token=/.test(h) ? (() => { try { return decodeURIComponent(h.slice('#token='.length).split('&')[0]); } catch (e) { return ''; } })() : new URLSearchParams(h.split('?')[1] || '').get('token');
     if (t) { pwToken = t; history.replaceState(null, '', '#/set-password'); }
     const dead = msg => {
       app.innerHTML = loginCard('This link can’t be used', `<p style="margin-bottom:16px">${esc(msg)}</p><a class="btn" style="width:100%;text-align:center" href="#/forgot">Send a new link</a>`);
     };
     if (!pwToken) return dead('Open the link from your email again. Each link works once.');
     let info;
-    try { info = await api('/password/check?token=' + encodeURIComponent(pwToken)); } catch (err) { return dead(err.message); }
+    try { info = await api('/password/check', { method: 'POST', body: { token: pwToken } }); } catch (err) { return dead(err.message); }
     const welcome = info.purpose === 'welcome';
     app.innerHTML = loginCard(welcome ? 'Set your password' : 'Choose a new password', `
         <p class="muted" style="margin:-6px 0 14px;font-size:.9375rem">${welcome ? `Welcome, ${esc(info.name)}. Choose the password you’ll use to sign in.` : `Hi ${esc(info.name)}. Choose a new password. This signs you out everywhere.`}</p>

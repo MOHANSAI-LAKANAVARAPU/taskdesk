@@ -61,6 +61,8 @@ function reason(err) {
 }
 
 const escHtml = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+// Set-password links keep the token in the URL fragment as #token=…: a fragment is never sent to any server, proxy or log.
+const tokenLink = token => `${cfg.appUrl}/#token=${token}`;
 const link = hashPath => `${cfg.appUrl}/#/${hashPath.replace(/^[#/]+/, '')}`;
 
 // Short HTML (banner, heading, a line or two, one button, footer) plus a plain-text version. All text is escaped here.
@@ -157,4 +159,4 @@ function status() {
 }
 
 console.log(configured || DRY_RUN ? `[email] ready: ${cfg.host}:${cfg.port} ssl=${cfg.secure} as ${cfg.user}${DRY_RUN ? ' (dry run)' : ''}` : '[email] not set up (SMTP_HOST/SMTP_USER/SMTP_PASS missing); emails are off');
-module.exports = { queue, sendNow, status, layout, link, enabled: () => configured || DRY_RUN };
+module.exports = { queue, sendNow, status, layout, link, tokenLink, enabled: () => configured || DRY_RUN };
