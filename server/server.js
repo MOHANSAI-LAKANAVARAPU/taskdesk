@@ -46,6 +46,17 @@ app.use((req, res, next) => {
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()' });
   next();
 });
+// Health check for the load balancer (AWS prep): no sign-in, no data. 200 only when the database opens and answers a query,
+// else 503. Mounted before CSRF, static files, auth and every limiter, and it never writes an audit entry or touches a
+// session, so a check every 30 seconds changes nothing. HEALTH_TEST_FAIL=1 (tests only) makes the database check fail.
+const healthQuery = db.prepare('SELECT COUNT(*) AS n FROM (SELECT 1 FROM users LIMIT 1)'); // reads a table page, so a broken file or key fails
+app.all('/api/health', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (req.method !== 'GET' && req.method !== 'HEAD') return res.status(405).set('Allow', 'GET, HEAD').json({ ok: false });
+  let ok = false;
+  try { if (process.env.HEALTH_TEST_FAIL === '1') throw new Error('test'); ok = Number.isInteger(healthQuery.get().n); } catch (e) { ok = false; }
+  res.status(ok ? 200 : 503).json({ ok });
+});
 app.use('/api/users/import/commit', express.json({ limit: '2mb' })); // up to 2000 rows; every other route keeps 200 KB
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
