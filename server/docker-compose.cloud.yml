@@ -1,0 +1,89 @@
+# TaskDesk on the AWS host (AWS prep). Based on docker-compose.yml and the sprint package's compose-cloud-snippet.
+# Started ONLY by taskdesk-launch (systemd unit taskdesk.service):
+#   docker compose --env-file /dev/null --project-name taskdesk --file docker-compose.cloud.yml up --no-build ...
+# so every setting arrives as an environment variable (from Secrets Manager); there is no env_file and no .env.
+# A variable that is not listed below never reaches the app. Names and defaults: ../aws-sprint/DEV-worksheet.md.
+#
+# Differences from the laptop file:
+#   - the app port is published on the host's loopback only (Nginx on the host is the only way in);
+#   - restart "no" on every service (systemd owns the lifecycle);
+#   - data /srv/taskdesk/data, updates /srv/taskdesk/updates (read-only), keys /run/taskdesk/keys (read-only);
+#   - no `keys` service: in the cloud keys are NEVER generated. TASKDESK_CLOUD=true makes keys.js refuse to start without them;
+#   - the hardening is the same: uid 1000, read-only root, tmpfs /tmp, no capabilities, no new privileges; ClamAV kept.
+# Host folders: /srv/taskdesk/data owned 1000:1000 mode 700; /run/taskdesk/keys root:1000 mode 750, key files 640.
+name: taskdesk
+services:
+  taskdesk:
+    build: .
+    image: taskdesk-taskdesk
+    container_name: taskdesk
+    user: "1000:1000"
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      clamav:
+        condition: service_started   # it needs a few minutes to load; until then uploads are refused (scanner.js), the app and /api/health stay up
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # fixed for the cloud
+      TZ: Asia/Kolkata
+      PORT: "3000"
+      DATA_DIR: /app/data
+      KEYS_DIR: /run/taskdesk/keys
+      TASKDESK_CLOUD: "true"
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
+      # from Secrets Manager (the "env" object); an unset one falls back to the default after ":-"
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      APP_URL: ${APP_URL:-}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      MOVED_TO: ${MOVED_TO:-}
+      OWNER_EMAIL: ${OWNER_EMAIL:-}
+      ADMIN_NAME: ${ADMIN_NAME:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_SECURE: ${SMTP_SECURE:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+      EMAIL_PER_MINUTE: ${EMAIL_PER_MINUTE:-10}
+      EMAIL_WELCOME_PER_DAY: ${EMAIL_WELCOME_PER_DAY:-400}
+      LOGIN_IP_LIMIT: ${LOGIN_IP_LIMIT:-10}
+      PASSWORD_WORKERS: ${PASSWORD_WORKERS:-}
+    volumes:
+      - /srv/taskdesk/data:/app/data
+      - /srv/taskdesk/updates:/app/updates:ro
+      - /run/taskdesk/keys:/run/taskdesk/keys:ro
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+  # Virus scanner: unchanged from the laptop file (clamd on the internal network only, signatures in a named volume).
+  clamav:
+    image: clamav/clamav:1.4
+    container_name: taskdesk-clamav
+    restart: "no"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      FRESHCLAM_CHECKS: "12"
+      CLAMD_CONF_StreamMaxLength: 2000M
+      CLAMD_CONF_MaxFileSize: 2000M
+      CLAMD_CONF_MaxScanSize: 4000M
+      CLAMD_CONF_AlertExceedsMax: "yes"
+    volumes:
+      - clamav-db:/var/lib/clamav
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+
+volumes:
+  clamav-db:

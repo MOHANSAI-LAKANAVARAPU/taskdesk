@@ -8,7 +8,11 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const DIR = process.env.SECRETS_DIR || path.join(__dirname, 'secrets');
+// The folder: KEYS_DIR, else SECRETS_DIR, else ./secrets. Cloud mode (AWS prep): TASKDESK_CLOUD=true. The keys are then put in
+// place by the host from Secrets Manager (a read-only mount), and this program NEVER makes keys: a missing or bad key is a
+// stop with a message, because a new key would silently make the existing data unreadable.
+const DIR = process.env.KEYS_DIR || process.env.SECRETS_DIR || path.join(__dirname, 'secrets');
+const CLOUD = process.env.TASKDESK_CLOUD === 'true';
 const NAMES = ['master.key', 'backup.key'];
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const FILE_MAGIC = 'TDF1'; // first bytes of an encrypted upload (see filecrypt.js)
@@ -25,7 +29,12 @@ function encryptedDataExists() {
   return null;
 }
 
+function cloudMissing(name) {
+  return new Error(`cloud mode: ${path.join(DIR, name)} is missing or unreadable. Keys are never generated in the cloud (a new key would make the existing data unreadable). The host puts both keys in ${DIR} from Secrets Manager before the app starts; check that and the folder's group permissions.`);
+}
+
 function ensureKeys() {
+  if (CLOUD) { for (const name of NAMES) readKey(name); return []; } // checks only; makes nothing
   const made = [];
   if (!fs.existsSync(path.join(DIR, 'master.key'))) {
     const what = encryptedDataExists();
@@ -48,14 +57,14 @@ function readKey(name) {
   const file = path.join(DIR, name);
   let text;
   try { text = fs.readFileSync(file, 'utf8').trim(); }
-  catch (e) { throw new Error(`${file} is missing or unreadable (${e.code}). Create the keys with \`node keys.js\` (Docker: \`docker compose up -d\` runs it), or put back your copy from the USB drive (scripts/KEYS.md).`); }
+  catch (e) { if (CLOUD) throw cloudMissing(name); throw new Error(`${file} is missing or unreadable (${e.code}). Create the keys with \`node keys.js\` (Docker: \`docker compose up -d\` runs it), or put back your copy from the USB drive (scripts/KEYS.md).`); }
   if (!/^[0-9a-f]{64}$/.test(text)) throw new Error(`${file} is not a valid key (expected 64 hex characters).`);
   return Buffer.from(text, 'hex');
 }
 
 // The server: load master.key, creating the keys first when they're missing and the folder can be written.
 function loadMasterKey() {
-  if (!fs.existsSync(path.join(DIR, 'master.key'))) {
+  if (!CLOUD && !fs.existsSync(path.join(DIR, 'master.key'))) {
     try { const made = ensureKeys(); if (made.length) console.log(`[keys] created ${made.join(' and ')} in ${DIR}. Copy them to a USB drive now (scripts/KEYS.md).`); }
     catch (e) { if (e.refused) throw e; /* read-only folder: readKey explains */ }
   }
