@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: TaskDesk recovery-region storage. Deploy in the OTHER approved India region before the main stack. Holds encrypted copies of daily data-volume snapshots now, and replicated app backups later. Retained on stack deletion.
+Parameters:
+  BackupRetainDays:
+    Type: Number
+    Default: 35
+    MinValue: 1
+    Description: Days to keep replicated app backup packages under backups/ (used after deployment, when S3 replication is added).
+Resources:
+  RecoveryKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: TaskDesk recovery-region key for snapshot copies and replicated backups; retained on stack deletion
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'}
+            Action: 'kms:*'
+            Resource: '*'
+  RecoveryKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties: {AliasName: !Sub 'alias/${AWS::StackName}-recovery', TargetKeyId: !Ref RecoveryKey}
+  RecoveryBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: 'aws:kms', KMSMasterKeyID: !GetAtt RecoveryKey.Arn}
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireReplicatedBackups
+            Status: Enabled
+            Prefix: backups/
+            ExpirationInDays: !Ref BackupRetainDays
+            NoncurrentVersionExpiration: {NoncurrentDays: 7}
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+  RecoveryBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RecoveryBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt RecoveryBucket.Arn, !Sub '${RecoveryBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': false}}
+Outputs:
+  RecoveryRegion: {Value: !Ref 'AWS::Region'}
+  RecoveryKeyArn: {Value: !GetAtt RecoveryKey.Arn}
+  RecoveryBucketName: {Value: !Ref RecoveryBucket}

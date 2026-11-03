@@ -1,0 +1,13 @@
+# /etc/taskdesk/backup.conf - filled by the Developer. Root-owned, mode 0600. No secret values here.
+#
+# Command that runs the app's OWN verified, SQLCipher-consistent backup. It must exit 0 only on
+# success and write its output into BACKUP_OUTPUT_DIR (a HOST path). Never use a raw copy of the
+# live .db/-wal files or a stock sqlite3 command. Example shape only:
+BACKUP_COMMAND='docker exec REPLACE_ACTUAL_APP_CONTAINER REPLACE_REAL_BACKUP_COMMAND'
+BACKUP_OUTPUT_DIR=/srv/taskdesk/REPLACE_HOST_BACKUP_OUTPUT_DIR
+
+# Set ONLY if the app's backup does not already include the uploaded files (host path).
+UPLOADS_DIR=
+
+# Delete the app's own output files after a verified upload (yes/no). Keep "no" until restore is proven.
+REMOVE_APP_OUTPUT_AFTER_UPLOAD=no

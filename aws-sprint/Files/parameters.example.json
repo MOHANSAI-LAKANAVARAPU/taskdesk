@@ -1,0 +1,18 @@
+[
+  {"ParameterKey": "DomainName", "ParameterValue": "taskdesk.hifocuscctv.com"},
+  {"ParameterKey": "CertificateArn", "ParameterValue": "arn:aws:acm:ap-south-1:REPLACE_ACCOUNT_ID:certificate/REPLACE_CERTIFICATE_ID"},
+  {"ParameterKey": "IngressCidr", "ParameterValue": "REPLACE_OFFICE_EGRESS_IP/32"},
+  {"ParameterKey": "NotificationEmail", "ParameterValue": "REPLACE_PRIMARY_OPERATOR@hifocuscctv.com"},
+  {"ParameterKey": "SecondNotificationEmail", "ParameterValue": "REPLACE_BACKUP_OPERATOR@hifocuscctv.com"},
+  {"ParameterKey": "InstanceType", "ParameterValue": "c7i.xlarge"},
+  {"ParameterKey": "PinnedAmiId", "ParameterValue": "REPLACE_AMI_ID_FROM_SSM_LOOKUP"},
+  {"ParameterKey": "DataDiskGiB", "ParameterValue": "200"},
+  {"ParameterKey": "AppSecretArn", "ParameterValue": "arn:aws:secretsmanager:ap-south-1:REPLACE_ACCOUNT_ID:secret:taskdesk/production-REPLACE"},
+  {"ParameterKey": "StagingSecretArn", "ParameterValue": "arn:aws:secretsmanager:ap-south-1:REPLACE_ACCOUNT_ID:secret:taskdesk/rehearsal-REPLACE"},
+  {"ParameterKey": "HealthPath", "ParameterValue": "/"},
+  {"ParameterKey": "HealthSuccessCodes", "ParameterValue": "200-399"},
+  {"ParameterKey": "WafMode", "ParameterValue": "Count"},
+  {"ParameterKey": "TerminationProtection", "ParameterValue": "false"},
+  {"ParameterKey": "RecoveryRegion", "ParameterValue": "ap-south-2"},
+  {"ParameterKey": "RecoveryKeyArn", "ParameterValue": "arn:aws:kms:ap-south-2:REPLACE_ACCOUNT_ID:key/REPLACE_RECOVERY_KEY_ID"}
+]

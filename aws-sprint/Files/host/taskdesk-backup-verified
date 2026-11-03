@@ -1,0 +1,79 @@
+#!/bin/bash
+# TaskDesk verified backup wrapper.
+# Runs the app's OWN consistent backup command, packages what it produced (plus uploads if
+# configured), uploads the package to the primary backups/ prefix with a SHA-256 checksum that
+# S3 verifies, and publishes a BackupSuccess or BackupFailure metric watched by the stack alarms.
+# It never reports success when any step fails. Run it through taskdesk-backup.service/.timer.
+set -Eeuo pipefail
+umask 077
+
+aws=/usr/local/bin/aws
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+metric() {
+  "$aws" cloudwatch put-metric-data --region "${TASKDESK_REGION:-}" \
+    --namespace TaskDesk/Backup --metric-name "$1" --value 1 --unit Count \
+    --dimensions "Stack=${TASKDESK_STACK:-unknown}" || log "warning: could not publish $1 metric"
+}
+trap 'log "backup FAILED near line $LINENO"; metric BackupFailure' ERR
+
+# Region, bucket and stack name: written by the CloudFormation bootstrap.
+# shellcheck source=/dev/null
+. /etc/taskdesk/backup.env
+# Backup command and paths: filled by the Developer.
+# shellcheck source=/dev/null
+. /etc/taskdesk/backup.conf
+
+for setting in TASKDESK_REGION TASKDESK_BUCKET TASKDESK_STACK BACKUP_COMMAND BACKUP_OUTPUT_DIR; do
+  if [ -z "${!setting:-}" ]; then log "missing setting $setting"; false; fi
+done
+case "$BACKUP_COMMAND $BACKUP_OUTPUT_DIR ${UPLOADS_DIR:-}" in
+  *REPLACE_*) log "backup.conf still contains REPLACE values"; false ;;
+esac
+test -d "$BACKUP_OUTPUT_DIR"
+
+# Only the authorized production writer backs up; same guard as taskdesk-launch.
+read -r expected environment < <(python3 -c 'import json; c = json.load(open("/etc/taskdesk/deployment.json")); print(c["expected_instance_id"], c["environment"])')
+token=$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+actual=$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/instance-id)
+if [ "$expected" != "$actual" ]; then log "instance $actual is not the authorized writer $expected"; false; fi
+
+work=/srv/taskdesk/backup-work
+install -d -m 0700 "$work"
+# Remove packages left by failed runs more than a day old.
+find "$work" -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec rm -rf -- {} +
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+pkg="$work/$stamp"
+mkdir -m 0700 "$pkg"
+touch "$pkg/.started"
+
+log "running app backup command"
+bash -c "$BACKUP_COMMAND"
+mapfile -t produced < <(find "$BACKUP_OUTPUT_DIR" -type f -newer "$pkg/.started" ! -path "$work/*")
+if [ "${#produced[@]}" -eq 0 ]; then log "backup command produced no new files in $BACKUP_OUTPUT_DIR"; false; fi
+tar -C / -cf "$pkg/app-backup.tar" "${produced[@]#/}"
+
+if [ -n "${UPLOADS_DIR:-}" ]; then
+  # Uploads are written once and then read; tar exit status 1 only means a file changed while read.
+  status=0
+  tar -C / --warning=no-file-changed -cf "$pkg/uploads.tar" "${UPLOADS_DIR#/}" || status=$?
+  if [ "$status" -gt 1 ]; then log "uploads archive failed with status $status"; false; fi
+fi
+
+{
+  echo "created_utc=$stamp"
+  echo "instance_id=$actual"
+  echo "environment=$environment"
+  echo "release=$(readlink -f /opt/taskdesk/current || echo unknown)"
+  (cd "$pkg" && sha256sum -- *.tar)
+} > "$pkg/manifest.txt"
+
+dest="s3://$TASKDESK_BUCKET/backups/$environment/$stamp"
+for file in "$pkg"/*.tar "$pkg/manifest.txt"; do
+  "$aws" s3 cp --only-show-errors --region "$TASKDESK_REGION" --checksum-algorithm SHA256 \
+    "$file" "$dest/$(basename "$file")"
+done
+
+metric BackupSuccess
+log "backup uploaded to $dest ($(du -sh "$pkg" | cut -f1))"
+rm -rf -- "$pkg"
+if [ "${REMOVE_APP_OUTPUT_AFTER_UPLOAD:-no}" = yes ]; then rm -f -- "${produced[@]}"; fi

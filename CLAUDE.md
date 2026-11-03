@@ -9,4 +9,5 @@ Root folder (`~/Downloads/TaskDesk`) holding everything for the TaskDesk project
 - `desktop/` — Electron desktop app source (Windows and Ubuntu).
 - `installers/` — built installers for employee laptops (`.exe` for Windows, `.deb` for Ubuntu).
 - `backups/` — database backups. Keep each `.db`, `.db-wal` and `.db-shm` set together.
+- `aws-sprint/` — IT's 8-hour AWS deployment package (unzipped, as received) plus our `DEV-worksheet.md` and `PACKAGE-REVIEW.md`. Nothing here is deployed by us.
 - `old-downloads/` — original downloaded zips; not used.

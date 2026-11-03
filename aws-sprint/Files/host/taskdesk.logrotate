@@ -1,0 +1,10 @@
+/var/log/taskdesk/service.log /var/log/taskdesk/backup.log {
+    daily
+    maxsize 50M
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

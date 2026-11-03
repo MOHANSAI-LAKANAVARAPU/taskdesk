@@ -1,0 +1,24 @@
+# Example of the changes to merge into the cloud copy of the REAL Compose file.
+# Every REPLACE value must come from the actual project; do not invent variable names or paths.
+# Keep the project's existing ClamAV service, non-root user and read-only settings.
+services:
+  REPLACE_APP_SERVICE:
+    # Host loopback only. Nginx on 8443 is the only way in; never publish 3000 on all interfaces.
+    ports:
+      - "127.0.0.1:3000:3000"
+    # systemd (taskdesk.service) owns the lifecycle; Docker must not start the app on its own.
+    restart: "no"
+    environment:
+      # Values arrive from Secrets Manager through taskdesk-launch; no production .env file.
+      COOKIE_SECURE: ${COOKIE_SECURE}
+      REPLACE_OTHER_REAL_APP_VARIABLE: ${REPLACE_OTHER_REAL_APP_VARIABLE}
+      # Only if the app or its reminders use local time. The EC2 host runs in UTC.
+      TZ: Asia/Kolkata
+    volumes:
+      - /srv/taskdesk/data:REPLACE_CONTAINER_DATA_PATH
+      - /srv/taskdesk/updates:REPLACE_CONTAINER_UPDATES_PATH
+      - /run/taskdesk/keys:REPLACE_CONTAINER_KEYS_PATH:ro
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+  # Every other service in the file (for example ClamAV) also needs restart: "no".

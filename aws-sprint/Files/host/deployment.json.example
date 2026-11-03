@@ -1,0 +1,11 @@
+{
+  "environment": "staging",
+  "expected_instance_id": "REPLACE_AUTHORIZED_EC2_INSTANCE_ID",
+  "region": "REPLACE_PRIMARY_REGION",
+  "secret_arn": "REPLACE_STAGING_OR_PRODUCTION_SECRET_ARN",
+  "working_directory": "/opt/taskdesk/current/server",
+  "compose_file": "/opt/taskdesk/current/server/REPLACE_COMPOSE_FILENAME",
+  "app_service": "REPLACE_ACTUAL_APP_SERVICE",
+  "app_gid": "REPLACE_NUMERIC_GID",
+  "expected_db": "/srv/taskdesk/data/taskdesk.db"
+}

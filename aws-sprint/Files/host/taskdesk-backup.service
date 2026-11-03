@@ -1,0 +1,13 @@
+[Unit]
+Description=Verified TaskDesk application backup
+After=taskdesk.service network-online.target
+RequiresMountsFor=/srv/taskdesk
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStartPre=/usr/bin/systemctl is-active --quiet taskdesk
+ExecStart=/usr/bin/flock -n /run/taskdesk-backup.lock /usr/local/sbin/taskdesk-backup-verified
+StandardOutput=append:/var/log/taskdesk/backup.log
+StandardError=append:/var/log/taskdesk/backup.log

@@ -1,0 +1,923 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: TaskDesk fast infrastructure - existing SQLite app, private EC2, ALB and regional WAF in an approved India region. Creates no app, data or secret values.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Company inputs}
+        Parameters: [DomainName, CertificateArn, IngressCidr, NotificationEmail, SecondNotificationEmail]
+      - Label: {default: Server and app}
+        Parameters: [InstanceType, PinnedAmiId, UbuntuAmi, DataDiskGiB, AppSecretArn, StagingSecretArn, HealthPath, HealthSuccessCodes]
+      - Label: {default: Protection and recovery}
+        Parameters: [WafMode, TerminationProtection, SnapshotRetainDays, RecoveryRegion, RecoveryKeyArn, BackupRetainDays, LogRetentionDays]
+      - Label: {default: Alarms}
+        Parameters: [Alarm5xxPer5Min]
+      - Label: {default: Network}
+        Parameters: [VpcCidr, PublicACidr, PublicBCidr, AppACidr]
+Parameters:
+  DomainName:
+    Type: String
+    Description: Approved company hostname, without https://
+    AllowedPattern: '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$'
+    MaxLength: 253
+  CertificateArn:
+    Type: String
+    Description: ISSUED ACM certificate in this India region covering DomainName
+    AllowedPattern: '^arn:aws:acm:ap-south-[12]:[0-9]{12}:certificate/[a-zA-Z0-9-]+$'
+  IngressCidr:
+    Type: String
+    Description: Who may reach the ALB. Use the office egress IP as x.x.x.x/32 while testing. Change to 0.0.0.0/0 only when employee access opens.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$'
+  UbuntuAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Used only when PinnedAmiId is blank. Re-resolved on every stack update.
+  PinnedAmiId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^ami-[0-9a-f]{8,17}$'
+    Description: Recommended. Exact Ubuntu 24.04 AMI ID. If blank the latest Canonical image is used; set this to the ResolvedAmiId output before any later stack update so an update never replaces the server.
+  InstanceType:
+    Type: String
+    Default: c7i.xlarge
+    AllowedValues: [c7i.xlarge, m7i.xlarge, m6i.xlarge]
+    Description: c7i.xlarge is 4 vCPU / 8 GiB. m7i/m6i.xlarge give 16 GiB and are preferred when ClamAV runs on the same host. No size is proven for 800 users. Check availability and quota in the chosen AZ.
+  DataDiskGiB:
+    Type: Number
+    Default: 200
+    MinValue: 20
+    MaxValue: 16384
+    Description: Example only - measure existing DB, uploads and update files plus backup working space and free margin.
+  VpcCidr:
+    Type: String
+    Default: 10.70.0.0/16
+  PublicACidr:
+    Type: String
+    Default: 10.70.0.0/24
+  PublicBCidr:
+    Type: String
+    Default: 10.70.1.0/24
+  AppACidr:
+    Type: String
+    Default: 10.70.10.0/24
+  AppSecretArn:
+    Type: String
+    AllowedPattern: '^arn:aws:secretsmanager:ap-south-[12]:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+    Description: Production app secret ARN in this account and region. Create it before the stack; values never go in this template.
+  StagingSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws:secretsmanager:ap-south-[12]:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+    Description: Optional rehearsal secret (same data keys, mail pointed at a sink) so a rehearsal copy cannot email employees.
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    Description: Named primary operator mailbox. Confirm the SNS subscription after creation.
+  SecondNotificationEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    Description: Backup operator mailbox. Recommended.
+  HealthPath:
+    Type: String
+    Default: /
+    AllowedPattern: '^/[^\s]*$'
+    Description: Use the app readiness path (for example /api/health) once it exists. Default / only proves an HTTP response.
+  HealthSuccessCodes:
+    Type: String
+    Default: '200-399'
+    AllowedPattern: '^[0-9]{3}(-[0-9]{3})?(,[0-9]{3}(-[0-9]{3})?)*$'
+    Description: Set to 200 once HealthPath is a real readiness endpoint.
+  WafMode:
+    Type: String
+    Default: Count
+    AllowedValues: [Count, Block]
+    Description: Count logs matches without blocking (pilot and tuning). Block enforces the common, SQL injection and IP reputation rules. Known bad inputs always block.
+  TerminationProtection:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Keep false for the first create so a failed create can roll back. Set true by stack update after launch checks. Also controls ALB deletion protection.
+  SnapshotRetainDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 365
+    Description: Daily data-volume snapshots kept (and copy retention in the recovery region).
+  RecoveryRegion:
+    Type: String
+    Default: ''
+    AllowedValues: ['', ap-south-1, ap-south-2]
+    Description: The OTHER approved India region. Requires RecoveryKeyArn from taskdesk-recovery-region.yaml. Blank disables snapshot copies.
+  RecoveryKeyArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws:kms:ap-south-[12]:[0-9]{12}:key/[a-f0-9-]+$'
+    Description: RecoveryKeyArn output of the recovery-region stack.
+  BackupRetainDays:
+    Type: Number
+    Default: 35
+    MinValue: 1
+    Description: Days to keep app backup packages under backups/ before they become noncurrent (deleted 7 days later).
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+    Description: Retention for host, proxy, backup and WAF CloudWatch logs and for ALB access logs in S3.
+  Alarm5xxPer5Min:
+    Type: Number
+    Default: 25
+    MinValue: 1
+    Description: Starting threshold for 5xx responses in five minutes. Tune from observed traffic.
+Conditions:
+  UsePinnedAmi: !Not [!Equals [!Ref PinnedAmiId, '']]
+  HasStagingSecret: !Not [!Equals [!Ref StagingSecretArn, '']]
+  HasSecondEmail: !Not [!Equals [!Ref SecondNotificationEmail, '']]
+  HasRecovery: !And [!Not [!Equals [!Ref RecoveryRegion, '']], !Not [!Equals [!Ref RecoveryKeyArn, '']]]
+  WafBlock: !Equals [!Ref WafMode, Block]
+  Protect: !Equals [!Ref TerminationProtection, 'true']
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-vpc'}]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+  PublicA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicACidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-a'}]
+  PublicB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicBCidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-b'}]
+  AppA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref AppACidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-app-a'}]
+  PublicRoutes:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PublicInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: {RouteTableId: !Ref PublicRoutes, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  PublicAAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref PublicRoutes, SubnetId: !Ref PublicA}
+  PublicBAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref PublicRoutes, SubnetId: !Ref PublicB}
+  NatAddress:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties: {Domain: vpc}
+  NatA:
+    Type: AWS::EC2::NatGateway
+    DependsOn: [PublicInternetRoute, PublicAAssociation]
+    Properties: {AllocationId: !GetAtt NatAddress.AllocationId, SubnetId: !Ref PublicA}
+  PrivateRoutes:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PrivateInternetRoute:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivateRoutes, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatA}
+  AppAAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {RouteTableId: !Ref PrivateRoutes, SubnetId: !Ref AppA}
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds: [!Ref PrivateRoutes]
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP redirect and HTTPS from IngressCidr only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref IngressCidr}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref IngressCidr}
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 8443, ToPort: 8443, CidrIp: !Ref AppACidr}
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Backend HTTPS from ALB only; no public IP or SSH
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 8443, ToPort: 8443, SourceSecurityGroupId: !Ref AlbSecurityGroup}
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: TaskDesk EBS, snapshot and backup/release encryption; retained on stack deletion
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'}
+            Action: 'kms:*'
+            Resource: '*'
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties: {AliasName: !Sub 'alias/${AWS::StackName}-data', TargetKeyId: !Ref DataKey}
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: !Ref DataDiskGiB
+      VolumeType: gp3
+      Encrypted: true
+      KmsKeyId: !GetAtt DataKey.Arn
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-data'}
+        - {Key: taskdesk-snapshot, Value: !Sub '${AWS::StackName}-data'}
+  TransferBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: 'aws:kms', KMSMasterKeyID: !GetAtt DataKey.Arn}
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireBackups
+            Status: Enabled
+            Prefix: backups/
+            ExpirationInDays: !Ref BackupRetainDays
+            NoncurrentVersionExpiration: {NoncurrentDays: 7}
+          - Id: ExpireRestorePackages
+            Status: Enabled
+            Prefix: restore/
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration: {NoncurrentDays: 7}
+          - Id: ExpireOldReleaseVersions
+            Status: Enabled
+            Prefix: releases/
+            NoncurrentVersionExpiration: {NoncurrentDays: 90}
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+  TransferBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TransferBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt TransferBucket.Arn, !Sub '${TransferBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': false}}
+  AlbLogs:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+            NoncurrentVersionExpiration: {NoncurrentDays: 7}
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+  AlbLogsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AlbLogs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: logdelivery.elasticloadbalancing.amazonaws.com}
+            Action: 's3:PutObject'
+            Resource: !Sub '${AlbLogs.Arn}/alb/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              ArnLike: {'aws:SourceArn': !Sub 'arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/*'}
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt AlbLogs.Arn, !Sub '${AlbLogs.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': false}}
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/taskdesk/${AWS::StackName}/app', RetentionInDays: !Ref LogRetentionDays}
+  ProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/taskdesk/${AWS::StackName}/proxy', RetentionInDays: !Ref LogRetentionDays}
+  BackupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/taskdesk/${AWS::StackName}/backup', RetentionInDays: !Ref LogRetentionDays}
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Policies:
+        - PolicyName: TaskDeskFiles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListReleaseAndRestorePrefixes
+                Effect: Allow
+                Action: ['s3:ListBucket']
+                Resource: !GetAtt TransferBucket.Arn
+                Condition: {StringLike: {'s3:prefix': [releases, 'releases/*', restore, 'restore/*']}}
+              - Sid: ReadReleasesAndRestorePackages
+                Effect: Allow
+                Action: ['s3:GetObject']
+                Resource: [!Sub '${TransferBucket.Arn}/releases/*', !Sub '${TransferBucket.Arn}/restore/*']
+              - Sid: WriteNewBackupsWithoutDelete
+                Effect: Allow
+                Action: ['s3:PutObject', 's3:AbortMultipartUpload', 's3:ListMultipartUploadParts']
+                Resource: !Sub '${TransferBucket.Arn}/backups/*'
+              - Sid: UseDataKeyThroughS3
+                Effect: Allow
+                Action: ['kms:Decrypt', 'kms:GenerateDataKey']
+                Resource: !GetAtt DataKey.Arn
+                Condition: {StringEquals: {'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'}}
+        - PolicyName: TaskDeskSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['secretsmanager:GetSecretValue']
+                Resource: !If [HasStagingSecret, [!Ref AppSecretArn, !Ref StagingSecretArn], [!Ref AppSecretArn]]
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref InstanceRole]}
+  BootstrapHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  AppInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [PrivateInternetRoute, AppAAssociation]
+    Properties:
+      ImageId: !If [UsePinnedAmi, !Ref PinnedAmiId, !Ref UbuntuAmi]
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref AppA
+      SecurityGroupIds: [!Ref AppSecurityGroup]
+      DisableApiTermination: !If [Protect, true, false]
+      MetadataOptions: {HttpEndpoint: enabled, HttpTokens: required, HttpPutResponseHopLimit: 1}
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: {VolumeType: gp3, VolumeSize: 30, Encrypted: true, KmsKeyId: !GetAtt DataKey.Arn, DeleteOnTermination: true}
+      Volumes:
+        - {Device: /dev/sdf, VolumeId: !Ref DataVolume}
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-app'}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          taskdesk_signal() {
+            printf '{"Status":"%s","Reason":"%s","UniqueId":"host-bootstrap","Data":"%s"}' "$1" "$2" "$2" > /run/taskdesk-signal.json
+            curl -sS --retry 10 --retry-delay 6 -X PUT -H 'Content-Type:' --data-binary @/run/taskdesk-signal.json '${BootstrapHandle}' || true
+          }
+          trap 'taskdesk_signal FAILURE "Bootstrap failed near line $LINENO - inspect /var/log/cloud-init-output.log through Session Manager"' ERR
+          taskdesk_apt() {
+            for taskdesk_try in $(seq 1 30); do
+              if apt-get -o DPkg::Lock::Timeout=120 "$@"; then return 0; fi
+              echo "apt-get attempt $taskdesk_try failed; retrying"
+              sleep 10
+            done
+            return 1
+          }
+          taskdesk_fetch() { curl -fsSL --retry 5 --retry-delay 5 -o "$2" "$1"; }
+          taskdesk_apt update
+          taskdesk_apt install -y ca-certificates curl unzip nginx openssl
+          install -m 0755 -d /etc/apt/keyrings
+          taskdesk_fetch https://download.docker.com/linux/ubuntu/gpg /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+          printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable' > /etc/apt/sources.list.d/docker.list
+          taskdesk_apt update
+          taskdesk_apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          install -d -m 0755 /etc/docker
+          cat > /etc/docker/daemon.json <<'DOCKER'
+          {"log-driver":"json-file","log-opts":{"max-size":"20m","max-file":"3"}}
+          DOCKER
+          taskdesk_fetch https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip /tmp/taskdesk-awscli.zip
+          unzip -q /tmp/taskdesk-awscli.zip -d /tmp/taskdesk-cli
+          /tmp/taskdesk-cli/aws/install --update
+          systemctl enable --now docker
+          systemctl restart docker
+          install -d -m 0750 /srv/taskdesk /opt/taskdesk /etc/taskdesk /var/lib/taskdesk /var/log/taskdesk
+          install -m 0640 /dev/null /var/log/taskdesk/service.log
+          install -m 0640 /dev/null /var/log/taskdesk/backup.log
+          cat > /etc/taskdesk/backup.env <<'BACKUPENV'
+          TASKDESK_REGION=${AWS::Region}
+          TASKDESK_BUCKET=${TransferBucket}
+          TASKDESK_STACK=${AWS::StackName}
+          BACKUPENV
+          chmod 0600 /etc/taskdesk/backup.env
+          taskdesk_serial=$(printf '%s' '${DataVolume}' | tr -d '-')
+          taskdesk_device="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$taskdesk_serial"
+          for taskdesk_attempt in $(seq 1 180); do
+            if test -b "$taskdesk_device"; then break; fi
+            sleep 2
+          done
+          test -b "$taskdesk_device"
+          # Only the specific new volume created by this stack is initialized.
+          # A volume that already has a filesystem is mounted, never formatted.
+          if ! blkid "$taskdesk_device"; then
+            test -z "$(wipefs --noheadings --output TYPE "$taskdesk_device")"
+            mkfs.ext4 -L taskdesk-data "$taskdesk_device"
+          fi
+          taskdesk_uuid=$(blkid -s UUID -o value "$taskdesk_device")
+          test -n "$taskdesk_uuid"
+          if ! grep -q "$taskdesk_uuid" /etc/fstab; then
+            printf 'UUID=%s /srv/taskdesk ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2\n' "$taskdesk_uuid" >> /etc/fstab
+          fi
+          systemctl daemon-reload
+          mountpoint -q /srv/taskdesk || mount /srv/taskdesk
+          mountpoint -q /srv/taskdesk
+          install -d -m 0700 /etc/nginx/taskdesk-tls
+          cat > /usr/local/sbin/taskdesk-backend-cert <<'CERT'
+          #!/bin/bash
+          # Creates or renews the private backend certificate used only between the ALB and Nginx.
+          set -euo pipefail
+          dir=/etc/nginx/taskdesk-tls
+          if test -s "$dir/cert.pem" && openssl x509 -checkend 2592000 -noout -in "$dir/cert.pem"; then exit 0; fi
+          openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 365 -subj /CN=taskdesk-backend \
+            -addext subjectAltName=DNS:taskdesk-backend -keyout "$dir/key.new" -out "$dir/cert.new"
+          chmod 0600 "$dir/key.new"
+          mv "$dir/key.new" "$dir/key.pem"
+          mv "$dir/cert.new" "$dir/cert.pem"
+          if systemctl is-active --quiet nginx; then nginx -t && systemctl reload nginx; fi
+          CERT
+          chmod 0700 /usr/local/sbin/taskdesk-backend-cert
+          cat > /etc/systemd/system/taskdesk-backend-cert.service <<'UNIT'
+          [Unit]
+          Description=Renew TaskDesk backend certificate when within 30 days of expiry
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/taskdesk-backend-cert
+          UNIT
+          cat > /etc/systemd/system/taskdesk-backend-cert.timer <<'UNIT'
+          [Unit]
+          Description=Weekly TaskDesk backend certificate check
+          [Timer]
+          OnCalendar=weekly
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          /usr/local/sbin/taskdesk-backend-cert
+          rm -f /etc/nginx/sites-enabled/default
+          cat > /etc/nginx/sites-available/taskdesk <<'NGINX'
+          # Logs omit URLs and query strings, which can carry reset tokens.
+          log_format taskdesk_safe '$remote_addr $request_method $status $body_bytes_sent $request_time';
+          server {
+            listen 8443 ssl default_server;
+            server_name ${DomainName};
+            ssl_certificate /etc/nginx/taskdesk-tls/cert.pem;
+            ssl_certificate_key /etc/nginx/taskdesk-tls/key.pem;
+            ssl_protocols TLSv1.2 TLSv1.3;
+            client_max_body_size 55m;
+            keepalive_timeout 310s;
+            set_real_ip_from ${PublicACidr};
+            set_real_ip_from ${PublicBCidr};
+            real_ip_header X-Forwarded-For;
+            real_ip_recursive on;
+            access_log /var/log/nginx/taskdesk-access.log taskdesk_safe;
+            error_log /var/log/nginx/taskdesk-error.log warn;
+            location / {
+              proxy_pass http://127.0.0.1:3000;
+              proxy_http_version 1.1;
+              proxy_set_header Host ${DomainName};
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $remote_addr;
+              proxy_set_header X-Forwarded-Proto https;
+              proxy_set_header Connection "";
+              proxy_buffering off;
+              proxy_read_timeout 600s;
+              proxy_send_timeout 600s;
+            }
+          }
+          NGINX
+          ln -sf /etc/nginx/sites-available/taskdesk /etc/nginx/sites-enabled/taskdesk
+          nginx -t
+          systemctl enable --now nginx
+          systemctl reload nginx
+          systemctl daemon-reload
+          systemctl enable --now taskdesk-backend-cert.timer
+          taskdesk_fetch https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb /tmp/taskdesk-cwagent.deb
+          dpkg -i -E /tmp/taskdesk-cwagent.deb
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/taskdesk.json <<'CWAGENT'
+          {
+            "agent": {"metrics_collection_interval": 60, "run_as_user": "root", "omit_hostname": true},
+            "metrics": {
+              "namespace": "TaskDesk/Host",
+              "append_dimensions": {"InstanceId": "${!aws:InstanceId}"},
+              "metrics_collected": {
+                "mem": {"measurement": ["mem_used_percent"]},
+                "disk": {"resources": ["/", "/srv/taskdesk"], "measurement": ["used_percent"], "drop_device": true}
+              }
+            },
+            "logs": {"logs_collected": {"files": {"collect_list": [
+              {"file_path": "/var/log/taskdesk/service.log", "log_group_name": "${AppLogGroup}", "log_stream_name": "{instance_id}"},
+              {"file_path": "/var/log/taskdesk/backup.log", "log_group_name": "${BackupLogGroup}", "log_stream_name": "{instance_id}"},
+              {"file_path": "/var/log/nginx/taskdesk-error.log", "log_group_name": "${ProxyLogGroup}", "log_stream_name": "{instance_id}"}
+            ]}}}
+          }
+          CWAGENT
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/taskdesk.json -s
+          touch /var/lib/taskdesk/host-ready
+          taskdesk_signal SUCCESS "Host bootstrap complete"
+  BootstrapWait:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: AppInstance
+    Properties: {Handle: !Ref BootstrapHandle, Timeout: '1800', Count: 1}
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: [PublicInternetRoute, PublicAAssociation, PublicBAssociation, AlbLogsPolicy]
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: [!Ref PublicA, !Ref PublicB]
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: '300'}
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true'}
+        - {Key: routing.http.desync_mitigation_mode, Value: strictest}
+        - {Key: deletion_protection.enabled, Value: !If [Protect, 'true', 'false']}
+        - {Key: access_logs.s3.enabled, Value: 'true'}
+        - {Key: access_logs.s3.bucket, Value: !Ref AlbLogs}
+        - {Key: access_logs.s3.prefix, Value: alb}
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTPS
+      Port: 8443
+      TargetType: instance
+      HealthCheckProtocol: HTTPS
+      HealthCheckPath: !Ref HealthPath
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      Matcher: {HttpCode: !Ref HealthSuccessCodes}
+      Targets: [{Id: !Ref AppInstance, Port: 8443}]
+      TargetGroupAttributes:
+        - {Key: load_balancing.cross_zone.enabled, Value: 'true'}
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig: {Protocol: HTTPS, Port: '443', StatusCode: HTTP_301}
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{CertificateArn: !Ref CertificateArn}]
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: {StatusCode: '404', ContentType: text/plain, MessageBody: Not found}
+  CompanyHostRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 10
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig: {Values: [!Ref DomainName]}
+      Actions:
+        - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Scope: REGIONAL
+      DefaultAction: {Allow: {}}
+      VisibilityConfig: {CloudWatchMetricsEnabled: true, SampledRequestsEnabled: true, MetricName: TaskDeskWaf}
+      Rules:
+        - Name: KnownBadInputs
+          Priority: 0
+          OverrideAction: {None: {}}
+          Statement: {ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet}}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, SampledRequestsEnabled: true, MetricName: TaskDeskKnownBad}
+        - Name: IpReputation
+          Priority: 1
+          OverrideAction: !If [WafBlock, {None: {}}, {Count: {}}]
+          Statement: {ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList}}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, SampledRequestsEnabled: true, MetricName: TaskDeskIpReputation}
+        - Name: CommonRules
+          Priority: 2
+          OverrideAction: !If [WafBlock, {None: {}}, {Count: {}}]
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              RuleActionOverrides:
+                - {Name: SizeRestrictions_BODY, ActionToUse: {Count: {}}}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, SampledRequestsEnabled: true, MetricName: TaskDeskCommon}
+        - Name: SqlInjection
+          Priority: 3
+          OverrideAction: !If [WafBlock, {None: {}}, {Count: {}}]
+          Statement: {ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesSQLiRuleSet}}
+          VisibilityConfig: {CloudWatchMetricsEnabled: true, SampledRequestsEnabled: true, MetricName: TaskDeskSqlInjection}
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties: {ResourceArn: !Ref LoadBalancer, WebACLArn: !GetAtt WebAcl.Arn}
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Unique suffix so a retained group from a failed attempt cannot block a retry.
+      LogGroupName: !Join ['-', [aws-waf-logs, !Ref 'AWS::StackName', !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]]]
+      RetentionInDays: !Ref LogRetentionDays
+  WafLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs: [!Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WafLogGroup}']
+      RedactedFields:
+        - {SingleHeader: {Name: authorization}}
+        - {SingleHeader: {Name: cookie}}
+        - {QueryString: {}}
+  SnapshotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: dlm.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole']
+      Policies:
+        - PolicyName: SnapshotKeys
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['kms:Encrypt', 'kms:Decrypt', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:DescribeKey']
+                Resource: !If [HasRecovery, [!GetAtt DataKey.Arn, !Ref RecoveryKeyArn], [!GetAtt DataKey.Arn]]
+              - Effect: Allow
+                Action: ['kms:CreateGrant']
+                Resource: !If [HasRecovery, [!GetAtt DataKey.Arn, !Ref RecoveryKeyArn], [!GetAtt DataKey.Arn]]
+                Condition: {Bool: {'kms:GrantIsForAWSResource': true}}
+  SnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      Description: !Sub 'TaskDesk ${AWS::StackName} daily data volume snapshots'
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt SnapshotRole.Arn
+      PolicyDetails:
+        PolicyType: EBS_SNAPSHOT_MANAGEMENT
+        ResourceTypes: [VOLUME]
+        TargetTags: [{Key: taskdesk-snapshot, Value: !Sub '${AWS::StackName}-data'}]
+        Schedules:
+          - Name: DailyCrashConsistent
+            CopyTags: true
+            TagsToAdd: [{Key: taskdesk-consistency, Value: crash-consistent}]
+            # 20:30 UTC is 02:00 IST.
+            CreateRule: {Interval: 24, IntervalUnit: HOURS, Times: ['20:30']}
+            RetainRule: {Count: !Ref SnapshotRetainDays}
+            CrossRegionCopyRules: !If
+              - HasRecovery
+              - - Target: !Ref RecoveryRegion
+                  Encrypted: true
+                  CmkArn: !Ref RecoveryKeyArn
+                  CopyTags: true
+                  RetainRule: {Interval: !Ref SnapshotRetainDays, IntervalUnit: DAYS}
+              - !Ref AWS::NoValue
+  Alerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: [{Protocol: email, Endpoint: !Ref NotificationEmail}]
+  SecondAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasSecondEmail
+    Properties: {TopicArn: !Ref Alerts, Protocol: email, Endpoint: !Ref SecondNotificationEmail}
+  StatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: TaskDesk EC2 status check failing. EC2 automatic recovery keeps the same instance ID and volumes; investigate before any manual replacement of the SQLite host.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [{Name: InstanceId, Value: !Ref AppInstance}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
+  NoHealthyTargetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: TaskDesk is down for employees - the ALB has no healthy target. Expected until the app is first started.
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
+  Target5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: TaskDesk app returned many 5xx responses in five minutes
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref Alarm5xxPer5Min
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Alerts]
+  Elb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: ALB returned many 5xx responses in five minutes (target down, timeouts or proxy errors)
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions: [{Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref Alarm5xxPer5Min
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Alerts]
+  SlowResponseAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: TaskDesk p95 response time above 2 seconds for 15 minutes
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions: [{Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}]
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Alerts]
+  MemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: TaskDesk host memory above 90% for 15 minutes (app, ClamAV and Docker share this host)
+      Namespace: TaskDesk/Host
+      MetricName: mem_used_percent
+      Dimensions: [{Name: InstanceId, Value: !Ref AppInstance}]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref Alerts]
+  RootDiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: TaskDesk root disk above 80% (Docker images, build cache and logs)
+      Namespace: TaskDesk/Host
+      MetricName: disk_used_percent
+      Dimensions:
+        - {Name: InstanceId, Value: !Ref AppInstance}
+        - {Name: path, Value: /}
+        - {Name: fstype, Value: ext4}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref Alerts]
+  DataDiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: TaskDesk data disk above 80% (SQLite, uploads and backup working space)
+      Namespace: TaskDesk/Host
+      MetricName: disk_used_percent
+      Dimensions:
+        - {Name: InstanceId, Value: !Ref AppInstance}
+        - {Name: path, Value: /srv/taskdesk}
+        - {Name: fstype, Value: ext4}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref Alerts]
+  BackupMissingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: No successful TaskDesk app backup for 12 hours. Expected until the backup timer is enabled.
+      Namespace: TaskDesk/Backup
+      MetricName: BackupSuccess
+      Dimensions: [{Name: Stack, Value: !Ref 'AWS::StackName'}]
+      Statistic: Sum
+      Period: 21600
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
+  BackupFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A TaskDesk app backup run failed
+      Namespace: TaskDesk/Backup
+      MetricName: BackupFailure
+      Dimensions: [{Name: Stack, Value: !Ref 'AWS::StackName'}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Alerts]
+Outputs:
+  CompanyUrl: {Value: !Sub 'https://${DomainName}'}
+  AlbDnsName: {Value: !GetAtt LoadBalancer.DNSName}
+  AlbArn: {Value: !Ref LoadBalancer}
+  TargetGroupArn: {Value: !Ref TargetGroup}
+  InstanceId: {Value: !Ref AppInstance}
+  ResolvedAmiId:
+    Description: Copy into PinnedAmiId before any later stack update
+    Value: !If [UsePinnedAmi, !Ref PinnedAmiId, !Ref UbuntuAmi]
+  DataVolumeId: {Value: !Ref DataVolume}
+  DataKeyArn: {Value: !GetAtt DataKey.Arn}
+  TransferBucketName: {Value: !Ref TransferBucket}
+  AlbLogsBucketName: {Value: !Ref AlbLogs}
+  VpcId: {Value: !Ref Vpc}
+  PublicSubnets: {Value: !Join [',', [!Ref PublicA, !Ref PublicB]]}
+  AppSubnet: {Value: !Ref AppA}
+  AlbSecurityGroupId: {Value: !Ref AlbSecurityGroup}
+  AppSecurityGroupId: {Value: !Ref AppSecurityGroup}
+  NatGatewayId: {Value: !Ref NatA}
+  WebAclArn: {Value: !GetAtt WebAcl.Arn}
+  WafLogs: {Value: !Ref WafLogGroup}
+  AppLogs: {Value: !Ref AppLogGroup}
+  AlertTopicArn: {Value: !Ref Alerts}
+  SnapshotPolicyId: {Value: !Ref SnapshotPolicy}
+  Note:
+    Value: 'Infrastructure only. Bootstrap is confirmed by BootstrapWait. Next: deploy the real app, restore data, enable backups, then publish DNS.'

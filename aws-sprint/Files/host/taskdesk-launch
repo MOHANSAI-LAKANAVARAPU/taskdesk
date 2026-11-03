@@ -1,0 +1,104 @@
+#!/usr/bin/python3
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import urllib.request
+
+def fail():
+    print("TaskDesk startup/build validation failed; inspect configuration, mount, IAM, keys, and app prerequisites without printing secrets.", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    os.umask(0o077)
+    mode = sys.argv[1] if len(sys.argv) == 2 else ""
+    if mode not in {"validate", "build", "start"}:
+        fail()
+
+    cfg = json.loads(Path("/etc/taskdesk/deployment.json").read_text())
+    if cfg["environment"] not in {"staging", "production"}:
+        fail()
+    metadata = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    token_request = urllib.request.Request(
+        "http://169.254.169.254/latest/api/token", method="PUT",
+        headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}
+    )
+    with metadata.open(token_request, timeout=3) as response:
+        token = response.read().decode()
+    identity_request = urllib.request.Request(
+        "http://169.254.169.254/latest/meta-data/instance-id",
+        headers={"X-aws-ec2-metadata-token": token}
+    )
+    with metadata.open(identity_request, timeout=3) as response:
+        instance_id = response.read().decode().strip()
+    if instance_id != cfg["expected_instance_id"]:
+        fail()
+    if not os.path.ismount("/srv/taskdesk"):
+        fail()
+    if mode == "start" and cfg["environment"] == "production":
+        db = Path(cfg["expected_db"])
+        if not db.is_file() or db.stat().st_size == 0:
+            fail()
+
+    result = subprocess.run(
+        ["/usr/local/bin/aws", "secretsmanager", "get-secret-value",
+         "--secret-id", cfg["secret_arn"], "--region", cfg["region"],
+         "--query", "SecretString", "--output", "text"],
+        check=True, capture_output=True, text=True
+    )
+    secret = json.loads(result.stdout)
+    values = secret["env"]
+    if not isinstance(values, dict):
+        fail()
+    if any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k)
+           or not isinstance(value, str) for k, value in values.items()):
+        fail()
+    forbidden = {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                 "AWS_SESSION_TOKEN", "LD_PRELOAD", "PATH", "BASH_ENV"}
+    if forbidden.intersection(values):
+        fail()
+
+    process_env = os.environ.copy()
+    process_env.update(values)
+
+    if mode == "start":
+        app_gid = int(cfg["app_gid"])
+        runtime = Path("/run/taskdesk")
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(runtime, 0o700)
+        keys = runtime / "keys"
+        keys.mkdir(mode=0o750, exist_ok=True)
+        os.chown(keys, 0, app_gid)
+        os.chmod(keys, 0o750)
+        for filename, field in [
+            ("master.key", "master_key_b64"),
+            ("backup.key", "backup_key_b64")
+        ]:
+            data = base64.b64decode(secret[field], validate=True)
+            if not data:
+                fail()
+            path = keys / filename
+            path.write_bytes(data)
+            os.chown(path, 0, app_gid)
+            os.chmod(path, 0o640)
+
+    command = [
+        "/usr/bin/docker", "compose", "--env-file", "/dev/null",
+        "--project-name", "taskdesk", "--file", cfg["compose_file"]
+    ]
+    if mode == "validate":
+        command += ["config", "--quiet"]
+    elif mode == "build":
+        command += ["build", "--pull"]
+    else:
+        command += ["up", "--no-build", "--force-recreate",
+                    "--abort-on-container-exit", "--exit-code-from",
+                    cfg["app_service"]]
+
+    os.chdir(cfg["working_directory"])
+    os.execve("/usr/bin/docker", command, process_env)
+except Exception:
+    fail()

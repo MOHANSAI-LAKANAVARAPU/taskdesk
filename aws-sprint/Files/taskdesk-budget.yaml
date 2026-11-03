@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: TaskDesk monthly AWS budget alert for the workload account. Budgets are account-wide; deploy this stack in ap-south-1 (CloudFormation does not offer the budget resource in ap-south-2). It stores no workload data.
+Parameters:
+  MonthlyBudget:
+    Type: Number
+    MinValue: 1
+    Description: Approved monthly AWS spend for this account.
+  BudgetUnit:
+    Type: String
+    Default: USD
+    AllowedValues: [USD, INR]
+    Description: Currency shown in the account's Billing console (INR for some AWS India accounts).
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    Description: Spending owner mailbox.
+  SecondNotificationEmail:
+    Type: String
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    Description: Second recipient so a budget alert never depends on one person.
+Resources:
+  MonthlyBudgetAlert:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AWS::StackName}-monthly'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudget, Unit: !Ref BudgetUnit}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE}
+          Subscribers:
+            - {SubscriptionType: EMAIL, Address: !Ref NotificationEmail}
+            - {SubscriptionType: EMAIL, Address: !Ref SecondNotificationEmail}
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE}
+          Subscribers:
+            - {SubscriptionType: EMAIL, Address: !Ref NotificationEmail}
+            - {SubscriptionType: EMAIL, Address: !Ref SecondNotificationEmail}
+Outputs:
+  BudgetName: {Value: !Ref MonthlyBudgetAlert}

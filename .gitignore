@@ -20,3 +20,9 @@ server/updates/*
 .env
 .env.bak-*
 server/owner-transfers.log
+
+# AWS sprint: only my private copies are ignored (parameter files, secret JSON, built release archives)
+aws-sprint/private/
+aws-sprint/out/
+aws-sprint/**/parameters.json
+aws-sprint/**/*.secret*.json

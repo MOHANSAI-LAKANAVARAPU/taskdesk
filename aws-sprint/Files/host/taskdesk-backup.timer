@@ -1,0 +1,12 @@
+[Unit]
+Description=TaskDesk backup every six hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00 UTC
+OnBootSec=10min
+Persistent=true
+RandomizedDelaySec=5min
+Unit=taskdesk-backup.service
+
+[Install]
+WantedBy=timers.target
