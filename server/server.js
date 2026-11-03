@@ -33,7 +33,11 @@ const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true';
 const SESSION_DAYS = 30;
 const UPLOAD_DIR = path.join(process.env.DATA_DIR || path.join(__dirname, 'data'), 'uploads');
 
-app.set('trust proxy', 1);
+// Behind Nginx (AWS) or any proxy: how many proxy hops to believe for the client address (req.ip: audit log, sign-in lockout
+// and per-address limits). Default 1, which is right for both the laptop (Docker's gateway hop) and the cloud (Nginx on the
+// host sets X-Forwarded-For to the real client, then reaches the container through Docker's gateway). TRUST_PROXY may also be
+// a number, "loopback", or a comma-separated list of addresses/CIDRs. Wrong value = every user looks like the proxy.
+app.set('trust proxy', (v => /^\d+$/.test(v) ? Number(v) : v === 'false' ? false : v.includes(',') ? v.split(',').map(x => x.trim()) : v)(String(process.env.TRUST_PROXY || '1').trim()));
 // Security headers on every response (Security A1). The CSP allows only this server's own script, styles, images and
 // connections. No inline scripts and no <style> blocks; only style="…" attributes are allowed (style-src-attr), as the
 // page templates use them for small layout tweaks (they can't run code or use selectors). File downloads set their
