@@ -33,7 +33,8 @@ h2{font-size:1.0625rem;margin:0 0 12px}
 .wrap{width:var(--page-w);margin:0 auto;padding:24px 20px 60px;outline:none}
 
 /* top bar */
-.topbar{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--line);padding-top:env(safe-area-inset-top,0px)}
+.maint-banner{position:sticky;top:0;z-index:6;background:var(--s-prog-bg);color:var(--ink);border-bottom:2px solid var(--s-prog);padding:9px 20px;text-align:center;font-weight:600;font-size:.9375rem;line-height:1.35}
+.topbar{position:sticky;top:var(--maint-h,0px);z-index:5;background:var(--surface);border-bottom:1px solid var(--line);padding-top:env(safe-area-inset-top,0px)}
 .topbar-inner{width:var(--page-w);margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:20px}
 .brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:1.0625rem;color:var(--ink);text-decoration:none}
 .brand-mark{width:24px;height:24px;background:url(/hifocus-tray.svg) center/contain no-repeat}
@@ -238,7 +239,7 @@ table.history td.reasons{white-space:normal;min-width:180px}
 .nav-count[hidden]{display:none}
 .nav-count{margin-left:6px;background:var(--accent);color:var(--accent-ink);padding:0 7px;font-size:.6875rem;vertical-align:1px}
 .wrap:has(> .chat){padding-bottom:16px}
-.chat{display:grid;grid-template-columns:clamp(320px,20vw,400px) minmax(0,1fr);gap:16px;height:calc(100dvh - var(--topbar-h,60px) - 40px);min-height:420px}
+.chat{display:grid;grid-template-columns:clamp(320px,20vw,400px) minmax(0,1fr);gap:16px;height:calc(100dvh - var(--topbar-h,60px) - var(--maint-h,0px) - 40px);min-height:420px}
 .chat-side,.chat-main{background:var(--surface);border:1px solid var(--line);border-radius:12px;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 .chat-side-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:14px 14px 10px}
 .chat-side-head h1{font-size:1.375rem}
@@ -308,7 +309,7 @@ table.history td.reasons{white-space:normal;min-width:180px}
 .lb-bar{display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--surface);color:var(--ink)}
 .lb-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.875rem}
 @media (max-width:760px){
-  .chat{grid-template-columns:1fr;height:calc(100dvh - var(--topbar-h,100px) - 40px)}
+  .chat{grid-template-columns:1fr;height:calc(100dvh - var(--topbar-h,100px) - var(--maint-h,0px) - 40px)}
   .chat.has-open .chat-side{display:none}
   .chat:not(.has-open) .chat-main{display:none}
   .chat-back{display:block}

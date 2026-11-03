@@ -42,12 +42,18 @@ sudo /opt/taskdesk/current/server/scripts/restore-cloud.sh /srv/taskdesk/restore
 ```
 It replaces the separate `chown` line (it sets `1000:1000`, folders 700, files 600) and checks the result (integrity, foreign keys, row counts against the manifest, every upload present and encrypted); exit 0 only if all pass, otherwise it puts the previous data back. In Step 6 use `/srv/taskdesk/restore-final` and the production ARN. Step 6.2's "run the app's integrity check and record row counts" is done by the laptop backup itself (it prints the counts).
 
-### 4. Workbook Step 6 order: the laptop backup needs the laptop app **running** - *tested here*
-Step 6 says stop the laptop app, then take the final backup. The app's backup reads the encrypted database **through the running container** (a consistent online copy), so it cannot run against a stopped one.
-**Change:** announce the freeze, take the backup while the container is up (nobody writes during the freeze), check it exited 0 and printed `Verify: OK`, **then** `docker compose stop taskdesk`, then start the notice server (item 1):
-```bash
-cd ~/Downloads/TaskDesk/server && scripts/backup.sh --cloud /media/<external disk>/taskdesk-final
-```
+### 4. Workbook Step 6: cutover order, with a write freeze - *tested here*
+Step 6 stops the laptop app and then takes the final backup. That cannot work (the app's backup reads the encrypted database **through the running container**) and nothing stops people writing between "announce the freeze" and "stop". The app now has a **read-only mode** (an admin switch; every change is refused with a 503 message, reading and sign-in keep working, a banner shows on every page, the desktop app shows the same page). **Replace Step 6.1-6.3 with this order** (the same text is in DEV-worksheet.md, section 7):
+
+1. **Turn on read-only mode** on the laptop: Account page (signed in as an admin) → "Read-only mode" → enter when changes are allowed again (for example 90 minutes from now) → "Turn on read-only mode". Or in `~/Downloads/TaskDesk/server/.env` add `MAINTENANCE=readonly` and `MAINTENANCE_UNTIL=<ISO time>` and run `docker compose up -d` (a few seconds of restart; the page cannot turn this form off). Check: `curl -s localhost:3000/api/maintenance` shows `"on":true`, and a change in the page shows the message.
+2. **Wait 1 minute** (requests already in flight finish; reminders and queued emails are paused).
+3. **Final backup**, laptop app still running: `cd ~/Downloads/TaskDesk/server && scripts/backup.sh --cloud /media/<external disk>/taskdesk-final`. Check exit 0 and `Verify: OK`; record the row counts it prints.
+4. **Stop the laptop app**: `docker compose stop taskdesk`, then start the notice server (item 1): `MOVED_TO=https://<hostname> node scripts/moved-notice.js`.
+5. **Upload** the package to S3 `restore/final/` (Step 6.3).
+6. **Restore** on the host (item 3 above, `restore-cloud.sh ... --keys-from-secret <production ARN>`), then start the cloud app and check counts.
+
+**Turning it off:** on the laptop, Account page → "Turn off read-only mode" (or remove the `.env` lines and `docker compose up -d`). **The cloud server is never read-only after the restore**: the switch lives in `data/maintenance.json`, not in the database or the backup. Roll back before DNS = stop the cloud app, `docker compose start taskdesk` on the laptop, turn read-only off. If the move is called off, remember to remove the notice server (it would otherwise hold port 3000).
+Note: sign-in still works during the freeze and writes a session and audit row on the laptop (not business data; they are not in the final backup if made after it). Admins and managers who must set up two-step verification cannot do so until it is off.
 
 ### 5. Health check parameters (Steps 4.7, 9 and the stack) - *tested here*
 Set `HealthPath=/api/health` and `HealthSuccessCodes=200` (a stack update through the change set of Step 9, `AppInstance` must stay `Replacement: False`). The route needs no login, returns only `{"ok":true}`, answers 503 when the database does not answer, and is never audited or rate limited.

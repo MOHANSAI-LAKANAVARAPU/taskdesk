@@ -64,6 +64,30 @@ app.all('/api/health', (req, res) => {
 app.use('/api/users/import/commit', express.json({ limit: '2mb' })); // up to 2000 rows; every other route keeps 200 KB
 app.use(express.json({ limit: '200kb' }));
 app.use(cookieParser());
+// ---------- Read-only mode (write freeze) for the move to a new server ----------
+// While it is on, every change request (POST/PUT/PATCH/DELETE: tasks, uploads, chat send, password links, ...) is refused with 503 and
+// the message below; reading, sign-in, /api/health, /api/version, /api/stream and /updates keep working, and the page shows a banner.
+// Two ways to turn it on: an admin's switch (Account page, PUT /api/maintenance; kept in DATA_DIR/maintenance.json, NOT in the database,
+// so a backup restored on the new server never arrives read-only), or the server setting MAINTENANCE=readonly (cannot be switched off
+// from the page; MAINTENANCE_UNTIL=<ISO time> sets the time shown). Background writers (reminder emails, queued welcome emails) pause
+// too, so the old and the new server never both send the same email.
+const MAINT_FILE = path.join(process.env.DATA_DIR || path.join(__dirname, 'data'), 'maintenance.json');
+const MAINT_ENV = String(process.env.MAINTENANCE || '').trim().toLowerCase() === 'readonly';
+const MAINT_ENV_UNTIL = (v => { const d = new Date(v); return v && !isNaN(d) ? d.toISOString() : null; })(String(process.env.MAINTENANCE_UNTIL || '').trim());
+let maint = (() => { try { const j = JSON.parse(fs.readFileSync(MAINT_FILE, 'utf8')); return j && j.on ? { on: true, until: j.until || null, since: j.since || null, by: j.by || null } : { on: false }; } catch (e) { return { on: false }; } })();
+const maintenance = () => MAINT_ENV ? { on: true, forced: true, until: MAINT_ENV_UNTIL || maint.until || null, since: maint.since || null } : maint.on ? { ...maint, forced: false } : { on: false, forced: false };
+const maintTime = iso => new Date(iso).toLocaleString('en-IN', { timeZone: process.env.TZ || undefined, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short' });
+const maintMessage = m => `TaskDesk is moving to a new server. You can read but not change anything until ${m.until ? maintTime(m.until) : 'the move is finished'}.`;
+if (process.env.MAINTENANCE && !MAINT_ENV) console.error(`[maintenance] MAINTENANCE=${JSON.stringify(process.env.MAINTENANCE)} ignored: the only value is "readonly".`);
+if (MAINT_ENV || maint.on) console.log(`[maintenance] READ-ONLY mode is on${MAINT_ENV ? ' (MAINTENANCE=readonly)' : ''}: changes are refused until it is turned off`);
+const MAINT_ALLOWED = new Set(['POST /api/login', 'POST /api/login/code', 'POST /api/logout', 'PUT /api/maintenance']);
+app.use('/api', (req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  const m = maintenance();
+  if (!m.on || MAINT_ALLOWED.has(`${req.method} ${req.baseUrl}${req.path}`)) return next();
+  res.set('Retry-After', '600');
+  res.status(503).json({ error: maintMessage(m), code: 'maintenance', until: m.until || null });
+});
 // CSRF (Security A1). Every POST/PUT/PATCH/DELETE to /api:
 // - is refused when the browser's Origin header names another site;
 // - with a session cookie, must carry X-CSRF-Token = csrfFor(session token), which the page gets from /api/me and
@@ -1185,7 +1209,7 @@ function welcomeStatus() {
 }
 let draining = false;
 function drainWelcome() {
-  if (draining || !mailer.enabled()) return;
+  if (draining || !mailer.enabled() || maintenance().on) return;
   draining = true;
   try {
     if (mailer.status().paused_until) return;
@@ -2472,6 +2496,27 @@ function push(userIds, event, data) {
     try { res.write(typeof data === 'function' ? `event: ${event}\ndata: ${JSON.stringify(data(id))}\n\n` : line); } catch (e) { /* closed */ }
   }
 }
+app.get('/api/maintenance', (req, res) => { noCache(res); const m = maintenance(); res.json({ on: m.on, forced: !!m.forced, until: m.until || null, message: m.on ? maintMessage(m) : null }); });
+app.put('/api/maintenance', auth, requireAdmin, (req, res) => {
+  if (MAINT_ENV) return bad(res, 'Read-only mode is set by the server setting MAINTENANCE=readonly. Remove that setting and restart the server to turn it off.', 409);
+  const on = req.body && req.body.on;
+  if (typeof on !== 'boolean') return bad(res, 'Say whether read-only mode is on or off.');
+  let until = null;
+  if (on) {
+    const raw = req.body.until, d = new Date(raw);
+    if (raw == null || raw === '' ) return bad(res, 'Enter the time when changes will be allowed again; everyone sees it.');
+    if (typeof raw !== 'string' || isNaN(d)) return bad(res, 'That time isn’t valid.');
+    if (d.getTime() < Date.now() - 60e3) return bad(res, 'That time has already passed.');
+    until = d.toISOString();
+  }
+  const next = on ? { on: true, until, since: new Date().toISOString(), by: req.user.name } : { on: false };
+  try { fs.writeFileSync(MAINT_FILE + '.tmp', JSON.stringify(next), { mode: 0o600 }); fs.renameSync(MAINT_FILE + '.tmp', MAINT_FILE); }
+  catch (e) { console.error('[maintenance] could not save the switch:', e.message); return bad(res, 'Could not save the setting on the server.', 500); }
+  maint = next;
+  audit(req, on ? 'maintenance_on' : 'maintenance_off', { details: on ? `read-only until ${maintTime(until)}` : 'changes allowed again' });
+  console.log(`[maintenance] read-only ${on ? 'ON until ' + until : 'OFF'} (${req.user.name})`);
+  const m = maintenance(); res.json({ on: m.on, forced: false, until: m.until || null, message: m.on ? maintMessage(m) : null });
+});
 app.get('/api/stream', auth, (req, res) => {
   const uid = req.user.id, token = req.cookies.sid;
   res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-store', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
@@ -2982,7 +3027,7 @@ const AUDIT_ACTIONS = ['sign_in', 'sign_in_failed', 'account_locked', 'signed_ou
   'password_reset', 'password_set_by_manager', 'welcome_resent', 'person_added', 'person_edited', 'role_changed', 'team_changed', 'lead_changed',
   'managed_teams_changed', 'team_leads_changed', 'team_managers_changed', 'team_deleted', 'protection_changed', 'account_activated',
   'account_deactivated', 'person_removed', 'person_restored', '2fa_enabled', '2fa_disabled', '2fa_recovery_codes_renewed', '2fa_reset',
-  'people_imported', 'team_created', 'virus_blocked', 'file_downloaded', 'history_exported', 'audit_exported'];
+  'people_imported', 'team_created', 'maintenance_on', 'maintenance_off', 'virus_blocked', 'file_downloaded', 'history_exported', 'audit_exported'];
 function auditWhere(q) {
   const where = [], params = [];
   if (DATE_RE.test(String(q.from || ''))) { where.push(`date(at, 'localtime') >= ?`); params.push(q.from); }
@@ -3014,6 +3059,7 @@ app.get('/api/audit', auth, requireAdmin, (req, res) => {
 // Runs on every summary check (each desktop app checks every minute), so no timer is needed.
 // It also runs every 10 minutes for the "Still unassigned" emails (sent once per request, to the team's leads and team managers who turned them on).
 function remindStaleRequests() {
+  if (maintenance().on) return; // read-only mode: no writes and no emails
   const flagged = db.prepare(`UPDATE requests SET reminded_at = ? WHERE status = 'open' AND deleted_at IS NULL AND reminded_at IS NULL
     AND MAX(created_at, COALESCE((SELECT MAX(e.created_at) FROM request_events e WHERE e.request_id = requests.id), '')) < datetime('now', '-24 hours')
     RETURNING id, title, target_team_id`).all(new Date().toISOString());

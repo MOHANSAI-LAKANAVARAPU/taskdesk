@@ -62,11 +62,21 @@
     }
     if (res.status === 401 && !path.startsWith('/login')) { me = null; location.hash = '#/login'; }
     if (res.status === 403 && data.code === '2fa_setup') { mustSetup2fa = true; location.hash = '#/2fa-setup'; }
+    if (res.status === 503 && data.code === 'maintenance') { showMaint({ on: true, message: data.error }); loadMaint(); }
     if (!res.ok) throw new Error(data.error || 'Something went wrong. Try again.');
     return data;
   }
 
   let tt;
+  // Read-only mode (the move to a new server): a banner on every page, kept current every 30 s and whenever a change is refused.
+  let maintOn = false;
+  function showMaint(m) {
+    const b = $('#maintBanner'); maintOn = !!(m && m.on);
+    b.hidden = !maintOn; b.textContent = maintOn ? m.message : '';
+    document.documentElement.style.setProperty('--maint-h', maintOn ? b.offsetHeight + 'px' : '0px');
+  }
+  async function loadMaint() { try { showMaint(await (await fetch('/api/maintenance', { credentials: 'same-origin' })).json()); } catch (e) { /* offline: keep what is shown */ } }
+  loadMaint(); setInterval(loadMaint, 30000); window.addEventListener('resize', () => { if (maintOn) showMaint({ on: true, message: $('#maintBanner').textContent }); });
   function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(tt); tt = setTimeout(() => t.classList.remove('show'), 2800); }
 
   function fmtDate(d) {
@@ -134,6 +144,7 @@
   $('#logoutBtn').onclick = async () => { closeStream(); await api('/logout', { method: 'POST' }).catch(() => {}); me = null; setChatUnread(0); location.hash = '#/login'; };
 
   async function router() {
+    loadMaint(); // the banner follows the server on every page change (and every 30 s)
     let route = location.hash.replace(/^#\/?/, '');
     if (/^token=/.test(route)) route = 'set-password'; // the link from an email: #token=… (the token stays in the fragment, see viewSetPassword)
     // Signed-out pages: sign in, "Forgot password?" and the "Set your password" link from an email.
@@ -1499,7 +1510,7 @@
     account_activated: 'Account activated', account_deactivated: 'Account deactivated', person_removed: 'Person removed', person_restored: 'Person restored',
     '2fa_enabled': 'Two-step verification turned on', '2fa_disabled': 'Two-step verification turned off', '2fa_recovery_codes_renewed': 'New recovery codes',
     '2fa_reset': 'Two-step verification reset by an admin',
-    virus_blocked: 'Upload blocked by the virus scanner', people_imported: 'People imported (Excel/CSV)', team_created: 'Team created',
+    virus_blocked: 'Upload blocked by the virus scanner', people_imported: 'People imported (Excel/CSV)', team_created: 'Team created', maintenance_on: 'Read-only mode turned on', maintenance_off: 'Read-only mode turned off',
     file_downloaded: 'File downloaded', history_exported: 'History exported (CSV)', audit_exported: 'Audit log exported (CSV)' };
   async function viewAudit() {
     if (me.role !== 'admin') { app.innerHTML = `<div class="empty">Only admins can see the audit log.</div>`; return; }
@@ -1631,7 +1642,7 @@
           ${emailRows.map(([k, l]) => `<label class="check-row"><input type="checkbox" name="${k}"${prefs[k] ? ' checked' : ''}> ${l}</label>`).join('')}
           <button class="btn" style="margin-top:8px">Save</button>
         </form>
-        ${me.role === 'admin' ? '<section class="card" id="emailSettings"><h2>Email settings</h2><p class="muted">Loading…</p></section>' : ''}
+        ${me.role === 'admin' ? '<section class="card" id="emailSettings"><h2>Email settings</h2><p class="muted">Loading…</p></section><section class="card" id="maintCard"><h2>Read-only mode</h2><p class="muted">Loading…</p></section>' : ''}
       </div>`;
     // Other signed-in sessions (other browsers, the desktop app) and "Sign out all other devices".
     async function showDevices() {
@@ -1658,7 +1669,7 @@
       const body = Object.fromEntries(emailRows.map(([k]) => [k, e.target.elements[k].checked]));
       try { await api('/me/email-prefs', { method: 'PUT', body }); toast('Email notifications saved'); } catch (err) { toast(err.message); }
     };
-    if (me.role === 'admin') renderEmailSettings(await api('/email/status'));
+    if (me.role === 'admin') { renderEmailSettings(await api('/email/status')); renderMaintCard(await api('/maintenance')); }
   }
   // Account page: two-step verification on/off, new recovery codes. Required (no "Turn off") for admins and managers.
   async function showTwoStep() {
@@ -1689,6 +1700,27 @@
         };
       }
     }
+  }
+  // Admins: read-only mode for moving to a new server (every change is refused for everyone; reading and sign-in still work).
+  function renderMaintCard(st) {
+    const box = $('#maintCard'); if (!box) return;
+    showMaint(st);
+    const local = d => { const x = new Date(d); x.setMinutes(x.getMinutes() - x.getTimezoneOffset()); return x.toISOString().slice(0, 16); };
+    box.innerHTML = `<h2>Read-only mode</h2>
+      <p class="muted" style="font-size:.875rem;margin-top:-4px">Used while TaskDesk moves to a new server. While it is on, nobody can change anything (tasks, requests, chat, uploads, passwords); everyone can still sign in and read, and sees a banner. Turn it on, wait a minute, then take the final backup.</p>
+      ${st.on ? `<p class="warn-text" role="status">Read-only mode is ON. ${esc(st.message || '')}</p>
+        ${st.forced ? '<p class="muted">It is set by the server setting MAINTENANCE=readonly. Remove that setting and restart the server to turn it off.</p>' : '<div class="inline-actions"><button class="btn" id="maintOff">Turn off read-only mode</button></div>'}`
+      : `<form id="maintForm"><label class="f"><span>Changes allowed again at (shown to everyone)</span><input type="datetime-local" name="until" required value="${esc(local(Date.now() + 3 * 36e5))}"></label>
+        <p class="err" id="maintErr"></p><button class="btn">Turn on read-only mode</button></form>`}`;
+    const off = $('#maintOff'), form = $('#maintForm');
+    if (off) off.onclick = async () => { try { renderMaintCard(await api('/maintenance', { method: 'PUT', body: { on: false } })); toast('Changes are allowed again'); } catch (e) { toast(e.message); } };
+    if (form) form.onsubmit = async e => {
+      e.preventDefault();
+      const v = new FormData(form).get('until'), d = new Date(v);
+      if (!v || isNaN(d)) return $('#maintErr').textContent = 'Enter a valid time.';
+      if (!confirm(`Turn on read-only mode until ${d.toLocaleString()}? Nobody will be able to change anything until you turn it off.`)) return;
+      try { renderMaintCard(await api('/maintenance', { method: 'PUT', body: { on: true, until: d.toISOString() } })); toast('Read-only mode is on'); } catch (err) { $('#maintErr').textContent = err.message; }
+    };
   }
   // Admins: what the server uses (never the password), the last error, and "Send test email" with the exact result.
   function renderEmailSettings(st, result) {
