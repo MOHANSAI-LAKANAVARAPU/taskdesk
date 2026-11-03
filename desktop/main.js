@@ -5,6 +5,7 @@ const os = require('os');
 const pkg = require('./package.json');
 const { autoUpdater } = require('electron-updater');
 const { normalizeServer, serverFromArgv } = require('./serverurl');
+const { acceptMove } = require('./moved');
 
 // The address the setup window offers (taskdesk.defaultServer in package.json, or TASKDESK_SERVER when the installer was built:
 // scripts/build.js). PRESET_SERVER is only set when an installer was built for one server on purpose (TASKDESK_SERVER set):
@@ -49,7 +50,7 @@ else { app.on('second-instance', (e, argv) => {
 
 // ---------- config ----------
 let cfgPath;
-let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, widgetPositions: {}, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null, knownNeedsTeamIds: null, knownReminderIds: null, knownAskIds: null, knownWithdrawnIds: null, knownNoteIds: null };
+let cfg = { server: '', showWidget: true, autoStart: true, widgetPos: null, widgetPositions: {}, knownUser: null, knownTaskIds: [], knownStatuses: null, knownApprovalIds: null, knownRequestIds: null, knownReadyIds: null, knownNeedsTeamIds: null, knownReminderIds: null, knownAskIds: null, knownWithdrawnIds: null, knownNoteIds: null, moves: [] };
 function loadConfig() {
   cfgPath = path.join(app.getPath('userData'), 'config.json');
   try { cfg = Object.assign(cfg, JSON.parse(fs.readFileSync(cfgPath, 'utf8'))); } catch (e) { /* first run */ }
@@ -324,22 +325,54 @@ function reloadDashboard(why) {
 }
 function refreshAll() { reloadDashboard('Refresh'); poll(); }
 // The server's build id changes whenever new server code or pages are deployed; reload the dashboard when it does.
-let serverBuild = null;
+// The same answer can carry moved_to (AWS move, 1.0.18): the https address TaskDesk now lives at. It is read on every check,
+// signed in or not (the old server may be only a "moved notice" that answers nothing else). Returns true when the app moved.
+let serverBuild = null, lastMoveNote = '';
+const ALLOW_HTTP_MOVE = !app.isPackaged && process.env.TASKDESK_TEST_ALLOW_HTTP_MOVE === '1'; // tests only: never in an installed app
 async function checkServerVersion() {
   try {
     const r = await fetch(cfg.server + '/api/version', { signal: AbortSignal.timeout(5000) });
-    if (!r.ok) return;
-    const { build } = await r.json();
-    if (!build) return;
+    if (!r.ok) return false;
+    const { build, moved_to } = await r.json();
+    if (moved_to && await followMove(moved_to)) return true;
+    if (!build) return false;
     if (serverBuild && build !== serverBuild) { console.log(`[version] server updated ${serverBuild} -> ${build}`); serverBuild = build; reloadDashboard('server updated'); }
     else if (!serverBuild) { serverBuild = build; console.log(`[version] server build ${build}`); }
   } catch (e) { /* the summary check already logs network problems */ }
+  return false;
+}
+// The server announced a new address. Follow it only if moved.js allows it (https, new, no loop) and the new address answers
+// like TaskDesk; otherwise stay where we are and look again at the next check. No dialog: people just sign in again there
+// (cookies belong to one address; their accounts come with the data).
+async function followMove(announced) {
+  const a = acceptMove(cfg.server, announced, { moves: cfg.moves, allowHttp: ALLOW_HTTP_MOVE });
+  const note = (m) => { if (m !== lastMoveNote) { lastMoveNote = m; console.log('[move] ' + m); } };
+  if (!a.url) return note(`announcement ignored (${a.reject})`), false; // never log the announced text: it may carry credentials
+  try {
+    const r = await fetch(a.url + '/api/version', { signal: AbortSignal.timeout(5000) });
+    const j = r.ok ? await r.json() : null;
+    if (j && j.moved_to && normalizeServer(j.moved_to).url === cfg.server) return note(`${a.url} announces ${cfg.server} back (a loop); staying`), false;
+    if (!j || typeof j.build !== 'string' || !j.build) return note(`${a.url} does not answer like TaskDesk yet (HTTP ${r.status}); staying on ${cfg.server}`), false;
+  } catch (e) {
+    const cause = e.cause && (e.cause.code || e.cause.message);
+    return note(`can’t reach the new address ${a.url} yet (${cause || e.message}); staying on ${cfg.server}`), false;
+  }
+  console.log(`[move] moving from ${cfg.server} to ${a.url}`);
+  cfg.moves = [...(cfg.moves || []), cfg.server];
+  cfg.previousServer = cfg.server;
+  applyServer(a.url);
+  serverBuild = null; lastMoveNote = '';
+  stopStream('moved');
+  if (mainWin && !mainWin.isDestroyed()) mainWin.loadURL(cfg.server);
+  schedulePoll(500);
+  return true;
 }
 
 async function poll() {
   clearTimeout(pollTimer);
   try {
     if (!cfg.server) return recordCheck(false, { reason: 'no server address set' });
+    if (await checkServerVersion()) return; // moved to a new address: the next check runs there
     const cookies = await session.defaultSession.cookies.get({ url: cfg.server, name: 'sid' });
     if (!cookies.length) { stopStream('signed out'); recordCheck(false, { reason: 'not signed in (no session cookie)' }); return setSummary({ state: 'signed-out' }); }
     const r = await fetch(cfg.server + '/api/my-summary', {
@@ -356,7 +389,7 @@ async function poll() {
     // Badge = my own open tasks + tasks waiting for my approval + requests waiting for me to assign them
     const badge = data.open + approvals + assign;
     setSummary({ state: 'ok', open: badge, own: data.open, approvals, assign, overdue: data.overdue, name: data.user && data.user.name, chat: data.chat_unread || 0 });
-    checkServerVersion();
+    if (data.moved_to) followMove(data.moved_to).catch(() => {});
     startStream(cookies[0].value, data.user && data.user.id); // instant chat messages (no-op while connected for this user)
     recordCheck(true, { user: data.user && data.user.id, own: data.open, approvals, assign, open: badge, overdue: data.overdue, chat: data.chat_unread || 0,
       teamRequests: (data.team_requests || []).length, ready: (data.ready_requests || []).length, needsTeam: (data.needs_team_requests || []).length });

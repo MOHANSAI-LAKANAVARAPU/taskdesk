@@ -100,7 +100,19 @@ const BUILD_ID = (() => {
   for (const f of fs.readdirSync(pub).sort()) add(path.join(pub, f));
   return h.digest('hex').slice(0, 12);
 })();
-app.get('/api/version', (req, res) => { noCache(res); res.json({ build: BUILD_ID }); });
+// MOVED_TO (AWS move): the https address TaskDesk now lives at. Announced in /api/version and /api/my-summary so desktop apps
+// (1.0.18+) switch to it by themselves. Must be https://host[/path]; anything else is ignored with a log line (the app would
+// refuse it anyway). TASKDESK_TEST_ALLOW_HTTP_MOVE=1 (tests only) also lets http through.
+const MOVED_TO = (v => {
+  if (!v) return '';
+  try {
+    const u = new URL(v);
+    if (!(u.protocol === 'https:' || (u.protocol === 'http:' && process.env.TASKDESK_TEST_ALLOW_HTTP_MOVE === '1')) || !u.hostname || u.username || u.password || u.search || u.hash) throw new Error('bad');
+    return `${u.protocol}//${u.host}${u.pathname.replace(/\/+$/, '')}`;
+  } catch (e) { console.error('[moved] MOVED_TO ignored: it must be an https:// address without user name, ? or #.'); return ''; }
+})(String(process.env.MOVED_TO || '').trim());
+if (MOVED_TO) console.log(`[moved] announcing the new address ${MOVED_TO} to desktop apps`);
+app.get('/api/version', (req, res) => { noCache(res); res.json(MOVED_TO ? { build: BUILD_ID, moved_to: MOVED_TO } : { build: BUILD_ID }); });
 // Desktop app auto-update files (latest.yml, installers). Public, no sign-in; missing files are a plain 404.
 app.use('/updates', express.static(path.join(__dirname, 'updates'), { fallthrough: false, index: false, maxAge: 0 }));
 app.use('/updates', (err, req, res, next) => res.status(err.status || 404).type('text').send('Not found'));
@@ -3072,7 +3084,8 @@ app.get('/api/my-summary', auth, (req, res) => {
     WHERE up.note_kind IS NOT NULL AND up.user_id != ? AND t.deleted_at IS NULL AND up.created_at >= datetime('now','-3 days')
       AND (t.assignee_id = ? OR (t.assigned_by = ? AND up.user_id = t.assignee_id)) ORDER BY up.id DESC LIMIT 100`).all(u.id, u.id, u.id);
   res.json({ user: publicUser(u), open: counts.open || 0, overdue: counts.overdue || 0, tasks, recently_approved, approvals, team_requests,
-    ready_requests, needs_team_requests, assign_requests, unassigned_reminders, team_asks, withdrawn, task_notes, chat_unread: chatUnreadTotal(u.id) });
+    ready_requests, needs_team_requests, assign_requests, unassigned_reminders, team_asks, withdrawn, task_notes, chat_unread: chatUnreadTotal(u.id),
+    ...(MOVED_TO ? { moved_to: MOVED_TO } : {}) });
 });
 
 // ---------- dashboard ----------
