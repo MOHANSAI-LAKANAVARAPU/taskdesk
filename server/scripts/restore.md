@@ -136,3 +136,16 @@ The owner account is set on the server by `OWNER_EMAIL` in `server/.env`. Nobody
   ```
 - The usual `sqlite3` tool can't open the database (it's encrypted). To look inside, use the image as above, with `require('/app/dbfile').openDb(…)`.
 - If the laptop is off at 13:00 and 18:00, that day has no backup (cron doesn't catch up). Run `~/Downloads/TaskDesk/server/scripts/backup.sh` by hand when needed.
+
+
+## Cloud (AWS) restore
+
+On the AWS host use `scripts/restore-cloud.sh` instead of the steps above (it decrypts, checks, moves the old data aside and fixes ownership and permissions). It restores a package made by `backup.sh --cloud` or a laptop backup into `/srv/taskdesk/data`, with the app stopped:
+
+```bash
+sudo systemctl stop taskdesk
+sudo /opt/taskdesk/current/server/scripts/restore-cloud.sh /srv/taskdesk/restore-final --data /srv/taskdesk/data --yes
+sudo systemctl start taskdesk
+```
+
+`master.key` and `backup.key` must already be in `/run/taskdesk/keys` (the launcher puts them there from Secrets Manager; use `--keys-dir` for another folder). It exits 0 only when integrity, foreign-key, row-count and upload checks all pass; if not, the previous data is put back. Details: `CLAUDE.md`, "Cloud (AWS prep)".
