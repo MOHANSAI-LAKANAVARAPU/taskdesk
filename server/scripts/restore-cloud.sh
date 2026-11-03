@@ -5,6 +5,7 @@
 #
 #   restore-cloud.sh <backup file | folder> [--data /srv/taskdesk/data] [--keys-dir /run/taskdesk/keys]
 #                    [--owner 1000:1000] [--updates-from <dir> --updates /srv/taskdesk/updates]
+#                    [--keys-from-secret <secret ARN or name> [--region <aws region>]]
 #                    [--image taskdesk-taskdesk] [--container taskdesk] [--yes]
 #
 # What it does, in order (the current data is moved aside, never deleted):
@@ -15,23 +16,33 @@
 #      opens with master.key (so the keys fit), integrity_check, foreign keys, every table's row count equals the manifest
 #      (printed when there is no manifest), every uploaded file the database names is present and encrypted, the copied file
 #      is byte-identical to the backup's;  6. optional: copies desktop installers (--updates-from) into the updates folder.
+# Keys: /run/taskdesk/keys is only filled when the launcher STARTS the app, but the workbook restores BEFORE the first start. With
+# --keys-from-secret the script reads master_key_b64 / backup_key_b64 from that Secrets Manager secret (aws CLI, the host's
+# role) into a private folder on /dev/shm (root:<gid>, 750 / 640, like the launcher) and shreds it on exit; nothing is printed.
 # Exit 0 only when every check passed. If a check fails, the restored data is moved to <data>.failed-restore-<time> and the
 # previous data is put back, so a bad restore never stays in place. Keys and passwords are never printed.
 set -u -o pipefail
 export PATH=/usr/local/bin:/usr/bin:/bin
 DATA=/srv/taskdesk/data; KEYS_DIR=${KEYS_DIR:-/run/taskdesk/keys}; OWNER=1000:1000; UPDATES=""; UPDATES_FROM=""
-IMAGE=taskdesk-taskdesk; CONTAINER=taskdesk; YES=0; SRC=""
+IMAGE=taskdesk-taskdesk; CONTAINER=taskdesk; YES=0; SRC=""; SECRET=""; REGION=""; KEYTMP=""
+KEYS_DIR_GIVEN=0""
 ENC=(-aes-256-cbc -pbkdf2 -iter 200000 -md sha256)
 log() { echo "$(date -u '+%F %T') $*"; }
 die() { log "FAILED: $*"; cleanup; exit 1; }
 TMP=""; ASIDE=""; PLACED=0
-cleanup() { [ -n "$TMP" ] && rm -rf "$TMP"; TMP=""; }
+cleanup() {
+  [ -n "$TMP" ] && rm -rf "$TMP"; TMP=""
+  if [ -n "$KEYTMP" ]; then find "$KEYTMP" -type f -exec shred -u {} + 2>/dev/null; rm -rf "$KEYTMP"; KEYTMP=""; fi
+}
+trap cleanup EXIT
 usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --data) DATA=${2:?}; shift 2 ;;
-    --keys-dir) KEYS_DIR=${2:?}; shift 2 ;;
+    --keys-dir) KEYS_DIR=${2:?}; KEYS_DIR_GIVEN=1; shift 2 ;;
+    --keys-from-secret) SECRET=${2:?}; shift 2 ;;
+    --region) REGION=${2:?}; shift 2 ;;
     --owner) OWNER=${2:?}; shift 2 ;;
     --updates) UPDATES=${2:?}; shift 2 ;;
     --updates-from) UPDATES_FROM=${2:?}; shift 2 ;;
@@ -45,6 +56,25 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$SRC" ] || usage
 [[ $OWNER =~ ^[0-9]+:[0-9]+$ ]] || die "--owner must be numeric uid:gid, e.g. 1000:1000"
+if [ -n "$SECRET" ]; then
+  [ "$KEYS_DIR_GIVEN" = 0 ] || die "use either --keys-dir or --keys-from-secret"
+  AWS=${AWS_CLI:-aws}   # AWS_CLI: another path, for tests
+  command -v "$AWS" >/dev/null 2>&1 || die "--keys-from-secret needs the aws CLI"
+  KEYTMP=$(mktemp -d /dev/shm/taskdesk-restore-keys.XXXXXX) || die "could not make a key folder on /dev/shm"
+  chmod 750 "$KEYTMP"; chown "0:${OWNER#*:}" "$KEYTMP" 2>/dev/null || chown "$(id -u):${OWNER#*:}" "$KEYTMP" 2>/dev/null || true
+  "$AWS" secretsmanager get-secret-value --secret-id "$SECRET" ${REGION:+--region "$REGION"} --query SecretString --output text 2>/dev/null \
+    | python3 -I -c '
+import base64, json, os, sys
+d = json.loads(sys.stdin.read()); out = sys.argv[1]
+for name, field in (("master.key", "master_key_b64"), ("backup.key", "backup_key_b64")):
+    b = base64.b64decode(d[field], validate=True)
+    if not b: sys.exit(1)
+    fd = os.open(os.path.join(out, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640); os.write(fd, b); os.close(fd)
+' "$KEYTMP" || die "could not read the keys from the secret (aws role, secret name/region, or the secret's JSON)"
+  chown "0:${OWNER#*:}" "$KEYTMP"/*.key 2>/dev/null || chown "$(id -u):${OWNER#*:}" "$KEYTMP"/*.key 2>/dev/null || true
+  chmod 640 "$KEYTMP"/*.key
+  KEYS_DIR=$KEYTMP; log "Keys read from the secret (not printed, removed when the script ends)"
+fi
 BACKUP_KEY=${BACKUP_KEY:-$KEYS_DIR/backup.key}
 DATA=${DATA%/}; PARENT=$(dirname "$DATA")
 [ -d "$PARENT" ] && [ -w "$PARENT" ] || die "$PARENT is not a writable directory"

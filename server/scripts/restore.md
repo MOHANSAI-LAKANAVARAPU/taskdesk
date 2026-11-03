@@ -148,4 +148,4 @@ sudo /opt/taskdesk/current/server/scripts/restore-cloud.sh /srv/taskdesk/restore
 sudo systemctl start taskdesk
 ```
 
-`master.key` and `backup.key` must already be in `/run/taskdesk/keys` (the launcher puts them there from Secrets Manager; use `--keys-dir` for another folder). It exits 0 only when integrity, foreign-key, row-count and upload checks all pass; if not, the previous data is put back. Details: `CLAUDE.md`, "Cloud (AWS prep)".
+`master.key` and `backup.key` must be available: the launcher only puts them in `/run/taskdesk/keys` when it *starts* the app, so before the first start add `--keys-from-secret <secret ARN> --region <region>` (reads them from Secrets Manager into a temporary folder in memory and removes it afterwards), or use `--keys-dir` for another folder. It exits 0 only when integrity, foreign-key, row-count and upload checks all pass; if not, the previous data is put back. Details: `CLAUDE.md`, "Cloud (AWS prep)".
