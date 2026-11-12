@@ -11,3 +11,5 @@ Root folder (`~/Downloads/TaskDesk`) holding everything for the TaskDesk project
 - `backups/` — database backups. Keep each `.db`, `.db-wal` and `.db-shm` set together.
 - `aws-sprint/` — IT's 8-hour AWS deployment package (unzipped, as received) plus our `DEV-worksheet.md` and `PACKAGE-REVIEW.md`. Nothing here is deployed by us.
 - `old-downloads/` — original downloaded zips; not used.
+
+- The repo is on GitHub (private): MOHANSAI-LAKANAVARAPU/taskdesk. Never make it public, never push secrets; push after each commit when I ask.
