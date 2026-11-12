@@ -26,3 +26,14 @@ aws-sprint/private/
 aws-sprint/out/
 aws-sprint/**/parameters.json
 aws-sprint/**/*.secret*.json
+# keys, databases, uploads, bundles, the IT sprint zip (never commit; the repo is on GitHub)
+*.key
+*.pem
+*.db
+*.db-*
+*.sqlite*
+uploads/
+secrets/
+*.bundle
+*.enc
+/TaskDesk-8-hour-sprint.zip
